@@ -52,3 +52,12 @@ this colocated checkout.
 
 `jj describe -m "ferry: subject"`, then `just land`. Work is not complete
 until `just land` succeeds.
+
+## Issues
+
+Ferry's own work is tracked with bd (`bd ready`, `bd show <id>`,
+`bd update <id> --claim`, `bd close <id>`; full reference: `bd prime`).
+Consumer coordination stays on Herald and Murail beads (herald-4e6mw,
+herald-v0m46, murail-2qnnz). Issues live in a local Dolt database; sync with
+`bd dolt push` / `bd dolt pull` to the file remote, never through git.
+`.beads/config.yaml` is tracked config only; keep machine paths out of it.

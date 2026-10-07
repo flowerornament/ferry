@@ -3,3 +3,6 @@
 # tmux pane after the workspace; outside a jj repository it does nothing.
 [[hooks.SessionStart]]
 hooks = [{ type = "command", command = "bash \"$(jj workspace root 2>/dev/null || pwd)/scripts/jj-identity\" codex" }]
+
+[features]
+hooks = true

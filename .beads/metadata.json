@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "ferry",
+  "project_id": "2526789e-e6e0-4f30-bc99-42ad8e6d5022"
+}
