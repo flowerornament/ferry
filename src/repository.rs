@@ -229,6 +229,12 @@ pub fn declaration(
                     }
                     config.preserve = contract.preserve;
                 }
+                if !contract.provider.requires.is_empty() {
+                    if !config.provider.requires.is_empty() {
+                        return Err("provider requirements have two owners".into());
+                    }
+                    config.provider = contract.provider;
+                }
                 if !contract.companion_refs.is_empty() {
                     if !config.companion_refs.is_empty() {
                         return Err("companion refs have two owners".into());

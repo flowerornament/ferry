@@ -53,6 +53,17 @@ pub struct Config {
     pub companion_refs: BTreeMap<String, CompanionSource>,
     #[serde(default)]
     pub preserve: Vec<String>,
+    #[serde(default)]
+    pub provider: Provider,
+}
+
+/// What a project requires of the Ferry that runs it. An older Ferry rejects
+/// this table as an unknown key, so the requirement fails closed.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provider {
+    #[serde(default)]
+    pub requires: BTreeSet<String>,
 }
 
 /// A caller revision, or an explicitly selected locally known tracking ref.
@@ -147,6 +158,8 @@ pub struct CatalogContract {
     pub companion_refs: BTreeMap<String, CompanionSource>,
     #[serde(default)]
     pub preserve: Vec<String>,
+    #[serde(default)]
+    pub provider: Provider,
 }
 fn recipe_table() -> String {
     "recipe".into()

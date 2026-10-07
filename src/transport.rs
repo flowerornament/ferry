@@ -68,6 +68,9 @@ pub struct HostInfo {
     pub source_rev: Option<String>,
     #[serde(default)]
     pub exe: Option<String>,
+    /// Absent on hosts that predate capabilities: none.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 pub fn host_info() -> Result<HostInfo> {
     Ok(HostInfo {
@@ -77,6 +80,7 @@ pub fn host_info() -> Result<HostInfo> {
         cores: std::thread::available_parallelism()?.get(),
         source_rev: Some(receipt::source_rev()),
         exe: receipt::exe_path(),
+        capabilities: receipt::capabilities(),
     })
 }
 
@@ -412,6 +416,12 @@ pub fn remote(
             .arg(&machine.ssh)
             .arg(format!("{} host-info", machine.binary)),
     )?)?;
+    if let Err(missing) = receipt::provides(&request.provider_requires, &info.capabilities) {
+        refused_by(record, &info);
+        record.outcome = Outcome::Refused;
+        record.exit_code = 125;
+        return Err(format!("host {missing}").into());
+    }
     if info.protocol != receipt::PROTOCOL {
         record.outcome = Outcome::Refused;
         record.exit_code = 125;

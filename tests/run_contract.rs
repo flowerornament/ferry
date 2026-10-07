@@ -1750,6 +1750,115 @@ fn an_unreadable_custody_marker_leaves_the_seat_alone() {
 }
 
 #[test]
+fn a_project_can_require_provider_capabilities() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\n[provider]\nrequires=['admission']\n[recipe.pass]\ncommand=['sh','-c','echo committed']\nroutable=true\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "requires admission"]);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        receipt(&out)["provider_requires"],
+        serde_json::json!(["admission"])
+    );
+    assert_eq!(receipt(&out)["admission"]["result"], "admitted");
+
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\n[provider]\nrequires=['teleport']\n[recipe.pass]\ncommand=['sh','-c','echo committed']\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "requires the impossible"]);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(
+        receipt(&out)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("teleport")
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
+}
+
+#[test]
+fn a_host_without_a_required_capability_is_refused_before_acceptance() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\n[provider]\nrequires=['admission']\n[recipe.pass]\ncommand=['sh','-c','echo committed']\nroutable=true\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "requires admission"]);
+    let bin = dir.path().join("host/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    // A host from before capabilities: its host-info names none.
+    fs::write(
+        bin.join("old-ferry"),
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed 's/,\"capabilities\":\\[[^]]*\\]//';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = remote_run(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(125));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("lacks required capabilities"),
+        "{}",
+        record["reason"]
+    );
+    assert_eq!(record["host_binary_sha256"].as_str().unwrap().len(), 64);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("\"accepted\""));
+}
+
+#[test]
+fn host_run_refuses_a_request_requiring_a_capability_it_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = serde_json::json!({
+        "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
+        "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
+        "timeout_seconds": null, "mirrors": [], "forwarded_env": {},
+        "provider_requires": ["teleport"]
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("host-run")
+        .env("HOME", dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        child.stdin.as_mut().unwrap(),
+        format!("{request}\n").as_bytes(),
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(125));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"event\":\"refused\""), "{stdout}");
+    assert!(stdout.contains("teleport"), "{stdout}");
+    assert!(!stdout.contains("\"accepted\""));
+    assert!(!dir.path().join(".local/state/ferry/records").exists());
+}
+
+#[test]
 fn a_recipe_can_empty_a_process_group_it_killed() {
     // Like a project's own teardown: kill a group whose members were adopted
     // by the supervisor, then require the group to be empty. Adopted zombies

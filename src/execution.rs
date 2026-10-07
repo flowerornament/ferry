@@ -11,7 +11,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, Write},
     path::{Path, PathBuf},
@@ -109,6 +109,9 @@ pub struct Request {
     // arguments; such hosts refuse a request that carries them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    // Omitted when empty, like args; a host that predates it refuses it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub provider_requires: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +140,7 @@ pub fn validate(request: &Request) -> Result<()> {
     if request.recipe.command.is_empty() {
         return Err("empty command".into());
     }
+    crate::receipt::provides(&request.provider_requires, &crate::receipt::capabilities())?;
     if request.args.iter().any(|arg| arg.contains('\0')) {
         return Err("invalid recipe argument".into());
     }

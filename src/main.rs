@@ -105,6 +105,9 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         config::preserve_path(path)?;
     }
     record.preserve.clone_from(&config.preserve);
+    record.provider_requires = config.provider.requires.iter().cloned().collect();
+    receipt::provides(&config.provider.requires, &receipt::capabilities())
+        .map_err(|e| format!("this caller: {e}"))?;
     record.companion_sources.clone_from(&config.companion_refs);
     for (name, revision) in &config.companion_refs {
         repository::ref_name(name)?;
@@ -159,6 +162,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         companion_refs: record.companion_refs.clone(),
         preserve: record.preserve.clone(),
         args: options.args.clone(),
+        provider_requires: config.provider.requires.clone(),
     };
     if matches!(route, config::Route::Remote(_)) {
         record.outcome = receipt::Outcome::Lost;
@@ -265,6 +269,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         custody: None,
         lease: None,
         admission: None,
+        provider_requires: vec![],
     })
 }
 

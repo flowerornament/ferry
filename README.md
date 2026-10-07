@@ -105,6 +105,40 @@ temporary checkout.
 Only explicitly routable recipes go remote. Publishing and certifying recipes
 must remain unroutable: Herald's `just land` stays local.
 
+### Provider capabilities
+
+A project can require capabilities of the Ferry that runs it. This keeps a
+rollback, or an older binary on one end, from silently running without them:
+
+```toml
+[provider]
+requires = ["admission"]
+```
+
+The table may sit in `ferry.toml` or in an adapter's emitted contract, but not
+both. Capabilities are only ever added:
+
+| capability | meaning |
+| ---------- | ------- |
+| `args` | recipe arguments after `--` |
+| `refusal-event` | typed refusals before acceptance |
+| `custody` | seat custody records at release |
+| `lease` | the shared/exclusive host lease |
+| `admission` | host policy admission (`host.toml`), even when not configured |
+
+A run is refused (125), before any hook runs, in each of these cases:
+
+- **Unknown capability:** the project requires a capability the caller does
+  not provide, such as a misspelled name.
+- **Host lacks it:** the host's `host-info` does not list every required
+  capability. A host from before capabilities lists none. The receipt still
+  names that host's binary.
+- **Host refuses the request:** `host-run` refuses a request requiring
+  something it lacks.
+
+A caller from before this table rejects it as an unknown key. The receipt
+records `provider_requires`.
+
 ## Machines
 
 Create `$XDG_CONFIG_HOME/ferry/machines.toml` (default `~/.config/ferry`):

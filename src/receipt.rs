@@ -8,6 +8,31 @@ use std::{
 };
 
 pub const PROTOCOL: u32 = 1;
+/// What this Ferry can do, as a project contract may require it under
+/// `[provider] requires`. Documented in README; only ever extended.
+pub const CAPABILITIES: &[&str] = &["args", "refusal-event", "custody", "lease", "admission"];
+
+/// Refuses requirements this binary does not provide.
+pub fn provides(
+    requires: &std::collections::BTreeSet<String>,
+    capabilities: &[String],
+) -> Result<(), String> {
+    let missing: Vec<&str> = requires
+        .iter()
+        .filter(|name| !capabilities.contains(name))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Ferry lacks required capabilities {missing:?} (it provides {capabilities:?})"
+        ))
+    }
+}
+pub fn capabilities() -> Vec<String> {
+    CAPABILITIES.iter().map(|name| (*name).to_owned()).collect()
+}
 /// The source revision a Nix build compiled in, or `unpinned` for a build
 /// without one. Receipts that predate the field leave it null: unknown.
 pub fn source_rev() -> String {
@@ -88,6 +113,9 @@ pub struct Receipt {
     /// The host's disk admission: policy, measurements, evictions, verdict.
     #[serde(default)]
     pub admission: Option<crate::admission::Admission>,
+    /// The provider capabilities the project required.
+    #[serde(default)]
+    pub provider_requires: Vec<String>,
 }
 
 pub fn now_ms() -> u128 {
