@@ -51,6 +51,8 @@ pub struct Config {
     pub environment: Option<Environment>,
     #[serde(default)]
     pub companion_refs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub preserve: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -128,6 +130,8 @@ pub struct CatalogContract {
     pub environment: Option<Environment>,
     #[serde(default)]
     pub companion_refs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub preserve: Vec<String>,
 }
 fn recipe_table() -> String {
     "recipe".into()
@@ -273,6 +277,24 @@ pub fn relative_path(value: &str) -> Result<(), Refusal> {
         return Err(Refusal::Declaration(format!(
             "path must stay inside checkout: {value:?}"
         )));
+    }
+    Ok(())
+}
+
+pub fn preserve_path(value: &str) -> Result<(), Refusal> {
+    relative_path(value)?;
+    if matches!(value.split('/').next(), Some(".git" | ".jj" | ".ferry")) {
+        return Err(Refusal::Declaration(
+            "cannot preserve version-control or Ferry state".into(),
+        ));
+    }
+    if value
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '\\' | '!' | '\n' | '\r'))
+    {
+        return Err(Refusal::Declaration(
+            "preserve must name literal directories".into(),
+        ));
     }
     Ok(())
 }

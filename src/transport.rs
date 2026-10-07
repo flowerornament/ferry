@@ -114,6 +114,7 @@ pub fn mirror(
                 &store,
                 &format!("{commit}:refs/ferry/{commit}"),
             )?;
+            pin_mirror(&store, &commit, Some(host))?;
         } else {
             let store = root.join(".ferry/local/mirrors").join(format!("{key}.git"));
             fs::create_dir_all(store.parent().ok_or("invalid mirror directory")?)?;
@@ -128,6 +129,11 @@ pub fn mirror(
                     .arg(repository::git_dir(&source)?)
                     .arg(&commit),
             )?;
+            pin_mirror(
+                store.to_str().ok_or("non-UTF-8 mirror path")?,
+                &commit,
+                None,
+            )?;
         }
         mirrors.push(execution::Mirrored {
             url: declaration.url.clone(),
@@ -136,6 +142,23 @@ pub fn mirror(
         });
     }
     Ok(mirrors)
+}
+
+fn pin_mirror(store: &str, commit: &str, host: Option<&config::Machine>) -> Result<()> {
+    // Ordinary dependency fetchers request heads, not Ferry's custody refs.
+    // A compare-and-set makes each content-addressed head an immutable GC pin.
+    let script = "set -eu; head=$(git --git-dir=\"$1\" symbolic-ref HEAD); case $head in refs/heads/ferry/*) exit 125;; esac; ref=refs/heads/ferry/$2; git --git-dir=\"$1\" update-ref \"$ref\" \"$2\" 0000000000000000000000000000000000000000 2>/dev/null || test \"$(git --git-dir=\"$1\" rev-parse --verify \"$ref\")\" = \"$2\"";
+    if let Some(host) = host {
+        let command = ["sh", "-c", script, "ferry-mirror", store, commit]
+            .into_iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        repository::output(ssh()?.arg(&host.ssh).arg(command))?;
+    } else {
+        repository::output(Command::new("sh").args(["-c", script, "ferry-mirror", store, commit]))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,6 +172,8 @@ pub struct HostResult {
     pub binary_sha256: String,
     pub artifacts_sha256: Option<String>,
     pub artifacts_error: Option<String>,
+    #[serde(default)]
+    pub collection: Option<execution::Collection>,
 }
 fn event(value: &serde_json::Value) {
     serde_json::to_writer(std::io::stdout(), value)
@@ -193,6 +218,7 @@ pub fn host_run() -> Result<i32> {
         binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
         artifacts_sha256: None,
         artifacts_error: None,
+        collection: None,
     };
     event(&serde_json::json!({"protocol":1,"event":"accepted","id":request.id}));
     let executed: Result<()> = (|| {
@@ -200,7 +226,9 @@ pub fn host_run() -> Result<i32> {
         event(
             &serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit,"seat":request.seat}),
         );
-        let (code, timeout) = execution::run(&root, &seat, &request, &stop, true)?;
+        let executed = execution::run(&root, &seat, &request, &stop, true);
+        result.collection = execution::collection(&root, &request)?;
+        let (code, timeout) = executed?;
         result.exit_code = code;
         result.outcome = if stop.load(Ordering::SeqCst) {
             Outcome::Lost
@@ -268,13 +296,14 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     if json {
         event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
     }
-    let (code, timeout) =
-        execution::run(&state, &seat, request, &stop, json).inspect_err(|_| {
-            if execution::attempted(&state, request) {
-                record.outcome = Outcome::Lost;
-                record.exit_code = 255;
-            }
-        })?;
+    let executed = execution::run(&state, &seat, request, &stop, json);
+    record.collection = execution::collection(&state, request)?;
+    let (code, timeout) = executed.inspect_err(|_| {
+        if execution::attempted(&state, request) {
+            record.outcome = Outcome::Lost;
+            record.exit_code = 255;
+        }
+    })?;
     record.exit_code = code;
     record.outcome = if stop.load(Ordering::SeqCst) {
         Outcome::Lost
@@ -433,6 +462,7 @@ fn accept_result(
     info: &HostInfo,
     result: HostResult,
 ) -> Result<()> {
+    record.collection.clone_from(&result.collection);
     if result.token != request.token
         || result.commit != request.commit
         || result.protocol != receipt::PROTOCOL

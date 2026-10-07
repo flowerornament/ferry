@@ -43,6 +43,10 @@ pub struct Receipt {
     pub forwarded_env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub companion_refs: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub preserve: Vec<String>,
+    #[serde(default)]
+    pub collection: Option<crate::execution::Collection>,
 }
 
 pub fn now_ms() -> u128 {

@@ -102,6 +102,36 @@ fn working_copy_edits_cannot_change_the_recipe() {
 }
 
 #[test]
+fn preserved_ignored_directories_survive_but_tracked_files_reset() {
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "cache/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['cache']\n[recipe.pass]\ncommand=['sh','-c','mkdir -p cache; if test -f cache/marker; then echo warm; else echo cold; touch cache/marker; fi']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "preserved cache"]);
+    let first = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    assert_eq!(receipt(&first)["preserve"], serde_json::json!(["cache"]));
+    let state = dir.path().join(".ferry/local/slots");
+    let slot = fs::read_dir(state).unwrap().next().unwrap().unwrap().path();
+    fs::write(slot.join("ferry.toml"), "tracked tampering").unwrap();
+    let second = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert!(String::from_utf8_lossy(&second.stdout).contains("warm"));
+    assert_ne!(
+        fs::read_to_string(slot.join("ferry.toml")).unwrap(),
+        "tracked tampering"
+    );
+}
+
+#[test]
 fn legacy_worktree_seats_migrate_under_the_existing_lease() {
     let dir = fixture();
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
@@ -213,14 +243,61 @@ fn recipe_exit_125_and_printed_refused_are_not_transport_refusals() {
 }
 
 #[test]
-fn failure_after_recipe_dispatch_is_lost_not_refused() {
+fn collection_failure_records_its_error_without_changing_recipe_verdict() {
     let dir = fixture();
     fs::write(dir.path().join("ferry.toml"), "version=1\n[hooks]\ncollect='missing-collect'\n[recipe.pass]\ncommand=['sh','-c','echo attempted']\n").unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
     git(dir.path(), &["commit", "-m", "broken collection hook"]);
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert_eq!(receipt(&out)["outcome"], "lost");
-    assert_eq!(out.status.code(), Some(255));
+    assert_eq!(receipt(&out)["outcome"], "ran-pass");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(receipt(&out)["collection"]["exit_code"], 127);
+}
+
+#[test]
+fn collection_runs_after_recipe_failure_timeout_and_prepare_refusal() {
+    for (command, prepare, expected) in [
+        ("exit 7", false, "ran-fail"),
+        ("sleep 10", false, "timeout"),
+        ("exit 0", true, "refused"),
+    ] {
+        let dir = fixture();
+        fs::write(
+            dir.path().join("collect"),
+            "#!/bin/sh\necho collected > collected\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            dir.path().join("collect"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(dir.path().join("ferry.toml"), format!("version=1\n[hooks]\ncollect='collect'\n{}[recipe.pass]\ncommand=['sh','-c','{command}']\n", if prepare { "prepare='missing-prepare'\n" } else { "" })).unwrap();
+        git(dir.path(), &["add", "ferry.toml", "collect"]);
+        git(dir.path(), &["commit", "-m", "collection contract"]);
+        let out = run(
+            dir.path(),
+            &["run", "pass", "--local", "--timeout-seconds", "1", "--json"],
+        );
+        let record = receipt(&out);
+        assert_eq!(
+            record["outcome"],
+            expected,
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(record["collection"]["exit_code"], 0);
+        let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::read_to_string(slot.join("collected")).unwrap(),
+            "collected\n"
+        );
+    }
 }
 
 #[test]
@@ -537,6 +614,49 @@ fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
     );
     assert_eq!(receipt(&out)["mirrors"][0]["commit"], sha.trim());
     assert!(String::from_utf8_lossy(&out.stdout).contains(sha.trim()));
+    let key = receipt(&out)["mirrors"][0]["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let store = dir
+        .path()
+        .join(".ferry/local/mirrors")
+        .join(format!("{key}.git"));
+    let clone = dir.path().join("ordinary-clone");
+    git(
+        dir.path(),
+        &["clone", store.to_str().unwrap(), clone.to_str().unwrap()],
+    );
+    git(&clone, &["cat-file", "-e", sha.trim()]);
+    let head = fs::read_to_string(store.join("HEAD")).unwrap();
+    assert!(!head.contains("refs/heads/ferry/"));
+    let pinned = store.join("refs/heads/ferry").join(sha.trim());
+    assert_eq!(fs::read_to_string(&pinned).unwrap().trim(), sha.trim());
+    // A conflicting pin refuses rather than silently moving a content address.
+    fs::write(dependency.join("value"), "changed").unwrap();
+    git(&dependency, &["commit", "-am", "changed dependency"]);
+    git(
+        dir.path(),
+        &[
+            "--git-dir",
+            store.to_str().unwrap(),
+            "fetch",
+            dependency.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    git(
+        dir.path(),
+        &[
+            "--git-dir",
+            store.to_str().unwrap(),
+            "update-ref",
+            &format!("refs/heads/ferry/{}", sha.trim()),
+            "FETCH_HEAD",
+        ],
+    );
+    let refused = run(dir.path(), &["run", "mirror", "--local", "--json"]);
+    assert_eq!(receipt(&refused)["outcome"], "refused");
 }
 
 #[test]

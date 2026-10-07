@@ -92,6 +92,10 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     record.contract_sha256 = evidence.contract_sha256;
     let declared = declared?;
     let config = declared.config;
+    for path in &config.preserve {
+        config::preserve_path(path)?;
+    }
+    record.preserve.clone_from(&config.preserve);
     for (name, revision) in &config.companion_refs {
         repository::ref_name(name)?;
         record
@@ -138,6 +142,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         mirrors: vec![],
         forwarded_env: record.forwarded_env.clone(),
         companion_refs: record.companion_refs.clone(),
+        preserve: record.preserve.clone(),
     };
     if matches!(route, config::Route::Remote(_)) {
         record.outcome = receipt::Outcome::Lost;
@@ -206,6 +211,8 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         contract_sha256: None,
         forwarded_env: BTreeMap::default(),
         companion_refs: BTreeMap::default(),
+        preserve: vec![],
+        collection: None,
     })
 }
 

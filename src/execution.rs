@@ -1,6 +1,6 @@
 //! Locked real checkouts and recipe sessions shared by caller and host.
 use crate::{
-    config::{Hooks, Recipe, Refusal, identifier},
+    config::{Hooks, Recipe, Refusal, identifier, preserve_path},
     receipt, repository,
 };
 use fs2::FileExt;
@@ -103,6 +103,8 @@ pub struct Request {
     pub forwarded_env: BTreeMap<String, String>,
     #[serde(default)]
     pub companion_refs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub preserve: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +222,9 @@ pub fn prepare(
     ]))?;
     let seat = root.join("slots").join(&request.seat);
     fs::create_dir_all(root.join("slots"))?;
+    for path in &request.preserve {
+        preserve_path(path)?;
+    }
     migrate_legacy(&bare, &seat)?;
     if !seat.exists() {
         repository::output(
@@ -232,43 +237,7 @@ pub fn prepare(
     if !seat.join(".git").is_dir() {
         return Err("seat has a legacy shared-ref checkout; select a new --seat".into());
     }
-    // Check index flags BEFORE resetting: reset would conceal tampering.
-    let index = repository::output(
-        Command::new("git")
-            .current_dir(&seat)
-            .args(["ls-files", "-v"]),
-    )?;
-    if index.split(|b| *b == b'\n').any(|line| {
-        line.first()
-            .is_some_and(|b| b.is_ascii_lowercase() || *b == b'S')
-    }) {
-        return Err("hidden index entries".into());
-    }
-    repository::output(Command::new("git").current_dir(&seat).args([
-        "checkout",
-        "--force",
-        "--detach",
-        &request.commit,
-    ]))?;
-    repository::output(
-        Command::new("git")
-            .current_dir(&seat)
-            .args(["clean", "-ffdx"]),
-    )?;
-    let head = repository::output(
-        Command::new("git")
-            .current_dir(&seat)
-            .args(["rev-parse", "HEAD"]),
-    )?;
-    let status = repository::output(Command::new("git").current_dir(&seat).args([
-        "status",
-        "--porcelain",
-        "--untracked-files=all",
-        "--ignored",
-    ]))?;
-    if String::from_utf8(head)?.trim() != request.commit || !status.is_empty() {
-        return Err("checkout integrity failed".into());
-    }
+    reset_checkout(&seat, request)?;
     materialize_refs(root, &seat, request)?;
     if !request.mirrors.is_empty() {
         fs::create_dir_all(seat.join(".ferry"))?;
@@ -290,6 +259,62 @@ pub fn prepare(
         }
     }
     Ok((seat, lease, exclusive))
+}
+
+fn reset_checkout(seat: &Path, request: &Request) -> Result<()> {
+    // Check index flags BEFORE resetting: reset would conceal tampering.
+    let index = repository::output(
+        Command::new("git")
+            .current_dir(seat)
+            .args(["ls-files", "-v"]),
+    )?;
+    if index.split(|b| *b == b'\n').any(|line| {
+        line.first()
+            .is_some_and(|b| b.is_ascii_lowercase() || *b == b'S')
+    }) {
+        return Err("hidden index entries".into());
+    }
+    repository::output(Command::new("git").current_dir(seat).args([
+        "checkout",
+        "--force",
+        "--detach",
+        &request.commit,
+    ]))?;
+    let mut clean = Command::new("git");
+    clean.current_dir(seat).args(["clean", "-ffdx"]);
+    for path in &request.preserve {
+        repository::output(Command::new("git").current_dir(seat).args([
+            "check-ignore",
+            "--no-index",
+            "--",
+            &format!("{path}/"),
+        ]))?;
+        if !repository::output(
+            Command::new("git")
+                .current_dir(seat)
+                .args(["ls-files", "--", path]),
+        )?
+        .is_empty()
+        {
+            return Err("preserve path contains tracked files".into());
+        }
+        clean.args(["-e", &format!("/{path}/")]);
+    }
+    repository::output(&mut clean)?;
+    let head = repository::output(
+        Command::new("git")
+            .current_dir(seat)
+            .args(["rev-parse", "HEAD"]),
+    )?;
+    let status = repository::output(Command::new("git").current_dir(seat).args([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    ]))?;
+    if String::from_utf8(head)?.trim() != request.commit || !status.is_empty() {
+        return Err("checkout integrity failed".into());
+    }
+    Ok(())
 }
 
 fn migrate_legacy(bare: &Path, seat: &Path) -> Result<()> {
@@ -426,6 +451,75 @@ pub fn attempted(root: &Path, request: &Request) -> bool {
 }
 
 pub fn run(
+    root: &Path,
+    workdir: &Path,
+    request: &Request,
+    stop: &AtomicBool,
+    json: bool,
+) -> Result<(i32, bool)> {
+    let outcome = run_session(root, workdir, request, stop, json);
+    if let Some(hook) = &request.hooks.collect {
+        let mut collect = request.clone();
+        collect.id = receipt::run_id()?;
+        collect.hooks.prepare = None;
+        collect.hooks.collect = None;
+        collect.recipe.command = vec![
+            "env".into(),
+            format!(
+                "FERRY_EXIT_CODE={}",
+                outcome.as_ref().map_or(125, |(code, _)| *code)
+            ),
+            workdir
+                .join(hook)
+                .to_str()
+                .ok_or("non-UTF-8 collect path")?
+                .to_owned(),
+        ];
+        collect.timeout_seconds = Some(60);
+        // Collection has its own bounded session after recipe teardown, including
+        // timeout or preparation failure. Never reinterpret the recipe verdict.
+        let result = if crate::seat::path(root, &request.seat).exists() {
+            Err("recipe teardown unconfirmed; collection not started".into())
+        } else {
+            run_session(root, workdir, &collect, &AtomicBool::new(false), json)
+        };
+        let collection = match result {
+            Ok((code, false)) => Collection {
+                exit_code: Some(code),
+                error: None,
+            },
+            Ok((code, true)) => Collection {
+                exit_code: Some(code),
+                error: Some("collection timed out".into()),
+            },
+            Err(error) => Collection {
+                exit_code: None,
+                error: Some(error.to_string()),
+            },
+        };
+        fs::write(
+            root.join("runs").join(&request.id).join("collection.json"),
+            serde_json::to_vec(&collection)?,
+        )?;
+    }
+    outcome
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Collection {
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+}
+
+pub fn collection(root: &Path, request: &Request) -> Result<Option<Collection>> {
+    match fs::read(root.join("runs").join(&request.id).join("collection.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn run_session(
     root: &Path,
     workdir: &Path,
     request: &Request,
@@ -601,15 +695,6 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
-    if let Some(collect) = &request.hooks.collect {
-        let status = Command::new(workdir.join(collect))
-            .envs(&env)
-            .env("FERRY_EXIT_CODE", code.to_string())
-            .status()?;
-        if !status.success() {
-            eprintln!("ferry: collect hook failed: {status}");
-        }
-    }
     let tmp = result.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec(&code)?)?;
     fs::rename(tmp, result)?;

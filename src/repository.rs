@@ -185,6 +185,12 @@ pub fn declaration(
                     }
                     config.environment = Some(environment);
                 }
+                if !contract.preserve.is_empty() {
+                    if !config.preserve.is_empty() {
+                        return Err("preserve paths have two declaration owners".into());
+                    }
+                    config.preserve = contract.preserve;
+                }
                 if !contract.companion_refs.is_empty() {
                     if !config.companion_refs.is_empty() {
                         return Err("companion refs have two owners".into());

@@ -69,6 +69,11 @@ If an existing catalog has another schema, provide `[catalog] adapter =
 "scripts/ferry-catalog"`. The committed executable runs caller-side in fresh
 checkouts of the pinned commit and emits JSON `{"version":1,"recipe":{...}}`.
 It may also emit a `mirror` list derived from the repo's existing lockfile.
+It can declare `preserve = ["_build", "deps", ".devenv"]` for ignored build
+directories. Ferry records the list and retains those directories across resets;
+tracked files, HEAD and hidden index flags are still checked. Paths must be
+literal, ignored directories containing no tracked files, never `.git`, `.jj`
+or `.ferry`. The repository's prepare hook makes retained build state current.
 Ferry checks repeatability, validates the entire contract before routing, and
 records adapter and emitted-contract digests. The adapter must be a pure reader;
 Ferry is not a sandbox that can prevent arbitrary side effects outside its
