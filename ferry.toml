@@ -1,0 +1,12 @@
+version = 1
+runner = "path"
+
+[recipe.test]
+command = ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]
+requires = []
+routable = true
+
+[recipe.fail]
+command = ["python3", "-c", "import sys; print('recipe failure'); sys.exit(17)"]
+requires = []
+routable = true

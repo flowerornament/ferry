@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Ferry's CLI and version-one configuration/event interface."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import tomllib
+
+HOME = Path(__file__).resolve().parent
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class Refused(Exception):
+    pass
+
+
+def read_toml(path):
+    try:
+        return tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused(f"cannot read {path}: {error}") from error
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+
+def checked(args, cwd=None, strip=True):
+    result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise Refused(result.stderr.strip() or f"command refused: {args[0]}")
+    return result.stdout.strip() if strip else result.stdout
+
+
+def repository():
+    return Path(checked(["jj", "workspace", "root"]))
+
+
+def committed_toml(root, revision, path):
+    relative = Path(path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise Refused("catalog path must be checkout-relative")
+    raw = checked(
+        ["jj", "file", "show", "-r", revision, str(relative)], root, strip=False
+    )
+    return tomllib.loads(raw), hashlib.sha256(raw.encode()).hexdigest()
+
+
+def catalog(root, config, revision=None):
+    declaration = config.get("catalog", {})
+    if "hook" in declaration:
+        path = root / declaration["hook"]
+        entries = json.loads(checked([str(path)], cwd=root))
+    elif "path" in declaration:
+        raw = (
+            committed_toml(root, revision, declaration["path"])[0]
+            if revision
+            else read_toml(root / declaration["path"])
+        )
+        entries = raw.get(declaration.get("table", "recipe"), {})
+    else:
+        entries = config.get("recipe", {})
+    if not isinstance(entries, dict):
+        raise Refused("catalog must provide a recipe object")
+    return entries
+
+
+def machines():
+    base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    path = base / "ferry/machines.toml"
+    return read_toml(path).get("host", {}) if path.exists() else {}
+
+
+def route(recipe, hosts, on=None, local=False):
+    if local or not hosts and on is None:
+        return "local", {}
+    if recipe.get("routable", False) is not True:
+        if on:
+            raise Refused("recipe is not routable")
+        return "local", {}
+    candidates = {on: hosts[on]} if on in hosts else hosts if on is None else {}
+    required = set(recipe.get("requires", []))
+    for name, host in candidates.items():
+        if required <= set(host.get("features", [])):
+            return name, host
+    raise Refused("no configured machine satisfies the recipe requirements")
+
+
+def emit(kind, data, json_mode):
+    event = {
+        "schema_version": 1,
+        "event": kind,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **data,
+    }
+    if json_mode:
+        print(json.dumps(event), flush=True)
+    elif kind == "output":
+        print(data["text"], end="", flush=True)
+    else:
+        print(f"ferry: {kind}: {json.dumps(data)}", file=sys.stderr, flush=True)
+
+
+def stream(command, env, json_mode, cwd=None):
+    with subprocess.Popen(
+        command,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ) as process:
+        for line in process.stdout:
+            emit("output", {"stream": "combined", "text": line}, json_mode)
+        return process.wait()
+
+
+def run(args):
+    root = repository()
+    sha = checked(
+        ["jj", "log", "--no-graph", "-r", args.commit, "-T", 'commit_id ++ "\\n"'], root
+    )
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Refused("revision must name exactly one commit")
+    if (
+        checked(["jj", "log", "--no-graph", "-r", sha, "-T", "conflict"], root)
+        != "false"
+    ):
+        raise Refused("commit has conflicts")
+    config, config_digest = committed_toml(root, sha, "ferry.toml")
+    if config.get("version") != 1:
+        raise Refused("ferry.toml must declare version = 1")
+    entries = catalog(root, config, sha)
+    if args.recipe not in entries or not NAME.fullmatch(args.recipe):
+        raise Refused("unknown or invalid recipe")
+    recipe = entries[args.recipe]
+    seat = root.name
+    if not NAME.fullmatch(seat):
+        raise Refused("seat must be a plain name")
+    machine, host = route(recipe, machines(), args.on, args.local)
+    spec = {
+        "command": recipe.get("command", ["just", args.recipe]),
+        "arguments": args.arguments,
+        "runner": recipe.get("environment", config.get("runner", "path")),
+        "hooks": config.get("hooks", {}),
+    }
+    if (
+        spec["runner"] not in {"path", "devenv"}
+        or not isinstance(spec["command"], list)
+        or not all(isinstance(v, str) for v in spec["command"])
+    ):
+        raise Refused(
+            "recipe command must be an argv array and environment path or devenv"
+        )
+    emit("accepted", {"commit": sha, "recipe": args.recipe, "seat": seat}, args.json)
+    emit(
+        "routed",
+        {
+            "machine": machine,
+            "features": host.get("features", []),
+            "requires": recipe.get("requires", []),
+            "force_local": "--local",
+        },
+        args.json,
+    )
+    if args.dry_run:
+        return 0
+    output = root / ".ferry/receipts"
+    output.mkdir(parents=True, exist_ok=True)
+    run_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-"
+        + seat
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
+    env = os.environ | {
+        "FERRY_SPEC": json.dumps(spec),
+        "FERRY_SEAT": seat,
+        "FERRY_COMMIT": sha,
+        "FERRY_RECIPE": args.recipe,
+        "FERRY_ID": run_id,
+        "FERRY_RECEIPT_DIR": str(output),
+        "FERRY_RECIPE_SCRIPT": (HOME / "libexec/recipe.py").read_text(),
+    }
+    executor_digest = hashlib.sha256(env["FERRY_RECIPE_SCRIPT"].encode()).hexdigest()
+    spec_digest = hashlib.sha256(env["FERRY_SPEC"].encode()).hexdigest()
+    started = time.monotonic()
+    if machine == "local":
+        anchor = checked(["jj", "git", "root"], root)
+        with tempfile.TemporaryDirectory(prefix="ferry-local-") as temporary:
+            archive = subprocess.run(
+                ["git", f"--git-dir={anchor}", "archive", sha],
+                capture_output=True,
+                check=True,
+            )
+            import io
+
+            with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tree:
+                tree.extractall(temporary, filter="data")
+            emit("prepared", {"commit": sha, "workdir": temporary}, args.json)
+            status = stream(
+                [sys.executable, str(HOME / "libexec/recipe.py")],
+                env,
+                args.json,
+                temporary,
+            )
+        receipt = {
+            "id": run_id,
+            "outcome": "passed" if status == 0 else "failed",
+            "exit_code": status,
+        }
+    else:
+        alias = host.get("ssh", machine)
+        if not NAME.fullmatch(alias):
+            raise Refused("ssh must be a plain configured alias")
+        env["FERRY_REMOTE_SSH"] = "ssh -o BatchMode=yes " + shlex.quote(alias)
+        env["FERRY_REMOTE_RUNNER"] = spec["runner"]
+        status = stream(
+            [
+                "bash",
+                str(HOME / "libexec/ferry-transport.sh"),
+                args.recipe,
+                sha,
+                machine,
+            ],
+            env,
+            args.json,
+            root,
+        )
+        path = output / f"{run_id}.json"
+        if not path.exists():
+            raise Refused("transport produced no receipt")
+        receipt = json.loads(path.read_text())
+        run_id = receipt["id"]
+        if receipt["outcome"] in {"ran-pass", "ran-fail"}:
+            remote = receipt.get("remote", {})
+            if (
+                remote.get("recipe_executor_sha256_received") != executor_digest
+                or remote.get("recipe_spec_sha256_received") != spec_digest
+            ):
+                raise Refused("host did not attest the sent executor and recipe spec")
+            emit(
+                "prepared",
+                {
+                    "commit": remote.get("prepared"),
+                    "machine": machine,
+                    "retained_host_evidence": True,
+                },
+                args.json,
+            )
+        receipt["transport_outcome"] = receipt["outcome"]
+        receipt["outcome"] = {"ran-pass": "passed", "ran-fail": "failed"}.get(
+            receipt["outcome"], receipt["outcome"]
+        )
+    receipt.update(
+        {
+            "schema_version": 1,
+            "commit": sha,
+            "recipe": args.recipe,
+            "machine": machine,
+            "features": host.get("features", []),
+            "requirements": recipe.get("requires", []),
+            "seat": seat,
+            "elapsed_seconds": time.monotonic() - started,
+            "config_sha256": config_digest,
+            "recipe_spec_sha256": spec_digest,
+            "recipe_executor_sha256": executor_digest,
+            "devenv_lock_sha256": digest(root / "devenv.lock"),
+        }
+    )
+    path = output / f"{run_id}.json"
+    path.write_text(json.dumps(receipt, indent=2) + "\n")
+    emit("exited", {"exit_code": status, "outcome": receipt["outcome"]}, args.json)
+    emit("receipt", {"id": run_id, "path": str(path)}, args.json)
+    return status
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="verb", required=True)
+    execute = commands.add_parser("run")
+    execute.add_argument("recipe")
+    choice = execute.add_mutually_exclusive_group()
+    choice.add_argument("--on")
+    choice.add_argument("--local", action="store_true")
+    execute.add_argument("--commit", default="@")
+    execute.add_argument("--json", action="store_true")
+    execute.add_argument("--dry-run", action="store_true")
+    commands.add_parser("machines")
+    commands.add_parser("recipes")
+    receipt = commands.add_parser("receipt")
+    receipt.add_argument("id")
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:
+        index = argv.index("--")
+        argv, extra = argv[:index], argv[index + 1 :]
+    args = parser.parse_args(argv)
+    try:
+        if args.verb == "run":
+            args.arguments = extra
+            return run(args)
+        if args.verb == "machines":
+            print(json.dumps(machines(), indent=2))
+        elif args.verb == "recipes":
+            root = repository()
+            print(json.dumps(catalog(root, read_toml(root / "ferry.toml")), indent=2))
+        else:
+            if not NAME.fullmatch(args.id):
+                raise Refused("invalid receipt id")
+            print(
+                (repository() / ".ferry/receipts" / f"{args.id}.json").read_text(),
+                end="",
+            )
+        return 0
+    except (Refused, OSError, ValueError, subprocess.SubprocessError) as error:
+        emit(
+            "refused",
+            {"reason": str(error), "exit_code": 125},
+            getattr(args, "json", False),
+        )
+        return 125
+
+
+if __name__ == "__main__":
+    sys.exit(main())
