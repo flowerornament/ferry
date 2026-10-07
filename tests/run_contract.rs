@@ -1393,7 +1393,19 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     let first = runs.spawn(dir.path(), "first", false);
     wait_for(&runs, "first-start");
     let alone = runs.spawn(dir.path(), "alone", true);
-    thread::sleep(Duration::from_millis(1500));
+    // Observe, rather than assume, that the exclusive run now holds the gate.
+    let gate = dir.path().join(".ferry/local/locks/host-gate");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while fs::File::open(&gate).is_ok_and(|probe| fs2::FileExt::try_lock_shared(&probe).is_ok())
+        || !gate.exists()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the exclusive run never took the gate"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let gated = Instant::now();
     assert!(
         !runs.logged().contains("alone-start"),
         "exclusive run started beside an in-flight run"
@@ -1404,6 +1416,7 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
         !runs.logged().contains("later-start"),
         "a new run started while an exclusive run waited"
     );
+    let held_for = gated.elapsed();
     runs.release("first");
     wait_for(&runs, "alone-start");
     thread::sleep(Duration::from_millis(500));
@@ -1431,7 +1444,12 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     );
     assert_eq!(receipts[0]["lease"]["mode"], "shared");
     assert_eq!(receipts[1]["lease"]["mode"], "exclusive");
-    assert!(receipts[1]["lease"]["wait_ms"].as_u64().unwrap() >= 1000);
+    // It held the gate and waited at least from then until A was released.
+    assert!(
+        u128::from(receipts[1]["lease"]["wait_ms"].as_u64().unwrap()) >= held_for.as_millis(),
+        "{} < {held_for:?}",
+        receipts[1]["lease"]["wait_ms"]
+    );
     assert_eq!(receipts[2]["lease"]["mode"], "shared");
     assert!(
         receipts[1]["requirements"]

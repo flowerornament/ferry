@@ -243,7 +243,8 @@ fn acquire_as(path: &Path, stop: &AtomicBool, shared: bool) -> Result<fs::File> 
 /// share it. A recipe that requires `exclusive` holds it alone: it first
 /// closes the gate, so no new run starts, then waits for in-flight runs to
 /// release their shared side. New runs pass the gate briefly before taking
-/// their shared side, so a waiting exclusive run cannot be starved. The lease
+/// their shared side, so once the exclusive run holds the gate, later runs
+/// cannot extend its wait; before that it competes for the gate, unqueued. The lease
 /// covers sessions under this state root only: not other users, processes
 /// outside Ferry, or other machines sharing the hardware.
 pub struct HostLease {

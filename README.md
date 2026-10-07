@@ -158,8 +158,9 @@ holds it alone, which is useful for timing measurements:
 2. It waits for in-flight runs to release their shared side.
 3. Then it runs alone.
 
-New runs pass the gate briefly before taking their shared side, so a waiting
-exclusive run cannot be starved. Each receipt records `lease.mode` (`shared`
+New runs pass the gate briefly before taking their shared side, so once the
+exclusive run holds the gate, later runs cannot extend its wait. Before that,
+it competes for the gate like any other run: there is no queue. Each receipt records `lease.mode` (`shared`
 or `exclusive`) and `lease.wait_ms`. `exclusive` is an execution lock, not a
 machine feature: routing ignores it, and receipts list it under
 `requirements`.
