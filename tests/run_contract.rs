@@ -382,10 +382,12 @@ fn collection_failure_records_its_error_without_changing_recipe_verdict() {
 
 #[test]
 fn collection_runs_after_recipe_failure_timeout_and_prepare_refusal() {
-    for (command, prepare, expected) in [
-        ("exit 7", false, "ran-fail"),
-        ("sleep 10", false, "timeout"),
-        ("exit 0", true, "refused"),
+    // Only the timeout case gets a tight budget: it also covers seat
+    // preparation, which a loaded build sandbox can spend a second on.
+    for (command, prepare, expected, timeout) in [
+        ("exit 7", false, "ran-fail", "60"),
+        ("sleep 10", false, "timeout", "1"),
+        ("exit 0", true, "refused", "60"),
     ] {
         let dir = fixture();
         fs::write(
@@ -403,7 +405,14 @@ fn collection_runs_after_recipe_failure_timeout_and_prepare_refusal() {
         git(dir.path(), &["commit", "-m", "collection contract"]);
         let out = run(
             dir.path(),
-            &["run", "pass", "--local", "--timeout-seconds", "1", "--json"],
+            &[
+                "run",
+                "pass",
+                "--local",
+                "--timeout-seconds",
+                timeout,
+                "--json",
+            ],
         );
         let record = receipt(&out);
         assert_eq!(
