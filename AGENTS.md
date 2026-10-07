@@ -45,6 +45,9 @@ this colocated checkout.
 - Staleness: when another agent rewrites a commit under your `@`, run
   `jj workspace update-stale`. Never `jj edit` an ancestor of another
   workspace's `@`.
+- Stop a process only by its exact pid, or a process group you created and
+  recorded. Never `pkill -f`, `killall` or any name or pattern match: this Mac
+  and bench are shared by many agents' seats, and a pattern kills theirs.
 - Recovery starts at `jj op log`, `jj undo` and `jj op restore`, before any
   destructive file operation. The `jj-ops` skill holds the jj model.
 
