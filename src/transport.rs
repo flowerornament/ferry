@@ -186,6 +186,8 @@ pub struct HostResult {
     pub exe: Option<String>,
     #[serde(default)]
     pub custody: Option<crate::custody::Release>,
+    #[serde(default)]
+    pub lease: Option<execution::Lease>,
 }
 fn event(value: &serde_json::Value) {
     serde_json::to_writer(std::io::stdout(), value)
@@ -253,6 +255,7 @@ pub fn host_run() -> Result<i32> {
         source_rev: Some(receipt::source_rev()),
         exe: receipt::exe_path(),
         custody: None,
+        lease: None,
     };
     event(&serde_json::json!({"protocol":1,"event":"accepted","id":request.id}));
     crate::custody::supervise()?;
@@ -286,6 +289,7 @@ pub fn host_run() -> Result<i32> {
             &request,
             terminal(result.outcome),
         )?);
+        result.lease = Some(exclusive.record.clone());
         drop(exclusive);
         drop(lease);
         Ok(())
@@ -373,6 +377,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         request,
         terminal(record.outcome),
     )?);
+    record.lease = Some(exclusive.record.clone());
     drop(exclusive);
     drop(lease);
     Ok(())
@@ -579,6 +584,7 @@ fn accept_result(
     record.host_binary_sha256 = Some(result.binary_sha256);
     record.host_source_rev = result.source_rev;
     record.custody = result.custody;
+    record.lease = result.lease;
     record.host_exe = result.exe;
     if record.host_binary_sha256.as_deref() != Some(&info.binary_sha256) {
         record.outcome = Outcome::Lost;

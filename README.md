@@ -148,6 +148,34 @@ example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`. Under an explicit
 host policy, Ferry may later reclaim named subdirectories of it from idle
 seats. It never reclaims anything else.
 
+### Host lease
+
+Every session holds a host-wide lease while it runs. Ordinary runs share it.
+`ferry run --exclusive`, or a recipe declaring `requires = ["exclusive"]`,
+holds it alone, which is useful for timing measurements:
+
+1. The run first closes a gate, so no new run starts.
+2. It waits for in-flight runs to release their shared side.
+3. Then it runs alone.
+
+New runs pass the gate briefly before taking their shared side, so a waiting
+exclusive run cannot be starved. Each receipt records `lease.mode` (`shared`
+or `exclusive`) and `lease.wait_ms`. `exclusive` is an execution lock, not a
+machine feature: routing ignores it, and receipts list it under
+`requirements`.
+
+The lease covers sessions under one state root: one user's Ferry on one host,
+or one repository's `.ferry/local`. It does not quiet:
+
+- processes started outside Ferry;
+- other users;
+- other virtual machines on the same hardware;
+- hosts whose Ferry predates the lease. Such a host holds only the exclusive
+  side and makes ordinary runs wait for nothing.
+
+The wait for the lease is not bounded by `--timeout-seconds`; interrupt the
+caller to give up.
+
 ### Seat custody
 
 When a session releases its seat, the receipt's `custody` records what the

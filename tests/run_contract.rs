@@ -1320,3 +1320,123 @@ fn escaped_descendant_taints(diagnostic_proc: Option<&str>) {
         );
     }
 }
+
+/// Runs of the `hold` recipe that a lease test spawned. Dropping it releases
+/// every run and then stops exactly the callers it spawned, so a failed
+/// assertion never leaves a run waiting for a lock or a release file.
+struct HoldRuns {
+    log: std::path::PathBuf,
+    pids: Vec<i32>,
+}
+impl HoldRuns {
+    fn spawn(&mut self, dir: &Path, name: &str, exclusive: bool) -> std::process::Child {
+        let mut args = vec!["run", "hold", "--local", "--json", "--seat", name];
+        if exclusive {
+            args.push("--exclusive");
+        }
+        args.extend(["--", name]);
+        let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .current_dir(dir)
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        self.pids.push(i32::try_from(child.id()).unwrap());
+        child
+    }
+    fn release(&self, name: &str) {
+        fs::write(format!("{}.{name}", self.log.display()), "").unwrap();
+    }
+    fn logged(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+impl Drop for HoldRuns {
+    fn drop(&mut self) {
+        for name in ["first", "alone", "later"] {
+            let _ = fs::write(format!("{}.{name}", self.log.display()), "");
+        }
+        for pid in &self.pids {
+            let _ = kill(Pid::from_raw(*pid), Signal::SIGTERM);
+        }
+    }
+}
+
+#[test]
+fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture();
+    let log = dir.path().join("lease.log");
+    // Each run logs its start, waits for its own release file, logs its end.
+    fs::write(
+        dir.path().join("ferry.toml"),
+        format!(
+            "version=1\n[recipe.hold]\ncommand=['sh','-c','echo \"$1-start\" >> {log}; while [ ! -e \"{log}.$1\" ] && [ -e {log} ]; do sleep 0.05; done; echo \"$1-end\" >> {log}','hold']\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "lease"]);
+    let mut runs = HoldRuns { log, pids: vec![] };
+    let wait_for = |runs: &HoldRuns, line: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !runs.logged().lines().any(|l| l == line) {
+            assert!(Instant::now() < deadline, "never logged {line}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let first = runs.spawn(dir.path(), "first", false);
+    wait_for(&runs, "first-start");
+    let alone = runs.spawn(dir.path(), "alone", true);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !runs.logged().contains("alone-start"),
+        "exclusive run started beside an in-flight run"
+    );
+    let later = runs.spawn(dir.path(), "later", false);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !runs.logged().contains("later-start"),
+        "a new run started while an exclusive run waited"
+    );
+    runs.release("first");
+    wait_for(&runs, "alone-start");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !runs.logged().contains("later-start"),
+        "a new run started beside an exclusive run"
+    );
+    runs.release("alone");
+    wait_for(&runs, "later-start");
+    runs.release("later");
+    let receipts: Vec<serde_json::Value> = [first, alone, later]
+        .into_iter()
+        .map(|child| receipt(&child.wait_with_output().unwrap()))
+        .collect();
+    assert_eq!(
+        runs.logged().lines().collect::<Vec<_>>(),
+        [
+            "first-start",
+            "first-end",
+            "alone-start",
+            "alone-end",
+            "later-start",
+            "later-end"
+        ]
+    );
+    assert_eq!(receipts[0]["lease"]["mode"], "shared");
+    assert_eq!(receipts[1]["lease"]["mode"], "exclusive");
+    assert!(receipts[1]["lease"]["wait_ms"].as_u64().unwrap() >= 1000);
+    assert_eq!(receipts[2]["lease"]["mode"], "shared");
+    assert!(
+        receipts[1]["requirements"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("exclusive"))
+    );
+}

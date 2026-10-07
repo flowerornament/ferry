@@ -212,6 +212,9 @@ pub fn interrupted_code() -> i32 {
     caught_signal().map_or(130, |signal| 128 + signal)
 }
 fn acquire(path: &Path, stop: &AtomicBool) -> Result<fs::File> {
+    acquire_as(path, stop, false)
+}
+fn acquire_as(path: &Path, stop: &AtomicBool, shared: bool) -> Result<fs::File> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -222,7 +225,12 @@ fn acquire(path: &Path, stop: &AtomicBool) -> Result<fs::File> {
         if stop.load(Ordering::SeqCst) {
             return Err("client lost while waiting for lock".into());
         }
-        match file.try_lock_exclusive() {
+        let locked = if shared {
+            FileExt::try_lock_shared(&file)
+        } else {
+            file.try_lock_exclusive()
+        };
+        match locked {
             Ok(()) => return Ok(file),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
@@ -231,11 +239,56 @@ fn acquire(path: &Path, stop: &AtomicBool) -> Result<fs::File> {
         }
     }
 }
+/// The host-wide lease every session holds while it runs. Ordinary runs
+/// share it. A recipe that requires `exclusive` holds it alone: it first
+/// closes the gate, so no new run starts, then waits for in-flight runs to
+/// release their shared side. New runs pass the gate briefly before taking
+/// their shared side, so a waiting exclusive run cannot be starved. The lease
+/// covers sessions under this state root only: not other users, processes
+/// outside Ferry, or other machines sharing the hardware.
+pub struct HostLease {
+    _held: Vec<fs::File>,
+    pub record: Lease,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Lease {
+    /// `shared` or `exclusive`.
+    pub mode: String,
+    /// How long the session waited for the lease.
+    pub wait_ms: u128,
+}
+
+impl HostLease {
+    fn acquire(root: &Path, request: &Request, stop: &AtomicBool) -> Result<Self> {
+        let started = std::time::Instant::now();
+        let gate = root.join("locks/host-gate");
+        let host = root.join("locks/host");
+        let exclusive = request.recipe.requires.contains("exclusive");
+        let held = if exclusive {
+            let gate = acquire_as(&gate, stop, false)?;
+            vec![gate, acquire_as(&host, stop, false)?]
+        } else {
+            let gate = acquire_as(&gate, stop, true)?;
+            let host = acquire_as(&host, stop, true)?;
+            drop(gate);
+            vec![host]
+        };
+        Ok(Self {
+            _held: held,
+            record: Lease {
+                mode: if exclusive { "exclusive" } else { "shared" }.into(),
+                wait_ms: started.elapsed().as_millis(),
+            },
+        })
+    }
+}
+
 pub fn prepare(
     root: &Path,
     request: &Request,
     stop: &AtomicBool,
-) -> Result<(PathBuf, fs::File, Option<fs::File>)> {
+) -> Result<(PathBuf, fs::File, HostLease)> {
     validate(request)?;
     fs::create_dir_all(root.join("locks"))?;
     let lease = acquire(&root.join("locks").join(&request.seat), stop)?;
@@ -250,11 +303,7 @@ pub fn prepare(
             return Err("cleanup_pending: an earlier session has unconfirmed teardown".into());
         }
     }
-    let exclusive = if request.recipe.requires.contains("exclusive") {
-        Some(acquire(&root.join("locks/host-exclusive"), stop)?)
-    } else {
-        None
-    };
+    let exclusive = HostLease::acquire(root, request, stop)?;
     let bare = root.join("repo.git");
     repository::output(Command::new("git").arg("--git-dir").arg(&bare).args([
         "cat-file",

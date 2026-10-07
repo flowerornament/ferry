@@ -82,6 +82,9 @@ pub struct Receipt {
     /// What the session left behind at release; null when it never released.
     #[serde(default)]
     pub custody: Option<crate::custody::Release>,
+    /// The host lease the session held: `shared` or `exclusive`, and its wait.
+    #[serde(default)]
+    pub lease: Option<crate::execution::Lease>,
 }
 
 pub fn now_ms() -> u128 {

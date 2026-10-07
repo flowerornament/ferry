@@ -70,6 +70,9 @@ struct Run {
     json: bool,
     #[arg(long)]
     timeout_seconds: Option<u64>,
+    /// Hold the host alone: wait for in-flight runs, keep new ones out.
+    #[arg(long)]
+    exclusive: bool,
     /// Arguments appended to the recipe's command, after `--`.
     #[arg(last = true)]
     args: Vec<String>,
@@ -112,10 +115,15 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         || Ok(BTreeMap::default()),
         |environment| environment.capture(std::env::vars_os()),
     )?;
-    let declaration = declared
+    let mut declaration = declared
         .recipes
         .get(&options.recipe)
-        .ok_or("unknown recipe")?;
+        .ok_or("unknown recipe")?
+        .clone();
+    if options.exclusive {
+        declaration.requires.insert("exclusive".into());
+    }
+    let declaration = &declaration;
     let hosts = machines()?;
     let route = config::route(declaration, &hosts, options.on.as_deref(), options.local)?;
     record.requirements = declaration.requires.iter().cloned().collect();
@@ -254,6 +262,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         host_source_rev: None,
         host_exe: None,
         custody: None,
+        lease: None,
     })
 }
 
