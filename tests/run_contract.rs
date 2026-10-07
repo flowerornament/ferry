@@ -1868,7 +1868,13 @@ fn a_recipe_can_empty_a_process_group_it_killed() {
         dir.path().join("group.sh"),
         r#"python3 -c 'import os,subprocess; os.setpgid(0,0); subprocess.Popen(["sleep","60"]); subprocess.Popen(["sleep","60"]); os.execvp("sleep",["sleep","61"])' &
 g=$!
-sleep 0.5
+# Ready only once the leader and both members are in the group.
+i=0
+until [ "$(ps -eo pgid= | awk -v g="$g" '$1 == g' | wc -l)" -ge 3 ]; do
+  i=$((i + 1))
+  [ "$i" -lt 300 ] || { echo "group never formed"; exit 3; }
+  sleep 0.1
+done
 kill -s KILL -- "-$g"
 wait "$g" 2>/dev/null
 i=0
@@ -1890,7 +1896,8 @@ exit 1
     git(dir.path(), &["add", "ferry.toml", "group.sh"]);
     git(dir.path(), &["commit", "-m", "group teardown"]);
     let out = run(dir.path(), &["run", "group", "--local", "--json"]);
-    // 7 means the group emptied; the recipe's own exit status is preserved.
+    // 7 means the group emptied; 3 means it never formed. The recipe's own
+    // exit status is preserved either way.
     assert_eq!(
         out.status.code(),
         Some(7),
