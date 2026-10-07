@@ -1,4 +1,4 @@
-{ lib, rustPlatform, git, jujutsu, openssh, inetutils, procps, stdenv, makeWrapper, python3, sourceRev ? null }:
+{ lib, rustPlatform, git, jujutsu, openssh, inetutils, procps, util-linux, stdenv, makeWrapper, python3, sourceRev ? null }:
 let
   version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 in rustPlatform.buildRustPackage {
@@ -11,7 +11,7 @@ in rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
   env = lib.optionalAttrs (sourceRev != null) { FERRY_SOURCE_REV = sourceRev; };
   nativeBuildInputs = [ makeWrapper ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ rustPlatform.bindgenHook ];
-  nativeCheckInputs = [ git jujutsu python3 inetutils ] ++ lib.optionals stdenv.hostPlatform.isLinux [ procps ];
+  nativeCheckInputs = [ git jujutsu python3 inetutils ] ++ lib.optionals stdenv.hostPlatform.isLinux [ procps util-linux ];
   doCheck = true;
   # The real session tests inspect and signal only processes they start.
   # This is the same Darwin sandbox allowance used by nixpkgs' fish tests.

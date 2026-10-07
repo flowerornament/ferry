@@ -1278,7 +1278,7 @@ fn escaped_descendant_taints(diagnostic_proc: Option<&str>) {
     // directory, and uses the cache only later, by path.
     fs::write(
         dir.path().join("ferry.toml"),
-        "version=1\n[recipe.escape]\ncommand=['sh','-c','late=\"$FERRY_CACHE_DIR/late\"; setsid env -i sh -c \"exec </dev/null >/dev/null 2>&1; cd /; sleep 5; touch $late\" & exit 0']\n",
+        "version=1\n[recipe.escape]\ncommand=['sh','-c','command -v setsid >/dev/null || exit 97; late=\"$FERRY_CACHE_DIR/late\"; nap=$(command -v sleep); mark=$(command -v touch); setsid env -i sh -c \"exec </dev/null >/dev/null 2>&1; cd /; $nap 5; $mark $late\" & exit 0']\n",
     )
     .unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
