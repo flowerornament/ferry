@@ -283,7 +283,10 @@ pub fn relative_path(value: &str) -> Result<(), Refusal> {
 
 pub fn preserve_path(value: &str) -> Result<(), Refusal> {
     relative_path(value)?;
-    if matches!(value.split('/').next(), Some(".git" | ".jj" | ".ferry")) {
+    if value
+        .split('/')
+        .any(|part| matches!(part, ".git" | ".jj" | ".ferry"))
+    {
         return Err(Refusal::Declaration(
             "cannot preserve version-control or Ferry state".into(),
         ));

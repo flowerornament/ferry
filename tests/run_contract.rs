@@ -625,7 +625,12 @@ fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
     let clone = dir.path().join("ordinary-clone");
     git(
         dir.path(),
-        &["clone", store.to_str().unwrap(), clone.to_str().unwrap()],
+        &[
+            "clone",
+            "--no-local",
+            store.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
     );
     git(&clone, &["cat-file", "-e", sha.trim()]);
     let head = fs::read_to_string(store.join("HEAD")).unwrap();

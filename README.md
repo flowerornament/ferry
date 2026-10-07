@@ -74,6 +74,8 @@ directories. Ferry records the list and retains those directories across resets;
 tracked files, HEAD and hidden index flags are still checked. Paths must be
 literal, ignored directories containing no tracked files, never `.git`, `.jj`
 or `.ferry`. The repository's prepare hook makes retained build state current.
+Preserved state is a declared cache: a run can depend on earlier runs in the
+same seat, not only on the requested commit. Omit preserve for a clean run.
 Ferry checks repeatability, validates the entire contract before routing, and
 records adapter and emitted-contract digests. The adapter must be a pure reader;
 Ferry is not a sandbox that can prevent arbitrary side effects outside its
