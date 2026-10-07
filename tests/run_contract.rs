@@ -1260,6 +1260,18 @@ fn a_normal_release_records_the_seat_idle_where_custody_is_supported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_escaped_descendant_taints_the_seat_instead_of_leaving_it_idle() {
+    escaped_descendant_taints(None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blind_diagnostic_never_turns_a_live_child_into_idle() {
+    // /proc shows nothing, but the kernel still reports the live child.
+    escaped_descendant_taints(Some("/nonexistent"));
+}
+
+#[cfg(target_os = "linux")]
+fn escaped_descendant_taints(diagnostic_proc: Option<&str>) {
     use std::{thread, time::Duration};
     let dir = fixture();
     // The escapee leaves the session, drops its environment, descriptors and
@@ -1271,7 +1283,15 @@ fn an_escaped_descendant_taints_the_seat_instead_of_leaving_it_idle() {
     .unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
     git(dir.path(), &["commit", "-m", "escape"]);
-    let out = run(dir.path(), &["run", "escape", "--local", "--json"]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
+    command
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .args(["run", "escape", "--local", "--json"]);
+    if let Some(proc_root) = diagnostic_proc {
+        command.env("FERRY_DIAGNOSTIC_PROC", proc_root);
+    }
+    let out = command.output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -1281,7 +1301,7 @@ fn an_escaped_descendant_taints_the_seat_instead_of_leaving_it_idle() {
     let custody = &record["custody"];
     assert_eq!(custody["record"], "taint", "{custody}");
     let survivors = custody["census"]["survivors"].as_array().unwrap();
-    assert!(!survivors.is_empty());
+    assert_eq!(survivors.is_empty(), diagnostic_proc.is_some(), "{custody}");
     assert!(seat_record(dir.path(), "idle").is_none());
     assert!(seat_record(dir.path(), "taint").is_some());
     // The escapee really was alive and did use the cache afterwards.

@@ -22,8 +22,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub enum Census {
     /// No live descendant of the supervisor.
     Empty,
-    /// Live descendants survived the session.
+    /// The kernel reports a live child. The pids name what /proc showed of
+    /// them, possibly nothing; the verdict does not depend on that list.
     Survivors(Vec<i32>),
+    /// The census could not be taken; custody is unknown.
+    Unknown(String),
     /// This platform cannot take a complete census.
     Unsupported,
 }
@@ -66,7 +69,7 @@ pub fn release(
     request: &crate::execution::Request,
     terminal: bool,
 ) -> Result<Release> {
-    let census = census()?;
+    let census = census();
     let record = match (&census, terminal) {
         (Census::Survivors(pids), _) => {
             write(
@@ -107,58 +110,50 @@ fn write(root: &Path, kind: &str, seat: &str, value: &impl Serialize) -> Result<
     Ok(())
 }
 
+/// The kernel decides: after reaping every exited orphan, ECHILD proves no
+/// child remains, and a live child proves a survivor. Because the supervisor
+/// is a subreaper, every surviving descendant is, or sits under, a direct
+/// child. Any other wait error leaves custody unknown.
 #[cfg(target_os = "linux")]
-fn census() -> Result<Census> {
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-    // Reap descendants that already exited and were reparented here.
-    while let Ok(status) = waitpid(None, Some(WaitPidFlag::WNOHANG)) {
-        if status == WaitStatus::StillAlive {
-            break;
+fn census() -> Census {
+    use nix::{
+        errno::Errno,
+        sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+    };
+    loop {
+        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            Err(Errno::ECHILD) => return Census::Empty,
+            Ok(WaitStatus::StillAlive) => return Census::Survivors(children()),
+            Ok(_) => {}
+            Err(error) => return Census::Unknown(error.to_string()),
         }
     }
-    let me = i32::try_from(std::process::id())?;
-    let mut parents = std::collections::HashMap::new();
-    for entry in fs::read_dir("/proc")? {
-        let Ok(pid) = entry?.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        // A process that exits during the census simply drops out of it.
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        let (_, fields) = stat.rsplit_once(')').ok_or("invalid process stat")?;
-        let mut fields = fields.split_whitespace();
-        let state = fields.next().ok_or("missing process state")?;
-        let ppid: i32 = fields.next().ok_or("missing parent")?.parse()?;
-        if state != "Z" {
-            parents.insert(pid, ppid);
-        }
-    }
-    let mut survivors: Vec<i32> = parents
-        .keys()
-        .copied()
-        .filter(|pid| {
-            let mut current = *pid;
-            for _ in 0..parents.len() {
-                match parents.get(&current) {
-                    Some(&parent) if parent == me => return true,
-                    Some(&parent) if parent > 1 => current = parent,
-                    _ => return false,
-                }
-            }
-            false
+}
+
+/// Diagnostic only: the supervisor's live direct children, as far as /proc
+/// shows them. An empty or partial list never weakens a kernel survivor.
+#[cfg(target_os = "linux")]
+fn children() -> Vec<i32> {
+    let me = std::process::id().to_string();
+    let proc_root = std::env::var_os("FERRY_DIAGNOSTIC_PROC").unwrap_or_else(|| "/proc".into());
+    let mut pids: Vec<i32> = fs::read_dir(&proc_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let (_, fields) = stat.rsplit_once(')')?;
+            let mut fields = fields.split_whitespace();
+            let state = fields.next()?;
+            (state != "Z" && fields.next()? == me).then_some(pid)
         })
         .collect();
-    survivors.sort_unstable();
-    Ok(if survivors.is_empty() {
-        Census::Empty
-    } else {
-        Census::Survivors(survivors)
-    })
+    pids.sort_unstable();
+    pids
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps)]
-fn census() -> Result<Census> {
-    Ok(Census::Unsupported)
+fn census() -> Census {
+    Census::Unsupported
 }
