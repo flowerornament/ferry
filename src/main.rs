@@ -94,6 +94,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     record.adapter_sha256 = evidence.adapter_sha256;
     record.contract_sha256 = evidence.contract_sha256;
     let declared = declared?;
+    interrupted()?;
     let config = declared.config;
     for path in &config.preserve {
         config::preserve_path(path)?;
@@ -162,6 +163,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         },
     )?;
     record.mirrors.clone_from(&request.mirrors);
+    interrupted()?;
     match route {
         config::Route::Local => transport::local(root, &request, record, options.json),
         config::Route::Remote(name) => {
@@ -169,7 +171,23 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         }
     }
 }
+/// Refuses to start another phase once the caller has been signalled.
+fn interrupted() -> Result<()> {
+    match execution::caught_signal() {
+        Some(signal) => {
+            Err(format!("caller received {} before dispatch", signal_name(signal)).into())
+        }
+        None => Ok(()),
+    }
+}
+fn signal_name(signal: i32) -> String {
+    nix::sys::signal::Signal::try_from(signal)
+        .map_or_else(|_| format!("signal {signal}"), |s| s.as_str().to_owned())
+}
 fn run(options: &Run) -> Result<i32> {
+    // Catch INT, TERM and HUP from the start, so an early signal still ends
+    // in a receipt rather than the default action.
+    execution::stopped()?;
     let root = repository::root()?;
     let start = receipt::now_ms();
     let mut record = new_record(&options.recipe, &options.seat)?;
@@ -177,6 +195,20 @@ fn run(options: &Run) -> Result<i32> {
     record.args_sha256 = Some(receipt::digest(&serde_json::to_vec(&options.args)?));
     if let Err(error) = dispatch(&root, options, &mut record) {
         record.reason = Some(error.to_string());
+    }
+    // An interrupted caller exits 128 plus its signal, unless the recipe had
+    // already reached a verdict.
+    if let Some(signal) = execution::caught_signal()
+        && !matches!(
+            record.outcome,
+            receipt::Outcome::RanPass | receipt::Outcome::RanFail | receipt::Outcome::Timeout
+        )
+    {
+        record.outcome = receipt::Outcome::Lost;
+        record.exit_code = 128 + signal;
+        if record.reason.is_none() {
+            record.reason = Some(format!("caller received {}", signal_name(signal)));
+        }
     }
     record.elapsed_ms = receipt::now_ms() - start;
     receipt::save(&root, &record)?;

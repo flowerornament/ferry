@@ -190,8 +190,8 @@ fn event(value: &serde_json::Value) {
         .unwrap_or_else(|e| eprintln!("ferry: event write failed: {e}"));
     println!();
 }
-pub fn host_run() -> Result<i32> {
-    let mut input = std::io::BufReader::new(std::io::stdin());
+/// Reads, validates and reserves a request. Any error here is a refusal.
+fn admit(input: &mut impl BufRead) -> Result<(Request, PathBuf, fs::File)> {
     let mut line = String::new();
     input.read_line(&mut line)?;
     let request: Request = serde_json::from_str(&line)?;
@@ -201,10 +201,24 @@ pub fn host_run() -> Result<i32> {
     fs::create_dir_all(root.join("records"))?;
     let record_path = root.join("records").join(format!("{}.json", request.id));
     // A reservation refuses reuse even after a crash, before acquiring any seat.
-    let mut record = fs::OpenOptions::new()
+    let record = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(record_path)?;
+    Ok((request, root, record))
+}
+pub fn host_run() -> Result<i32> {
+    let mut input = std::io::BufReader::new(std::io::stdin());
+    // Everything before `accepted` is a refusal: nothing ran. Say so in the
+    // protocol, so the caller records refused 125 rather than a lost run.
+    let admitted = admit(&mut input);
+    let (request, root, mut record) = match admitted {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            event(&serde_json::json!({"protocol":1,"event":"refused","reason":error.to_string()}));
+            return Ok(125);
+        }
+    };
     let stop = execution::stopped()?;
     let reader_stop = stop.clone();
     thread::spawn(move || {
@@ -266,7 +280,7 @@ pub fn host_run() -> Result<i32> {
         result.reason = Some(error.to_string());
         if stop.load(Ordering::SeqCst) {
             result.outcome = Outcome::Lost;
-            result.exit_code = 130;
+            result.exit_code = execution::interrupted_code();
         } else if execution::attempted(&root, &request) {
             result.outcome = Outcome::Lost;
             result.exit_code = 255;
@@ -425,32 +439,68 @@ pub fn remote(
         }
     });
     let stdout = child.stdout.take().ok_or("missing SSH stdout")?;
-    let mut host_result = None;
+    let stream = read_stream(stdout, json)?;
+    stop.store(true, Ordering::SeqCst);
+    heartbeat.join().map_err(|_| "heartbeat thread panicked")?;
+    let status = child.wait()?;
+    if let Some(result) = stream.result {
+        accept_result(root, machine, request, record, &info, result)?;
+    } else if let Some(reason) = stream.refusal {
+        record.outcome = Outcome::Refused;
+        record.exit_code = 125;
+        record.reason = Some(format!("host refused before acceptance: {reason}"));
+    } else if !stream.accepted && status.code() == Some(125) {
+        // A host from before the refusal event exits 125 for every error it
+        // meets before acceptance, and the recipe cannot have started.
+        record.outcome = Outcome::Refused;
+        record.exit_code = 125;
+        record.reason = Some("host refused before acceptance (exit 125; see its stderr)".into());
+    } else {
+        record.reason = Some(format!("no host result: {status}"));
+    }
+    Ok(())
+}
+
+/// What the host said on the protocol stream.
+struct HostStream {
+    result: Option<HostResult>,
+    accepted: bool,
+    refusal: Option<String>,
+}
+
+/// Relays recipe output and collects the host's protocol verdicts.
+fn read_stream(stdout: impl std::io::Read, json: bool) -> Result<HostStream> {
+    let mut stream = HostStream {
+        result: None,
+        accepted: false,
+        refusal: None,
+    };
     for line in std::io::BufReader::new(stdout).lines() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line)?;
         if value.get("protocol").and_then(serde_json::Value::as_u64) != Some(1) {
             return Err("host protocol mismatch".into());
         }
-        if value.get("event").and_then(|v| v.as_str()) == Some("host-result") {
-            host_result = Some(serde_json::from_value::<HostResult>(
-                value["result"].clone(),
-            )?);
-        } else if json {
+        match value.get("event").and_then(|v| v.as_str()) {
+            Some("accepted") => stream.accepted = true,
+            Some("refused") if !stream.accepted => {
+                stream.refusal = Some(value["reason"].as_str().unwrap_or("").to_owned());
+            }
+            Some("host-result") => {
+                stream.result = Some(serde_json::from_value::<HostResult>(
+                    value["result"].clone(),
+                )?);
+                continue;
+            }
+            _ => {}
+        }
+        if json {
             println!("{line}");
         } else if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
             println!("{text}");
         }
     }
-    stop.store(true, Ordering::SeqCst);
-    heartbeat.join().map_err(|_| "heartbeat thread panicked")?;
-    let status = child.wait()?;
-    if let Some(result) = host_result {
-        accept_result(root, machine, request, record, &info, result)?;
-    } else {
-        record.reason = Some(format!("no host result: {status}"));
-    }
-    Ok(())
+    Ok(stream)
 }
 
 fn push_companions(root: &Path, machine: &config::Machine, request: &Request) -> Result<()> {

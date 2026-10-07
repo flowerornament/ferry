@@ -17,8 +17,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -167,6 +167,9 @@ pub fn validate(request: &Request) -> Result<()> {
     }
     Ok(())
 }
+/// The last of SIGINT, SIGTERM or SIGHUP this process caught; zero for none.
+static CAUGHT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+
 pub fn stopped() -> Result<Arc<AtomicBool>> {
     let flag = Arc::new(AtomicBool::new(false));
     for signal in [
@@ -175,8 +178,22 @@ pub fn stopped() -> Result<Arc<AtomicBool>> {
         signal_hook::consts::SIGHUP,
     ] {
         signal_hook::flag::register(signal, flag.clone())?;
+        signal_hook::flag::register_usize(signal, CAUGHT.clone(), usize::try_from(signal)?)?;
     }
     Ok(flag)
+}
+
+/// The signal this process caught, if any.
+pub fn caught_signal() -> Option<i32> {
+    i32::try_from(CAUGHT.load(Ordering::SeqCst))
+        .ok()
+        .filter(|signal| *signal != 0)
+}
+
+/// The exit code of an interrupted run: 128 plus the signal this process
+/// caught. A host whose client disappeared without signalling it keeps 130.
+pub fn interrupted_code() -> i32 {
+    caught_signal().map_or(130, |signal| 128 + signal)
 }
 fn acquire(path: &Path, stop: &AtomicBool) -> Result<fs::File> {
     let file = fs::OpenOptions::new()
@@ -603,7 +620,7 @@ fn run_session(
             }
         }
         if stop.load(Ordering::SeqCst) {
-            break 130;
+            break interrupted_code();
         }
         if request
             .timeout_seconds

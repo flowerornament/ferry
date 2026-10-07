@@ -878,6 +878,22 @@ fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
 
 #[test]
 fn client_term_kills_children_in_another_process_group() {
+    interrupted_caller_kills_children_and_exits_128_plus_signal(
+        nix::sys::signal::Signal::SIGTERM,
+        143,
+    );
+}
+#[test]
+fn client_interrupt_exits_130() {
+    interrupted_caller_kills_children_and_exits_128_plus_signal(
+        nix::sys::signal::Signal::SIGINT,
+        130,
+    );
+}
+fn interrupted_caller_kills_children_and_exits_128_plus_signal(
+    signal: nix::sys::signal::Signal,
+    code: i32,
+) {
     use std::{
         thread,
         time::{Duration, Instant},
@@ -918,7 +934,7 @@ fn client_term_kills_children_in_another_process_group() {
     let pid: i32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),
-        nix::sys::signal::Signal::SIGTERM,
+        signal,
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -934,7 +950,54 @@ fn client_term_kills_children_in_another_process_group() {
         "sibling process-group child survived"
     );
     let output = caller.child.take().unwrap().wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(code));
     assert_eq!(receipt(&output)["outcome"], "lost");
+    assert_eq!(receipt(&output)["exit_code"], code);
+}
+
+#[test]
+fn a_signal_before_dispatch_still_writes_a_receipt() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture();
+    let marker = dir.path().join("adapter-started");
+    with_adapter(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\ntouch '{}'\nsleep 2\nprintf '%s\\n' '{{\"version\":1,\"recipe\":{{\"pass\":{{\"command\":[\"sh\",\"-c\",\"echo recipe-ran\"],\"requires\":[],\"routable\":false}}}}}}'\n",
+            marker.display()
+        ),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .args(["run", "pass", "--local", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(marker.exists(), "adapter never started");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(143));
+    let record = receipt(&output);
+    assert_eq!(record["outcome"], "lost");
+    assert_eq!(record["exit_code"], 143);
+    assert!(record["reason"].as_str().unwrap().contains("SIGTERM"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("recipe-ran"));
 }
 #[test]
 fn hidden_index_flags_refuse_before_resetting_the_seat() {
@@ -1015,4 +1078,97 @@ fn nondeterministic_adapter_is_a_refusal() {
             .unwrap()
             .contains("nondeterministic")
     );
+}
+
+/// A host reached through an SSH shim: `host` is its HOME, `binary` its
+/// ferry path relative to that HOME.
+fn remote_run(dir: &Path, binary: &str, args: &[&str]) -> Output {
+    let host = dir.join("host");
+    let tools = dir.join("transport-tools");
+    fs::create_dir_all(host.join(".local/bin")).unwrap();
+    fs::create_dir_all(&tools).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let config = dir.join("config/ferry");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("machines.toml"),
+        format!(
+            "[host.test-host]\nssh='test-host'\nbinary='{binary}'\ntriple='{}-{}'\ncores=1\nfeatures=[]\n",
+            std::env::consts::ARCH,
+            if cfg!(target_os = "macos") {
+                "apple-darwin"
+            } else {
+                "unknown-linux-gnu"
+            }
+        ),
+    )
+    .unwrap();
+    Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("HOME", dir)
+        .env(
+            "PATH",
+            format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GIT_SSH", tools.join("ssh"))
+        .env("FERRY_TEST_HOST", &host)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_host_refusal_before_acceptance_is_refused_not_lost() {
+    let dir = fixture();
+    // A file where the host keeps its run records: it cannot reserve the id.
+    fs::create_dir_all(dir.path().join("host/.local/state/ferry")).unwrap();
+    fs::write(dir.path().join("host/.local/state/ferry/records"), "").unwrap();
+    let out = remote_run(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("host refused before acceptance: "),
+        "{}",
+        record["reason"]
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
+}
+
+#[test]
+fn an_older_host_exiting_125_before_acceptance_is_refused_not_lost() {
+    let dir = fixture();
+    let bin = dir.path().join("host/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    // An older host-run says nothing on the protocol and exits 125.
+    fs::write(
+        bin.join("old-ferry"),
+        "#!/bin/sh\ncase \"$1\" in host-info) exec \"$HOME/.local/bin/ferry\" host-info;; *) echo 'ferry: File exists (os error 17)' >&2; exit 125;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = remote_run(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(125));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused");
+    assert_eq!(record["exit_code"], 125);
 }

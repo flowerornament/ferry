@@ -160,10 +160,22 @@ the caller's dirty tree.
 Receipts live in `.ferry/receipts/`. Machine timings must not be pooled across
 platforms. A remote result is evidence, not automatic publication authority.
 
-`--json` emits version-one NDJSON with prepared, output and receipt events;
-the host also emits accepted and a bound host-result. Output is escaped as data.
-Recipe exits pass through. Read the receipt's outcome,
-not a recipe's printed text, to distinguish tool refusal from recipe failure.
+`--json` emits version-one NDJSON with prepared, output and receipt events.
+The host also emits `accepted` and a bound `host-result`. Before acceptance
+it may instead emit `refused` with a reason. Output is escaped as data.
+
+### Outcomes and exit codes
+
+Read the receipt's `outcome`, not a recipe's printed text, to tell a Ferry
+refusal from a recipe failure. A recipe may itself exit 125.
+
+| outcome    | `ferry run` exits | meaning |
+| ---------- | ----------------- | ------- |
+| `ran-pass` | 0 | The recipe ran and exited 0. |
+| `ran-fail` | the recipe's code | The recipe ran and failed. |
+| `timeout`  | 124 | `--timeout-seconds` elapsed; the recipe's session was ended. |
+| `refused`  | 125 | Nothing ran. This covers an unknown recipe or route, an unmet requirement, a dirty or unknown commit, and a host that refused before acceptance (including a host older than the caller that rejects the request). |
+| `lost`     | 128 + signal, or 255 | The run's fate is unknown or was cut short. When the caller is interrupted, it exits 128 plus the signal it received: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. A signal that arrives before dispatch still writes a receipt. Otherwise, lost means the connection or host failed after dispatch: 255. |
 
 ## Limits
 
