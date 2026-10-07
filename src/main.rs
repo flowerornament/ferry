@@ -69,6 +69,9 @@ struct Run {
     json: bool,
     #[arg(long)]
     timeout_seconds: Option<u64>,
+    /// Arguments appended to the recipe's command, after `--`.
+    #[arg(last = true)]
+    args: Vec<String>,
 }
 fn machines() -> Result<config::Machines> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -144,6 +147,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         forwarded_env: record.forwarded_env.clone(),
         companion_refs: record.companion_refs.clone(),
         preserve: record.preserve.clone(),
+        args: options.args.clone(),
     };
     if matches!(route, config::Route::Remote(_)) {
         record.outcome = receipt::Outcome::Lost;
@@ -169,6 +173,8 @@ fn run(options: &Run) -> Result<i32> {
     let root = repository::root()?;
     let start = receipt::now_ms();
     let mut record = new_record(&options.recipe, &options.seat)?;
+    record.args.clone_from(&options.args);
+    record.args_sha256 = Some(receipt::digest(&serde_json::to_vec(&options.args)?));
     if let Err(error) = dispatch(&root, options, &mut record) {
         record.reason = Some(error.to_string());
     }
@@ -215,6 +221,8 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         companion_sources: BTreeMap::default(),
         preserve: vec![],
         collection: None,
+        args: vec![],
+        args_sha256: None,
     })
 }
 

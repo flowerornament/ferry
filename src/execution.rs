@@ -105,6 +105,10 @@ pub struct Request {
     pub companion_refs: BTreeMap<String, String>,
     #[serde(default)]
     pub preserve: Vec<String>,
+    // Omitted when empty so argument-free runs still reach hosts that predate
+    // arguments; such hosts refuse a request that carries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +136,9 @@ pub fn validate(request: &Request) -> Result<()> {
     }
     if request.recipe.command.is_empty() {
         return Err("empty command".into());
+    }
+    if request.args.iter().any(|arg| arg.contains('\0')) {
+        return Err("invalid recipe argument".into());
     }
     if request.forwarded_env.iter().any(|(name, value)| {
         name.is_empty()
@@ -463,6 +470,7 @@ pub fn run(
         collect.id = receipt::run_id()?;
         collect.hooks.prepare = None;
         collect.hooks.collect = None;
+        collect.args.clear();
         collect.recipe.command = vec![
             "env".into(),
             format!(
@@ -690,6 +698,7 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
     )?;
     let status = Command::new(&request.recipe.command[0])
         .args(&request.recipe.command[1..])
+        .args(&request.args)
         .envs(&env)
         .status()?;
     let code = status

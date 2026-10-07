@@ -3,6 +3,8 @@ use nix::{
     sys::signal::{Signal, kill, killpg},
     unistd::{Pid, getsid},
 };
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
@@ -77,6 +79,14 @@ fn run(root: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        })
 }
 fn receipt(out: &Output) -> serde_json::Value {
     String::from_utf8_lossy(&out.stdout)
@@ -366,6 +376,50 @@ fn recipe_exit_125_and_printed_refused_are_not_transport_refusals() {
     let out = run(dir.path(), &["run", "fail", "--local", "--json"]);
     assert_eq!(out.status.code(), Some(125));
     assert_eq!(receipt(&out)["outcome"], "ran-fail");
+}
+
+#[test]
+fn recipe_arguments_follow_the_command_and_are_recorded() {
+    let dir = fixture();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[recipe.pass]\ncommand=['sh','-c','printf \"<%s>\\\\n\" \"$@\"; [ \"$1\" = ok ]','recipe']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "argument fixture"]);
+    let args = ["ok", "two words", "--on", "elsewhere", ""];
+    let mut command_line = vec!["run", "pass", "--local", "--json", "--"];
+    command_line.extend(args);
+    let out = run(dir.path(), &command_line);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    let printed: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == "output")
+        .map(|event| event["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        printed,
+        ["<ok>", "<two words>", "<--on>", "<elsewhere>", "<>"]
+    );
+    let record = receipt(&out);
+    assert_eq!(record["machine"], "local");
+    assert_eq!(record["args"], serde_json::json!(args));
+    assert_eq!(
+        record["args_sha256"],
+        sha256(&serde_json::to_vec(&args).unwrap())
+    );
+
+    let out = run(
+        dir.path(),
+        &["run", "pass", "--local", "--json", "--", "no"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(receipt(&out)["outcome"], "ran-fail");
+    assert_eq!(receipt(&out)["args"], serde_json::json!(["no"]));
+
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(receipt(&out)["args"], serde_json::json!([]));
+    assert_eq!(receipt(&out)["args_sha256"], sha256(b"[]"));
 }
 
 #[test]
@@ -678,7 +732,7 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
         ),
     )
     .unwrap();
-    fs::write(dir.path().join("ferry.toml"), "version=1\n[environment]\nforwards=['APP_ALLOWED']\n[recipe.pass]\ncommand=['sh','-c','echo remote-$APP_ALLOWED']\nroutable=true\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[environment]\nforwards=['APP_ALLOWED']\n[recipe.pass]\ncommand=['sh','-c','echo remote-$APP_ALLOWED \"[$*]\"','recipe']\nroutable=true\n").unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
     git(dir.path(), &["commit", "-m", "remote contract fixture"]);
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
@@ -700,6 +754,9 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
             "--json",
             "--timeout-seconds",
             "5",
+            "--",
+            "a b",
+            "--seat",
         ])
         .output()
         .unwrap();
@@ -714,7 +771,8 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
         receipt(&out)["forwarded_env"],
         serde_json::json!({"APP_ALLOWED":"selected"})
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("remote-selected"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("remote-selected [a b --seat]"));
+    assert_eq!(receipt(&out)["args"], serde_json::json!(["a b", "--seat"]));
 }
 
 #[test]

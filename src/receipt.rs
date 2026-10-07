@@ -49,6 +49,12 @@ pub struct Receipt {
     pub preserve: Vec<String>,
     #[serde(default)]
     pub collection: Option<crate::execution::Collection>,
+    /// Recipe arguments given after `--`; older receipts default to none.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// SHA-256 of the arguments as a JSON array of strings.
+    #[serde(default)]
+    pub args_sha256: Option<String>,
 }
 
 pub fn now_ms() -> u128 {
