@@ -1748,3 +1748,46 @@ fn an_unreadable_custody_marker_leaves_the_seat_alone() {
     assert_eq!(admission["skipped"]["unknown"], 1, "{admission}");
     assert!(state.join("caches/hidden/cargo-target/deps/blob").exists());
 }
+
+#[test]
+fn a_recipe_can_empty_a_process_group_it_killed() {
+    // Like a project's own teardown: kill a group whose members were adopted
+    // by the supervisor, then require the group to be empty. Adopted zombies
+    // must not linger as members.
+    let dir = fixture();
+    fs::write(
+        dir.path().join("group.sh"),
+        r#"python3 -c 'import os,subprocess; os.setpgid(0,0); subprocess.Popen(["sleep","60"]); subprocess.Popen(["sleep","60"]); os.execvp("sleep",["sleep","61"])' &
+g=$!
+sleep 0.5
+kill -s KILL -- "-$g"
+wait "$g" 2>/dev/null
+i=0
+while [ "$i" -lt 20 ]; do
+  [ -z "$(ps -eo pgid=,stat= | awk -v g="$g" '$1 == g')" ] && exit 7
+  sleep 0.1
+  i=$((i + 1))
+done
+ps -eo pid=,ppid=,pgid=,stat= | awk -v g="$g" '$3 == g'
+exit 1
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\n[recipe.group]\ncommand=['sh','group.sh']\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml", "group.sh"]);
+    git(dir.path(), &["commit", "-m", "group teardown"]);
+    let out = run(dir.path(), &["run", "group", "--local", "--json"]);
+    // 7 means the group emptied; the recipe's own exit status is preserved.
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(receipt(&out)["outcome"], "ran-fail");
+    assert_eq!(receipt(&out)["exit_code"], 7);
+}

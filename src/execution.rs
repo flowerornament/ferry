@@ -709,6 +709,7 @@ fn run_session(
     let mut log = log;
     let mut timeout = false;
     let code = loop {
+        crate::custody::reap_adopted(owner.child.id());
         while let Ok((stream, line)) = receiver.try_recv() {
             log.write_all(&line)?;
             log.write_all(b"\n")?;

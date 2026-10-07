@@ -54,6 +54,43 @@ pub fn supervise() -> Result<()> {
     Ok(())
 }
 
+/// Reaps adopted descendants that have already exited, so they do not linger
+/// as zombies a project's own process-group accounting would still count.
+/// `leader` is the session leader this process waits on itself; it is left
+/// alone. Linux only: elsewhere nothing is adopted.
+pub fn reap_adopted(leader: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let me = std::process::id().to_string();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            if u32::try_from(pid).ok() == Some(leader) {
+                continue;
+            }
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, fields)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let mut fields = fields.split_whitespace();
+            if fields.next() == Some("Z") && fields.next() == Some(me.as_str()) {
+                let _ = nix::sys::wait::waitpid(
+                    nix::unistd::Pid::from_raw(pid),
+                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = leader;
+}
+
 /// Called under the seat lock as a session begins: the seat is in use.
 pub fn begin(root: &Path, seat: &str) -> Result<()> {
     match fs::remove_file(root.join("idle").join(format!("{seat}.json"))) {
