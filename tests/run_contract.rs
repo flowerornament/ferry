@@ -1396,9 +1396,17 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     // Observe, rather than assume, that the exclusive run now holds the gate.
     let gate = dir.path().join(".ferry/local/locks/host-gate");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while fs::File::open(&gate).is_ok_and(|probe| fs2::FileExt::try_lock_shared(&probe).is_ok())
-        || !gate.exists()
-    {
+    loop {
+        // The first run already passed the gate, so it must exist. Only a
+        // contended lock means the exclusive run holds it; any other error is
+        // a failure, never readiness.
+        let probe = fs::File::open(&gate)
+            .unwrap_or_else(|e| panic!("the first run created the host gate: {e}"));
+        match fs2::FileExt::try_lock_shared(&probe) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("probing the host gate: {e}"),
+            Ok(()) => drop(probe),
+        }
         assert!(
             Instant::now() < deadline,
             "the exclusive run never took the gate"

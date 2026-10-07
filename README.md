@@ -165,9 +165,13 @@ or `exclusive`) and `lease.wait_ms`. `exclusive` is an execution lock, not a
 machine feature: routing ignores it, and receipts list it under
 `requirements`.
 
-The lease covers sessions under one state root: one user's Ferry on one host,
-or one repository's `.ferry/local`. It does not quiet:
+`exclusive` means no other live Ferry session under the same state root: one
+user's Ferry on one host, or one repository's `.ferry/local`. It is not a
+quiet-host certificate. A measurement should still account for host load and
+custody. It does not quiet:
 
+- descendants that outlived an earlier session's supervisor. They hold no
+  lease; the seat's custody taint or owner marker is the evidence for them;
 - processes started outside Ferry;
 - other users;
 - other virtual machines on the same hardware;
