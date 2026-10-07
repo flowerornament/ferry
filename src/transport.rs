@@ -253,6 +253,16 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
             .arg(repository::git_dir(root)?)
             .arg(&request.commit),
     )?;
+    for commit in request.companion_refs.values() {
+        repository::output(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .arg("fetch")
+                .arg(repository::git_dir(root)?)
+                .arg(commit),
+        )?;
+    }
     let stop = execution::stopped()?;
     let (seat, lease, exclusive) = execution::prepare(&state, request, &stop)?;
     if json {
@@ -340,6 +350,7 @@ pub fn remote(
             request.commit, request.seat, request.commit
         ),
     )?;
+    push_companions(root, machine, request)?;
     let stop = execution::stopped()?;
     let child = ssh()?
         .arg(&machine.ssh)
@@ -395,6 +406,21 @@ pub fn remote(
         accept_result(root, machine, request, record, &info, result)?;
     } else {
         record.reason = Some(format!("no host result: {status}"));
+    }
+    Ok(())
+}
+
+fn push_companions(root: &Path, machine: &config::Machine, request: &Request) -> Result<()> {
+    for commit in request.companion_refs.values() {
+        push(
+            root,
+            &machine.ssh,
+            ".local/state/ferry/repo.git",
+            &format!(
+                "{commit}:refs/ferry/{}/{}/companions/{commit}",
+                request.seat, request.id
+            ),
+        )?;
     }
     Ok(())
 }

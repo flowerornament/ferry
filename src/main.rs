@@ -92,6 +92,12 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     record.contract_sha256 = evidence.contract_sha256;
     let declared = declared?;
     let config = declared.config;
+    for (name, revision) in &config.companion_refs {
+        repository::ref_name(name)?;
+        record
+            .companion_refs
+            .insert(name.clone(), repository::commit(root, Some(revision))?);
+    }
     record.forwarded_env = config.environment.as_ref().map_or_else(
         || Ok(BTreeMap::default()),
         |environment| environment.capture(std::env::vars_os()),
@@ -131,6 +137,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         timeout_seconds: options.timeout_seconds,
         mirrors: vec![],
         forwarded_env: record.forwarded_env.clone(),
+        companion_refs: record.companion_refs.clone(),
     };
     if matches!(route, config::Route::Remote(_)) {
         record.outcome = receipt::Outcome::Lost;
@@ -198,6 +205,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         adapter_sha256: None,
         contract_sha256: None,
         forwarded_env: BTreeMap::default(),
+        companion_refs: BTreeMap::default(),
     })
 }
 

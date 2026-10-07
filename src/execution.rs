@@ -101,6 +101,8 @@ pub struct Request {
     pub timeout_seconds: Option<u64>,
     pub mirrors: Vec<Mirrored>,
     pub forwarded_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub companion_refs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +121,12 @@ pub fn validate(request: &Request) -> Result<()> {
     }
     if request.commit.len() != 40 || !request.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid commit".into());
+    }
+    for (name, commit) in &request.companion_refs {
+        repository::ref_name(name)?;
+        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid companion commit".into());
+        }
     }
     if request.recipe.command.is_empty() {
         return Err("empty command".into());
@@ -215,12 +223,13 @@ pub fn prepare(
     if !seat.exists() {
         repository::output(
             Command::new("git")
-                .arg("--git-dir")
+                .args(["clone", "--shared", "--no-checkout"])
                 .arg(&bare)
-                .args(["worktree", "add", "--detach"])
-                .arg(&seat)
-                .arg(&request.commit),
+                .arg(&seat),
         )?;
+    }
+    if !seat.join(".git").is_dir() {
+        return Err("seat has a legacy shared-ref checkout; select a new --seat".into());
     }
     // Check index flags BEFORE resetting: reset would conceal tampering.
     let index = repository::output(
@@ -259,6 +268,7 @@ pub fn prepare(
     if String::from_utf8(head)?.trim() != request.commit || !status.is_empty() {
         return Err("checkout integrity failed".into());
     }
+    materialize_refs(root, &seat, request)?;
     if !request.mirrors.is_empty() {
         fs::create_dir_all(seat.join(".ferry"))?;
         let config = seat.join(".ferry/gitconfig");
@@ -279,6 +289,42 @@ pub fn prepare(
         }
     }
     Ok((seat, lease, exclusive))
+}
+
+fn materialize_refs(root: &Path, seat: &Path, request: &Request) -> Result<()> {
+    let directory = root.join("companion-refs");
+    fs::create_dir_all(&directory)?;
+    let manifest = directory.join(format!("{}.json", request.seat));
+    let previous: BTreeMap<String, String> = match fs::read(&manifest) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => return Err(error.into()),
+    };
+    for name in previous
+        .keys()
+        .filter(|name| !request.companion_refs.contains_key(*name))
+    {
+        repository::ref_name(name)?;
+        repository::output(
+            Command::new("git")
+                .current_dir(seat)
+                .args(["update-ref", "-d", name]),
+        )?;
+    }
+    for (name, commit) in &request.companion_refs {
+        repository::output(Command::new("git").current_dir(seat).args([
+            "cat-file",
+            "-e",
+            &format!("{commit}^{{commit}}"),
+        ]))?;
+        repository::output(Command::new("git").current_dir(seat).args([
+            "update-ref",
+            name,
+            commit,
+        ]))?;
+    }
+    fs::write(manifest, serde_json::to_vec(&request.companion_refs)?)?;
+    Ok(())
 }
 
 pub fn session_members(sid: u32) -> Result<Vec<i32>> {
@@ -454,6 +500,11 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         ("FERRY_COMMIT".to_owned(), request.commit.clone()),
         ("FERRY_WORKDIR".to_owned(), workdir.display().to_string()),
         ("FERRY_ID".to_owned(), request.id.clone()),
+        ("FERRY_REQUEST_FILE".to_owned(), spec.display().to_string()),
+        (
+            "FERRY_MIRRORS_DIR".to_owned(),
+            root.join("mirrors").display().to_string(),
+        ),
     ]);
     if request
         .forwarded_env

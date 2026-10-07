@@ -100,6 +100,72 @@ fn working_copy_edits_cannot_change_the_recipe() {
     assert_eq!(receipt(&out)["outcome"], "ran-pass");
     assert!(String::from_utf8_lossy(&out.stdout).contains("committed"));
 }
+
+#[test]
+fn companion_refs_are_pinned_and_isolated_between_seats() {
+    let dir = fixture();
+    let resolve = |root: &Path, revision: &str| {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", revision])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let first = resolve(dir.path(), "HEAD");
+    git(dir.path(), &["branch", "companion"]);
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[companion_refs]\n'refs/remotes/origin/master'='companion'\n[recipe.pass]\ncommand=['git','rev-parse','refs/remotes/origin/master']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "companion declaration"]);
+    let second = resolve(dir.path(), "HEAD");
+    let out = run(
+        dir.path(),
+        &["run", "pass", "--local", "--seat", "first", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        receipt(&out)["companion_refs"]["refs/remotes/origin/master"],
+        first
+    );
+    git(dir.path(), &["update-ref", "refs/heads/companion", &second]);
+    let out = run(
+        dir.path(),
+        &["run", "pass", "--local", "--seat", "second", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        receipt(&out)["companion_refs"]["refs/remotes/origin/master"],
+        second
+    );
+    for entry in fs::read_dir(dir.path().join(".ferry/local/slots")).unwrap() {
+        let slot = entry.unwrap().path();
+        let expected = if slot
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("-first")
+        {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(&resolve(&slot, "refs/remotes/origin/master"), expected);
+        assert!(
+            slot.join(".git").is_dir(),
+            "refs cannot live in a shared worktree repository"
+        );
+    }
+}
 #[test]
 fn recipe_exit_125_and_printed_refused_are_not_transport_refusals() {
     let dir = fixture();

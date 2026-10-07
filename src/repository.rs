@@ -75,6 +75,9 @@ pub fn git_dir(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(root.join(".git"))
 }
 pub fn commit(root: &Path, revision: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    if revision.is_some_and(|value| value.starts_with('-')) {
+        return Err("revision cannot be a command option".into());
+    }
     let value = if root.join(".jj").exists() {
         let rev = revision.unwrap_or("@");
         let bytes = output(Command::new("jj").current_dir(root).args([
@@ -182,6 +185,12 @@ pub fn declaration(
                     }
                     config.environment = Some(environment);
                 }
+                if !contract.companion_refs.is_empty() {
+                    if !config.companion_refs.is_empty() {
+                        return Err("companion refs have two owners".into());
+                    }
+                    config.companion_refs = contract.companion_refs;
+                }
                 contract.recipe
             }
             _ => return Err("catalog needs exactly one path or adapter".into()),
@@ -202,4 +211,12 @@ pub fn declaration(
         evidence.contract_sha256 = Some(crate::receipt::digest(&serde_json::to_vec(&recipes)?));
     }
     Ok(Declaration { config, recipes })
+}
+
+pub fn ref_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !name.starts_with("refs/") {
+        return Err("companion ref must be fully qualified".into());
+    }
+    output(Command::new("git").args(["check-ref-format", name]))?;
+    Ok(())
 }

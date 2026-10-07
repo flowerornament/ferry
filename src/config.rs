@@ -49,6 +49,8 @@ pub struct Config {
     #[serde(default)]
     pub mirror: Vec<Mirror>,
     pub environment: Option<Environment>,
+    #[serde(default)]
+    pub companion_refs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -124,6 +126,8 @@ pub struct CatalogContract {
     #[serde(default)]
     pub mirror: Vec<Mirror>,
     pub environment: Option<Environment>,
+    #[serde(default)]
+    pub companion_refs: BTreeMap<String, String>,
 }
 fn recipe_table() -> String {
     "recipe".into()

@@ -41,6 +41,8 @@ pub struct Receipt {
     pub contract_sha256: Option<String>,
     #[serde(default)]
     pub forwarded_env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub companion_refs: std::collections::BTreeMap<String, String>,
 }
 
 pub fn now_ms() -> u128 {
