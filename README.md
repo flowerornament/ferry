@@ -1,7 +1,7 @@
 # Ferry
 
-Run a recipe at an exact commit on a machine that can run it. Stream its
-output, return its exit code, and keep a receipt.
+Run this repo's recipe at this commit on a machine that can run it, and tell
+me exactly what happened.
 
 Ferry separates the project from the machine. A project declares recipes and
 their required features. You configure machines once. No machine configuration
@@ -9,22 +9,22 @@ means local execution; a configured machine missing required features refuses.
 
 ## Install and run
 
-Python 3.12+, Bash 5, jj, Git and SSH are required on the client. Remote hosts
-need Python, Git, Bash, flock, setsid, and the recipe's tools. Ferry's transport
-is extracted from Murail's reviewed `8ba36cfa` implementation.
+Build with `cargo build --locked` (Rust 1.99, edition 2024), then install
+`target/debug/ferry` on the caller and each host. One crate builds one binary:
+`ferry run` is the caller and `ferry host-run` receives the request. Git, SSH,
+and Unix process tools are required; jj is optional for colocated repositories.
+Murail's reviewed `8ba36cfa` transport is the behavioral specification.
 
 ```
-~/code/ferry/ferry recipes
-~/code/ferry/ferry machines
-~/code/ferry/ferry run test
-~/code/ferry/ferry run mix-test --on bench --commit @ -- path/to/test.exs
-~/code/ferry/ferry run test --local --json
-~/code/ferry/ferry receipt <id>
+ferry recipes
+ferry machines
+ferry run smoke --on bench
+ferry run test --local --json
+ferry receipt <id>
 ```
 
 Add this directory to PATH or use its absolute executable path. There is no
-published package or forge remote yet. `--dry-run` resolves the commit and
-route without pushing or running anything.
+published package or forge remote yet. This repository remains local-only.
 
 ## Project configuration
 
@@ -32,16 +32,15 @@ Commit `ferry.toml`:
 
 ```toml
 version = 1
-runner = "devenv"
 
 [recipe.test]
-command = ["mix", "test"]
-requires = ["linux", "x86_64"]
+command = ["devenv", "shell", "--", "mix", "test"]
+requires = ["linux-x86_64"]
 routable = true
 
 [recipe.mix-test]
 command = ["mix", "test"]
-requires = ["linux", "x86_64"]
+requires = ["linux-x86_64"]
 routable = true
 
 [hooks]
@@ -54,16 +53,23 @@ If recipes already have a catalog, point to it instead of repeating them:
 
 ```toml
 version = 1
-runner = "path"
 [catalog]
 path = ".config/murail-gates.toml"
 table = "recipe"
 ```
 
-Each catalog entry supplies `requires`, `routable`, and an optional argv
-`command` (default `just <recipe>`). Recipe runner metadata in another catalog
-is not an environment choice; `environment = "path" | "devenv"` overrides the
-project environment. Requirements and recipes are read from the named commit.
+Requirements and recipes are read from the named commit. Catalog entries must
+provide explicit command argv; Ferry never infers a tool from a recipe name.
+Ferry has no Nix-specific environment logic: the repo owns
+its command and executable prepare/env hooks.
+If an existing catalog has another schema, provide `[catalog] adapter =
+"scripts/ferry-catalog"`. The committed executable runs caller-side in fresh
+checkouts of the pinned commit and emits JSON `{"version":1,"recipe":{...}}`.
+It may also emit a `mirror` list derived from the repo's existing lockfile.
+Ferry checks repeatability, validates the entire contract before routing, and
+records adapter and emitted-contract digests. The adapter must be a pure reader;
+Ferry is not a sandbox that can prevent arbitrary side effects outside its
+temporary checkout.
 Only explicitly routable recipes go remote. Publishing and certifying recipes
 must remain unroutable: Herald's `just land` stays local.
 
@@ -87,10 +93,20 @@ proof that unrelated host work is absent.
 
 ## Hooks
 
+The optional `environment` declaration contains `forwards` (caller variables
+sent to the recipe), `watches` (prefixes whose unlisted nonempty variables
+refuse before any push), and `local` (variables deliberately left on the
+caller). A catalog adapter may emit this declaration from the repo's existing
+catalog; it must not also be declared in `ferry.toml`. Receipts record the
+selected values in `forwarded_env`, so never include secrets in `forwards`.
+The host env hook cannot replace a forwarded value.
+
 Hooks are committed executable paths relative to the exact checkout. They run
 inside the owned recipe session: prepare, env, recipe, collect. The env hook
 prints a JSON object of environment-variable strings, never shell code.
-Inputs include `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_RECIPE`, `FERRY_ID`, and
+Ferry reserves `FERRY_*` and `GIT_CONFIG_GLOBAL`; an env hook cannot replace
+run identity or the seat-local mirror configuration.
+Inputs include `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, and
 `FERRY_WORKDIR`; collect also receives `FERRY_EXIT_CODE`. Projects own their
 database preparation, cache homes, and artifact collection.
 
@@ -102,20 +118,39 @@ lock protects a detached checkout. HEAD, clean tree, and hidden index flags are
 checked before execution. A unique run token binds host facts to client output.
 Client loss terminates the recipe session; children creating new sessions can
 escape that boundary and require stronger host isolation. This is not a sandbox.
+Unconfirmed session cleanup quarantines the host with a `cleanup-pending-*`
+marker in its lock directory. Further dispatch refuses until an operator confirms
+the session is gone and removes that marker; Ferry never clears it by age.
+An execution error after recipe dispatch is `lost`, not a pre-execution refusal.
 
-Local execution extracts a fresh archive of the exact commit, not the caller's
-dirty tree. It does not claim remote HEAD/index verification or a warm checkout.
+Local execution uses the same locked, clean detached checkout mechanism, not
+the caller's dirty tree.
 Receipts live in `.ferry/receipts/`. Machine timings must not be pooled across
 platforms. A remote result is evidence, not automatic publication authority.
 
-`--json` emits version-one NDJSON: accepted, routed, prepared, output, exited,
-receipt, or refused. Output is escaped as data. Recipe exits pass through;
-125 means refusal and 124 is reserved for timeout. Read the receipt's outcome,
+`--json` emits version-one NDJSON with prepared, output and receipt events;
+the host also emits accepted and a bound host-result. Output is escaped as data.
+Recipe exits pass through. Read the receipt's outcome,
 not a recipe's printed text, to distinguish tool refusal from recipe failure.
+
+## Limits
+
+SIGKILL of `host-run` leaves the recipe's session running. Its durable ownership
+marker keeps that seat refused until recovery; cgroups are the later fix.
+The refusal names the internal seat and the exact `ferry seat recover <seat>`
+command to run on that host (`--local` for a local run). Recovery takes the seat
+lock, compares live session members against the leader's recorded start time,
+and clears the marker only when the session is empty. It writes a receipt and
+never kills processes. If death happened before the session birth was recorded,
+recovery refuses rather than guessing; another logical `--seat` remains usable.
 
 ## Development
 
-`just check` runs pure routing/catalog controls and Bash syntax checks.
+`just check` runs formatting, strict Clippy, unit and real-CLI controls.
 Transport review also requires actual remote execution: unknown/conflicted
 commit, tampered checkout, recipe failure, repeated IDs, and client disconnect.
-Unit tests alone do not establish those properties.
+Unit tests alone do not establish those properties. Current v0 work still
+includes seat listing/GC, richer evidence and adversarial remote disconnect
+controls. Mirrors use seat-local Git configuration, and declared artifact globs
+return under `.ferry/runs/<id>/`; filesystem links refuse rather than copy
+external bytes. See RELEASE.md for the unpublished release contract.

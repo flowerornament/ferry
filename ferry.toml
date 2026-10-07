@@ -1,12 +1,16 @@
 version = 1
-runner = "path"
+
+[recipe.smoke]
+command = ["sh", "-c", "echo ferry-smoke-ok"]
+requires = []
+routable = true
 
 [recipe.test]
-command = ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]
+command = ["sh", "-c", "export PATH=\"$HOME/.cargo/bin:$PATH\"; exec cargo test --locked"]
 requires = []
 routable = true
 
 [recipe.fail]
-command = ["python3", "-c", "import sys; print('recipe failure'); sys.exit(17)"]
+command = ["sh", "-c", "echo recipe-failure; exit 17"]
 requires = []
 routable = true

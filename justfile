@@ -1,3 +1,7 @@
 check:
-    python3 -m unittest discover -s tests -v
-    bash -n libexec/ferry-transport.sh libexec/ferry-run.sh
+    cargo fmt --check
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --locked
+
+build:
+    nix build --no-link --print-out-paths .

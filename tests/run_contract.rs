@@ -1,0 +1,559 @@
+//! Real CLI contracts exercise committed bytes and durable refusal receipts.
+use nix::{
+    sys::signal::{Signal, kill, killpg},
+    unistd::{Pid, getsid},
+};
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
+use tempfile::TempDir;
+
+struct OwnedGroup(i32);
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        if getsid(Some(Pid::from_raw(self.0))).is_ok_and(|sid| sid.as_raw() == self.0) {
+            let _ = killpg(Pid::from_raw(self.0), Signal::SIGKILL);
+        }
+    }
+}
+struct OwnedCaller {
+    child: std::process::Child,
+    owners: std::path::PathBuf,
+}
+impl Drop for OwnedCaller {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Startup assertions can fail before the session guard is constructed.
+        if let Ok(entries) = fs::read_dir(&self.owners) {
+            for entry in entries.flatten() {
+                let session = fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|owner| owner["session"].as_i64())
+                    .and_then(|pid| i32::try_from(pid).ok());
+                if let Some(session) = session {
+                    drop(OwnedGroup(session));
+                }
+            }
+        }
+    }
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+fn fixture() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init"]);
+    git(dir.path(), &["config", "user.name", "Ferry Test"]);
+    git(
+        dir.path(),
+        &["config", "user.email", "ferry@example.invalid"],
+    );
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[recipe.pass]\ncommand=['sh','-c','echo committed']\nroutable=true\n[recipe.fail]\ncommand=['sh','-c','echo refused; exit 125']\nroutable=true\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "fixture"]);
+    dir
+}
+fn run(root: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+fn receipt(out: &Output) -> serde_json::Value {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v["event"] == "receipt")
+        .unwrap()["receipt"]
+        .clone()
+}
+#[test]
+fn working_copy_edits_cannot_change_the_recipe() {
+    let dir = fixture();
+    fs::write(dir.path().join("ferry.toml"), "tampered").unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(receipt(&out)["outcome"], "ran-pass");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("committed"));
+}
+#[test]
+fn recipe_exit_125_and_printed_refused_are_not_transport_refusals() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "fail", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert_eq!(receipt(&out)["outcome"], "ran-fail");
+}
+
+#[test]
+fn failure_after_recipe_dispatch_is_lost_not_refused() {
+    let dir = fixture();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[hooks]\ncollect='missing-collect'\n[recipe.pass]\ncommand=['sh','-c','echo attempted']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "broken collection hook"]);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(receipt(&out)["outcome"], "lost");
+    assert_eq!(out.status.code(), Some(255));
+}
+
+#[test]
+fn environment_hook_cannot_replace_ferry_owned_mirror_configuration() {
+    let dir = fixture();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[hooks]\nenv='environment'\n[recipe.pass]\ncommand=['sh','-c','echo attempted-recipe']\n").unwrap();
+    fs::write(
+        dir.path().join("environment"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"GIT_CONFIG_GLOBAL\":\"/tmp/not-the-seat-config\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        dir.path().join("environment"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml", "environment"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "attempt to replace owned config"],
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert_eq!(receipt(&out)["outcome"], "refused");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("attempted-recipe"));
+}
+
+#[test]
+fn caller_environment_is_declared_forwarded_and_recorded() {
+    let dir = fixture();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[environment]\nforwards=['APP_ALLOWED']\nwatches=['APP_']\nlocal=['APP_LOCAL']\n[recipe.pass]\ncommand=['sh','-c','echo forwarded-$APP_ALLOWED']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "declared caller environment"]);
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ferry"));
+        cmd.current_dir(dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("APP_ALLOWED", "selected")
+            .env("APP_LOCAL", "not-forwarded")
+            .args(["run", "pass", "--local", "--json"]);
+        cmd
+    };
+    let out = command().output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        receipt(&out)["forwarded_env"],
+        serde_json::json!({"APP_ALLOWED":"selected"})
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("forwarded-selected"));
+    let out = command()
+        .env("APP_UNLISTED", "hidden-input")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(125));
+    assert_eq!(receipt(&out)["outcome"], "refused");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("forwarded-selected"));
+    fs::write(
+        dir.path().join("environment"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"APP_ALLOWED\":\"host-replacement\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        dir.path().join("environment"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[environment]\nforwards=['APP_ALLOWED']\nwatches=['APP_']\nlocal=['APP_LOCAL']\n[hooks]\nenv='environment'\n[recipe.pass]\ncommand=['sh','-c','echo forwarded-$APP_ALLOWED']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml", "environment"]);
+    git(dir.path(), &["commit", "-m", "attempt host override"]);
+    let out = command().output().unwrap();
+    assert_eq!(out.status.code(), Some(125));
+    assert_eq!(receipt(&out)["outcome"], "refused");
+    assert_eq!(
+        receipt(&out)["forwarded_env"],
+        serde_json::json!({"APP_ALLOWED":"selected"})
+    );
+}
+
+#[test]
+fn unconfirmed_cleanup_quarantines_the_host_before_dispatch() {
+    let dir = fixture();
+    let locks = dir.path().join(".ferry/local/locks");
+    fs::create_dir_all(&locks).unwrap();
+    fs::write(locks.join("cleanup-pending-earlier-run"), "unconfirmed").unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(receipt(&out)["outcome"], "refused");
+    assert!(
+        receipt(&out)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cleanup_pending")
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
+    assert!(locks.join("cleanup-pending-earlier-run").exists());
+}
+
+#[test]
+fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture();
+    let marker = dir.path().join("recipe-started");
+    fs::write(
+        dir.path().join("ferry.toml"),
+        format!(
+            "version=1\n[recipe.pass]\ncommand=['sh','-c','echo started > {}; sleep 60']\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "hard-death fixture"]);
+    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .args(["run", "pass", "--local", "--json"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut caller = OwnedCaller {
+        child,
+        owners: dir.path().join(".ferry/local/owners"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "recipe did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let ownership = fs::read_dir(dir.path().join(".ferry/local/owners"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let owner: serde_json::Value = serde_json::from_slice(&fs::read(&ownership).unwrap()).unwrap();
+    let group = OwnedGroup(i32::try_from(owner["session"].as_u64().unwrap()).unwrap());
+    let seat = ownership.file_stem().unwrap().to_str().unwrap();
+    kill(
+        Pid::from_raw(i32::try_from(caller.child.id()).unwrap()),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    caller.child.wait().unwrap();
+    let out = run(
+        dir.path(),
+        &["run", "pass", "--local", "--json", "--timeout-seconds", "1"],
+    );
+    assert_eq!(out.status.code(), Some(125));
+    assert!(
+        receipt(&out)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("seat recover")
+    );
+    let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(ownership.exists());
+    drop(group);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
+        if out.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session did not exit: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!ownership.exists());
+}
+#[test]
+fn every_caller_refusal_has_a_receipt() {
+    let dir = fixture();
+    for args in [
+        vec!["run", "pass", "--commit", "no-such-revision", "--json"],
+        vec!["run", "pass", "--seat", "rv;touch", "--json"],
+        vec!["run", "pass", "--on", "missing", "--json"],
+        vec!["run", "-bad", "--json"],
+    ] {
+        let out = run(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(125));
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], "refused");
+        assert!(
+            dir.path()
+                .join(".ferry/receipts")
+                .join(format!("{}.json", record["id"].as_str().unwrap()))
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment() {
+    let dir = fixture();
+    let host = dir.path().join("host");
+    let tools = dir.path().join("transport-tools");
+    fs::create_dir_all(host.join(".local/bin")).unwrap();
+    fs::create_dir_all(&tools).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nunset APP_ALLOWED\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let hook_marker = dir.path().join("pre-push-ran");
+    let hook = dir.path().join(".git/hooks/pre-push");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 77\n", hook_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = dir.path().join("config/ferry");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("machines.toml"),
+        format!(
+            "[host.test-host]\nssh='test-host'\ntriple='{}-{}'\ncores=1\nfeatures=[]\n",
+            std::env::consts::ARCH,
+            if cfg!(target_os = "macos") {
+                "apple-darwin"
+            } else {
+                "unknown-linux-gnu"
+            }
+        ),
+    )
+    .unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[environment]\nforwards=['APP_ALLOWED']\n[recipe.pass]\ncommand=['sh','-c','echo remote-$APP_ALLOWED']\nroutable=true\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "remote contract fixture"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env(
+            "PATH",
+            format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GIT_SSH", tools.join("ssh"))
+        .env("FERRY_TEST_HOST", &host)
+        .env("APP_ALLOWED", "selected")
+        .args([
+            "run",
+            "pass",
+            "--on",
+            "test-host",
+            "--json",
+            "--timeout-seconds",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!hook_marker.exists());
+    assert_eq!(
+        receipt(&out)["forwarded_env"],
+        serde_json::json!({"APP_ALLOWED":"selected"})
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("remote-selected"));
+}
+
+#[test]
+fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
+    let dir = fixture();
+    let dependency = dir.path().join("dependency");
+    fs::create_dir(&dependency).unwrap();
+    git(&dependency, &["init"]);
+    git(&dependency, &["config", "user.name", "Ferry Test"]);
+    git(
+        &dependency,
+        &["config", "user.email", "ferry@example.invalid"],
+    );
+    fs::write(dependency.join("value"), "mirrored").unwrap();
+    git(&dependency, &["add", "value"]);
+    git(&dependency, &["commit", "-m", "dep"]);
+    let out = Command::new("git")
+        .current_dir(&dependency)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let sha = String::from_utf8(out.stdout).unwrap();
+    fs::write(dir.path().join("ferry.toml"), format!("version=1\n[[mirror]]\nurl='https://ferry.invalid/private.git'\npath='dependency'\ncommit='{}'\n[recipe.mirror]\ncommand=['git','ls-remote','https://ferry.invalid/private.git']\n", sha.trim())).unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "mirror"]);
+    let out = run(dir.path(), &["run", "mirror", "--local", "--json"]);
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(receipt(&out)["mirrors"][0]["commit"], sha.trim());
+    assert!(String::from_utf8_lossy(&out.stdout).contains(sha.trim()));
+}
+
+#[test]
+fn client_term_kills_children_in_another_process_group() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture();
+    let marker = dir.path().join("child-pid");
+    let program = format!(
+        "import os,time\nos.setpgrp()\nopen({:?},'w').write(str(os.getpid()))\ntime.sleep(60)",
+        marker.to_str().unwrap()
+    );
+    let config =
+        serde_json::json!({"version":1,"recipe":{"hold":{"command":["python3","-c",program]}}});
+    fs::write(
+        dir.path().join("ferry.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "hold"]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .args(["run", "hold", "--local", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(marker.exists(), "recipe child never reached rendezvous");
+    let pid: i32 = fs::read_to_string(&marker).unwrap().parse().unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+        panic!("caller did not finish bounded cancellation");
+    }
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+        "sibling process-group child survived"
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(receipt(&output)["outcome"], "lost");
+}
+#[test]
+fn hidden_index_flags_refuse_before_resetting_the_seat() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success());
+    let seat = fs::read_dir(dir.path().join(".ferry/local/slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    git(&seat, &["update-index", "--assume-unchanged", "ferry.toml"]);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(receipt(&out)["outcome"], "refused");
+    assert!(
+        receipt(&out)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("hidden index")
+    );
+}
+
+fn with_adapter(root: &Path, script: &str) {
+    fs::write(
+        root.join("ferry.toml"),
+        "version=1\n[catalog]\nadapter='catalog'\n",
+    )
+    .unwrap();
+    fs::write(root.join("catalog"), script).unwrap();
+    fs::set_permissions(root.join("catalog"), fs::Permissions::from_mode(0o755)).unwrap();
+    git(root, &["add", "ferry.toml", "catalog"]);
+    git(root, &["commit", "-m", "adapter"]);
+}
+#[test]
+fn adapter_runs_from_the_pinned_commit_and_records_both_digests() {
+    let dir = fixture();
+    with_adapter(
+        dir.path(),
+        "#!/bin/sh\nprintf '%s\\n' '{\"version\":1,\"recipe\":{\"pass\":{\"command\":[\"sh\",\"-c\",\"echo adapter-commit\"],\"requires\":[],\"routable\":false}}}'\n",
+    );
+    fs::write(dir.path().join("catalog"), "not the committed adapter").unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let record = receipt(&out);
+    assert_eq!(record["adapter_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(record["contract_sha256"].as_str().unwrap().len(), 64);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("adapter-commit"));
+}
+#[test]
+fn malformed_or_partial_adapter_contract_never_runs_a_valid_subset() {
+    let dir = fixture();
+    with_adapter(
+        dir.path(),
+        "#!/bin/sh\nprintf '%s\\n' '{\"version\":1,\"recipe\":{\"pass\":{\"command\":[\"true\"]},\"bad\":{\"requires\":[]}}}'\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(receipt(&out)["outcome"], "refused");
+    assert!(receipt(&out)["adapter_sha256"].is_string());
+    assert!(receipt(&out)["contract_sha256"].is_string());
+    assert!(!dir.path().join(".ferry/local").exists());
+}
+#[test]
+fn nondeterministic_adapter_is_a_refusal() {
+    let dir = fixture();
+    with_adapter(
+        dir.path(),
+        "#!/bin/sh\nprintf '{\"version\":1,\"recipe\":{},\"pid\":%s}\\n' \"$$\"\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(
+        receipt(&out)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("nondeterministic")
+    );
+}
