@@ -4,3 +4,8 @@ __pycache__/
 .ferry/
 dist/
 /target/
+.jj/
+.claude/*
+!.claude/settings.json
+.codex/*
+!.codex/config.toml
