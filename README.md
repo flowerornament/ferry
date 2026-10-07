@@ -123,6 +123,65 @@ come from your SSH configuration. Ferry does not copy credentials or provision
 machines. Features are operator declarations, not hardware measurements or
 proof that unrelated host work is absent.
 
+### Host policy and admission
+
+A host's operator may set a disk floor in `$XDG_CONFIG_HOME/ferry/host.toml`
+(default `~/.config/ferry/host.toml`) on the machine that runs sessions. Each
+session is admitted under its seat lock, after the host lease, before
+checkout and hooks:
+
+```toml
+# Version 1: a guard. Below the floor, refuse (125).
+version = 1
+min_free_bytes = 42949672960
+
+# Version 2: below the floor, first reclaim named targets of idle seats.
+version = 2
+min_free_bytes = 42949672960
+evict = { mode = "idle-seat-targets", targets = ["cargo-target"] }
+```
+
+- **No file:** the run proceeds, and the receipt records the policy as
+  `not-configured`, with no floor claimed.
+- **Malformed policy:** a malformed file, another version, an unknown key, an
+  `evict` block in version 1, or a target that is not a plain name refuses
+  before anything is measured.
+- **Version 2 eviction:** below the floor, version 2 removes only
+  `caches/<seat>/<target>` for the listed targets. It works through seats
+  oldest release first, until the floor is met.
+- **Eligible seats:** a seat is eligible only if all of these hold:
+  - it has a custody `idle` record;
+  - it has no taint and no owner marker;
+  - its lock can be taken without waiting;
+  - its idle record is unchanged under that lock.
+- **Path checks:** every directory from the state root down, including
+  everything inside the target, must be a real directory on the state root's
+  filesystem, owned by the state root's owner. A symlinked target, or a mount
+  inside one, makes the seat ineligible. Removal never follows symlinks.
+- **Never removed:** checkouts, receipts, records, logs, other cache
+  contents, seats without an idle record, and anything outside
+  `<state>/caches`.
+
+If eligible seats run out while still below the floor, the run is refused
+(125). The evictions already made stand.
+
+The receipt and the host result carry `admission`, as far as the decision got:
+
+| field | meaning |
+| ----- | ------- |
+| `policy` | `{path, sha256, version}` of the file as read, or `"not-configured"` |
+| `floor_bytes` | the floor; null when not configured or refused before reading it |
+| `filesystem` | `{path, device}` of the state root that was measured |
+| `available_before`, `available_after` | bytes available to this user (statvfs), measured |
+| `evicted` | for each removed target: `seat`, `released_ms`, exact `path`, `logical_bytes` (sum of file lengths), `allocated_bytes` (allocated blocks, each inode once), and the measured `available_before`/`available_after` around it |
+| `skipped` | eligible-looking seats passed over: `locked`, `owners`, `tainted`, `no_idle_record`, `changed`, `unsafe_path` |
+| `result` | `admitted` or `refused` |
+
+Measured availability can move for reasons outside Ferry. The difference
+across a removal is an observation, not a claim about what that removal freed.
+There is no collector, timer or service: reclamation happens only inside an
+admitting session.
+
 ## Hooks
 
 The optional `environment` declaration contains `forwards` (caller variables

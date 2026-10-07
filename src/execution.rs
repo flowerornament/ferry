@@ -306,6 +306,7 @@ pub fn prepare(
     root: &Path,
     request: &Request,
     stop: &AtomicBool,
+    admission: &mut Option<crate::admission::Admission>,
 ) -> Result<(PathBuf, fs::File, HostLease)> {
     validate(request)?;
     fs::create_dir_all(root.join("locks"))?;
@@ -322,6 +323,12 @@ pub fn prepare(
         }
     }
     let exclusive = HostLease::acquire(root, request, stop)?;
+    // Measured after any wait for the lease, under this seat's lock.
+    crate::admission::admit(
+        root,
+        &request.seat,
+        admission.get_or_insert_with(Default::default),
+    )?;
     let bare = root.join("repo.git");
     repository::output(Command::new("git").arg("--git-dir").arg(&bare).args([
         "cat-file",

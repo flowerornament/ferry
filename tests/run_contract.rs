@@ -1477,3 +1477,252 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     );
     assert_lease_windows(&receipts, held_for, dir.path());
 }
+
+fn with_host_policy(dir: &Path, policy: &str) {
+    let config = dir.join("config/ferry");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("host.toml"), policy).unwrap();
+}
+
+/// A seat as an earlier session would have left it: a cache with a target and
+/// a sibling, a lock file, and optionally an idle, taint or owner record.
+fn synthetic_seat(state: &Path, seat: &str, released_ms: Option<u64>, extra: Option<&str>) {
+    fs::create_dir_all(state.join("caches").join(seat).join("cargo-target/deps")).unwrap();
+    fs::write(
+        state
+            .join("caches")
+            .join(seat)
+            .join("cargo-target/deps/blob"),
+        vec![7u8; 4096],
+    )
+    .unwrap();
+    fs::create_dir_all(state.join("caches").join(seat).join("keep")).unwrap();
+    fs::write(state.join("caches").join(seat).join("keep/warm"), "warm").unwrap();
+    fs::create_dir_all(state.join("locks")).unwrap();
+    fs::write(state.join("locks").join(seat), "").unwrap();
+    if let Some(released_ms) = released_ms {
+        fs::create_dir_all(state.join("idle")).unwrap();
+        fs::write(
+            state.join("idle").join(format!("{seat}.json")),
+            serde_json::json!({"released_ms": released_ms, "id": "earlier", "commit": "0"})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    if let Some(kind) = extra {
+        fs::create_dir_all(state.join(kind)).unwrap();
+        fs::write(state.join(kind).join(format!("{seat}.json")), "{}").unwrap();
+    }
+}
+
+#[test]
+fn admission_without_a_policy_is_not_configured_and_claims_no_floor() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success());
+    let admission = &receipt(&out)["admission"];
+    assert_eq!(admission["policy"], "not-configured");
+    assert!(admission["floor_bytes"].is_null());
+    assert!(admission["available_before"].is_null());
+    assert_eq!(admission["result"], "admitted");
+}
+
+#[test]
+fn a_malformed_or_unsupported_policy_refuses_without_measuring() {
+    for policy in [
+        "version = 1\nmin_free_bytes = 'lots'\n",
+        "version = 3\nmin_free_bytes = 1\n",
+        "version = 1\nmin_free_bytes = 1\nsurprise = true\n",
+        "version = 1\nmin_free_bytes = 1\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
+        "version = 2\nmin_free_bytes = 1\nevict = { mode = 'idle-seat-targets', targets = ['../escape'] }\n",
+    ] {
+        let dir = fixture();
+        with_host_policy(dir.path(), policy);
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        assert_eq!(out.status.code(), Some(125), "{policy}");
+        let admission = &receipt(&out)["admission"];
+        assert_eq!(admission["result"], "refused", "{policy}");
+        assert_eq!(admission["policy"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(
+            admission["floor_bytes"].is_null() || policy.contains("evict"),
+            "{policy}"
+        );
+        assert!(admission["available_before"].is_null(), "{policy}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
+    }
+}
+
+#[test]
+fn version_one_guards_the_floor_and_never_evicts() {
+    let dir = fixture();
+    let state = dir.path().join(".ferry/local");
+    synthetic_seat(&state, "idle-one", Some(1), None);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1000000000000000000\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    let record = receipt(&out);
+    let admission = &record["admission"];
+    assert_eq!(admission["result"], "refused");
+    assert_eq!(admission["policy"]["version"], 1);
+    assert_eq!(admission["floor_bytes"], 1_000_000_000_000_000_000u64);
+    assert!(admission["available_before"].as_u64().is_some());
+    assert_eq!(admission["evicted"], serde_json::json!([]));
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("below host floor")
+    );
+    assert!(
+        state
+            .join("caches/idle-one/cargo-target/deps/blob")
+            .exists()
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
+}
+
+#[test]
+fn version_two_admits_without_eviction_when_the_floor_is_met() {
+    let dir = fixture();
+    let state = dir.path().join(".ferry/local");
+    synthetic_seat(&state, "idle-one", Some(1), None);
+    with_host_policy(
+        dir.path(),
+        "version = 2\nmin_free_bytes = 1\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success());
+    let admission = &receipt(&out)["admission"];
+    assert_eq!(admission["result"], "admitted");
+    assert_eq!(admission["evicted"], serde_json::json!([]));
+    assert!(
+        state
+            .join("caches/idle-one/cargo-target/deps/blob")
+            .exists()
+    );
+}
+
+#[test]
+fn version_two_evicts_only_designated_targets_of_eligible_idle_seats_oldest_first() {
+    let dir = fixture();
+    let state = dir.path().join(".ferry/local");
+    synthetic_seat(&state, "older", Some(1), None);
+    synthetic_seat(&state, "newer", Some(2), None);
+    synthetic_seat(&state, "tainted", Some(0), Some("taint"));
+    synthetic_seat(&state, "owned", Some(0), Some("owners"));
+    synthetic_seat(&state, "busy", Some(0), None);
+    synthetic_seat(&state, "unknown", None, None);
+    synthetic_seat(&state, "linked", Some(0), None);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("precious"), "keep").unwrap();
+    fs::remove_dir_all(state.join("caches/linked/cargo-target")).unwrap();
+    std::os::unix::fs::symlink(&outside, state.join("caches/linked/cargo-target")).unwrap();
+    let busy = fs::File::open(state.join("locks/busy")).unwrap();
+    fs2::FileExt::lock_exclusive(&busy).unwrap();
+    with_host_policy(
+        dir.path(),
+        "version = 2\nmin_free_bytes = 1000000000000000000\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    drop(busy);
+    assert_eq!(out.status.code(), Some(125));
+    let admission = receipt(&out)["admission"].clone();
+    assert_eq!(admission["result"], "refused");
+    let evicted: Vec<&str> = admission["evicted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seat"].as_str().unwrap())
+        .collect();
+    assert_eq!(evicted, ["older", "newer"], "{admission}");
+    for entry in admission["evicted"].as_array().unwrap() {
+        assert!(entry["path"].as_str().unwrap().ends_with("/cargo-target"));
+        assert_eq!(entry["logical_bytes"], 4096);
+        assert!(entry["allocated_bytes"].as_u64().is_some());
+        assert!(entry["available_after"].as_u64().is_some());
+    }
+    let skipped = &admission["skipped"];
+    assert_eq!(
+        (
+            &skipped["tainted"],
+            &skipped["owners"],
+            &skipped["locked"],
+            &skipped["unsafe_path"]
+        ),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(1),
+            &serde_json::json!(1),
+            &serde_json::json!(1)
+        ),
+        "{admission}"
+    );
+    assert!(skipped["no_idle_record"].as_u64().unwrap() >= 1);
+    for seat in ["older", "newer"] {
+        assert!(
+            !state
+                .join("caches")
+                .join(seat)
+                .join("cargo-target")
+                .exists()
+        );
+        assert!(state.join("caches").join(seat).join("keep/warm").exists());
+        assert!(!state.join("idle").join(format!("{seat}.json")).exists());
+    }
+    for seat in ["tainted", "owned", "busy", "unknown"] {
+        assert!(
+            state
+                .join("caches")
+                .join(seat)
+                .join("cargo-target/deps/blob")
+                .exists()
+        );
+    }
+    assert!(outside.join("precious").exists());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_real_idle_release_is_reclaimed_by_a_later_admission() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\n[recipe.build]\ncommand=['sh','-c','mkdir -p \"$FERRY_CACHE_DIR/cargo-target\" \"$FERRY_CACHE_DIR/keep\" && head -c 8192 /dev/zero > \"$FERRY_CACHE_DIR/cargo-target/out\" && echo warm > \"$FERRY_CACHE_DIR/keep/warm\"']\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "build"]);
+    let out = run(
+        dir.path(),
+        &["run", "build", "--local", "--json", "--seat", "producer"],
+    );
+    assert!(out.status.success());
+    assert_eq!(receipt(&out)["custody"]["record"], "idle");
+    with_host_policy(
+        dir.path(),
+        "version = 2\nmin_free_bytes = 1000000000000000000\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
+    );
+    let out = run(
+        dir.path(),
+        &["run", "build", "--local", "--json", "--seat", "consumer"],
+    );
+    assert_eq!(out.status.code(), Some(125));
+    let admission = &receipt(&out)["admission"];
+    let evicted = admission["evicted"].as_array().unwrap();
+    assert_eq!(evicted.len(), 1, "{admission}");
+    assert!(evicted[0]["seat"].as_str().unwrap().ends_with("-producer"));
+    assert_eq!(evicted[0]["logical_bytes"], 8192);
+    let cache = fs::read_dir(dir.path().join(".ferry/local/caches"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with("-producer"))
+        .unwrap();
+    assert!(!cache.join("cargo-target").exists());
+    assert!(cache.join("keep/warm").exists());
+}

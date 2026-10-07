@@ -85,6 +85,9 @@ pub struct Receipt {
     /// The host lease the session held: `shared` or `exclusive`, and its wait.
     #[serde(default)]
     pub lease: Option<crate::execution::Lease>,
+    /// The host's disk admission: policy, measurements, evictions, verdict.
+    #[serde(default)]
+    pub admission: Option<crate::admission::Admission>,
 }
 
 pub fn now_ms() -> u128 {

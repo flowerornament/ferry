@@ -1,4 +1,5 @@
 //! Ferry runs committed repository recipes locally or over SSH.
+mod admission;
 mod artifacts;
 mod config;
 mod custody;
@@ -263,6 +264,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         host_exe: None,
         custody: None,
         lease: None,
+        admission: None,
     })
 }
 

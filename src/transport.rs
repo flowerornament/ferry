@@ -188,6 +188,8 @@ pub struct HostResult {
     pub custody: Option<crate::custody::Release>,
     #[serde(default)]
     pub lease: Option<execution::Lease>,
+    #[serde(default)]
+    pub admission: Option<crate::admission::Admission>,
 }
 fn event(value: &serde_json::Value) {
     serde_json::to_writer(std::io::stdout(), value)
@@ -256,11 +258,13 @@ pub fn host_run() -> Result<i32> {
         exe: receipt::exe_path(),
         custody: None,
         lease: None,
+        admission: None,
     };
     event(&serde_json::json!({"protocol":1,"event":"accepted","id":request.id}));
     crate::custody::supervise()?;
     let executed: Result<()> = (|| {
-        let (seat, lease, host_lease) = execution::prepare(&root, &request, &stop)?;
+        let (seat, lease, host_lease) =
+            execution::prepare(&root, &request, &stop, &mut result.admission)?;
         event(
             &serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit,"seat":request.seat}),
         );
@@ -337,7 +341,8 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     let stop = execution::stopped()?;
     execution::interrupted()?;
     crate::custody::supervise()?;
-    let (seat, lease, host_lease) = execution::prepare(&state, request, &stop)?;
+    let (seat, lease, host_lease) =
+        execution::prepare(&state, request, &stop, &mut record.admission)?;
     if json {
         event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
     }
@@ -583,6 +588,7 @@ fn accept_result(
     record.host_source_rev = result.source_rev;
     record.custody = result.custody;
     record.lease = result.lease;
+    record.admission = result.admission;
     record.host_exe = result.exe;
     if record.host_binary_sha256.as_deref() != Some(&info.binary_sha256) {
         record.outcome = Outcome::Lost;
