@@ -369,3 +369,38 @@ fn custody(root: &Path, target: &Path, device: u64) -> Result<Option<(u64, u64)>
     }
     Ok(Some((logical, allocated)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_record_replaced_before_the_lock_is_skipped_as_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("caches/seat/cargo-target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("out"), "built").unwrap();
+        fs::create_dir_all(root.join("locks")).unwrap();
+        fs::write(root.join("locks/seat"), "").unwrap();
+        fs::create_dir_all(root.join("idle")).unwrap();
+        // The record now on disk differs from the bytes the candidate was sorted on.
+        fs::write(root.join("idle/seat.json"), r#"{"released_ms":2}"#).unwrap();
+        let device = fs::metadata(root).unwrap().dev();
+        let mut admission = Admission::default();
+        reclaim(
+            root,
+            "seat",
+            1,
+            br#"{"released_ms":1}"#,
+            device,
+            &["cargo-target".to_owned()],
+            &mut admission,
+        )
+        .unwrap();
+        assert_eq!(admission.skipped.changed, 1);
+        assert_eq!(admission.evicted, vec![]);
+        assert!(target.join("out").exists());
+        assert!(root.join("idle/seat.json").exists());
+    }
+}
