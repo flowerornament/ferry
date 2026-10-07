@@ -1083,12 +1083,16 @@ fn nondeterministic_adapter_is_a_refusal() {
 /// A host reached through an SSH shim: `host` is its HOME, `binary` its
 /// ferry path relative to that HOME.
 fn remote_run(dir: &Path, binary: &str, args: &[&str]) -> Output {
+    remote_command(dir, binary, args).output().unwrap()
+}
+fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     let host = dir.join("host");
     let tools = dir.join("transport-tools");
     fs::create_dir_all(host.join(".local/bin")).unwrap();
     fs::create_dir_all(&tools).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    // FERRY_TEST_SLOW_PUSH names a marker: a git push touches it, then stalls.
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
@@ -1105,7 +1109,8 @@ fn remote_run(dir: &Path, binary: &str, args: &[&str]) -> Output {
         ),
     )
     .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_ferry"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
+    command
         .current_dir(dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("HOME", dir)
@@ -1115,9 +1120,58 @@ fn remote_run(dir: &Path, binary: &str, args: &[&str]) -> Output {
         )
         .env("GIT_SSH", tools.join("ssh"))
         .env("FERRY_TEST_HOST", &host)
-        .args(args)
-        .output()
-        .unwrap()
+        .args(args);
+    command
+}
+
+#[test]
+fn a_signal_during_the_push_stops_the_run_before_dispatch() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture();
+    let marker = dir.path().join("pushing");
+    let mut child = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_SLOW_PUSH", &marker)
+    .stdout(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(marker.exists(), "the push never started");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(143), "{stdout}");
+    let record = receipt(&output);
+    assert_eq!(record["outcome"], "lost");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("before dispatch")
+    );
+    assert!(
+        !stdout.contains("\"accepted\""),
+        "the host was asked to run: {stdout}"
+    );
+    assert!(!stdout.contains("committed"));
+    assert!(!dir.path().join("host/.local/state/ferry/records").exists());
 }
 
 #[test]
@@ -1143,10 +1197,12 @@ fn a_host_refusal_before_acceptance_is_refused_not_lost() {
         record["reason"]
             .as_str()
             .unwrap()
-            .starts_with("host refused before acceptance: "),
+            .starts_with("host refused before acceptance: creating "),
         "{}",
         record["reason"]
     );
+    // The receipt names the host binary that refused.
+    assert_eq!(record["host_binary_sha256"].as_str().unwrap().len(), 64);
     assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
 }
 

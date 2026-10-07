@@ -171,18 +171,11 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         }
     }
 }
-/// Refuses to start another phase once the caller has been signalled.
-fn interrupted() -> Result<()> {
-    match execution::caught_signal() {
-        Some(signal) => {
-            Err(format!("caller received {} before dispatch", signal_name(signal)).into())
-        }
-        None => Ok(()),
-    }
-}
 fn signal_name(signal: i32) -> String {
-    nix::sys::signal::Signal::try_from(signal)
-        .map_or_else(|_| format!("signal {signal}"), |s| s.as_str().to_owned())
+    execution::signal_name(signal)
+}
+fn interrupted() -> Result<()> {
+    execution::interrupted()
 }
 fn run(options: &Run) -> Result<i32> {
     // Catch INT, TERM and HUP from the start, so an early signal still ends

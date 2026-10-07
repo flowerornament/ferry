@@ -175,7 +175,7 @@ refusal from a recipe failure. A recipe may itself exit 125.
 | `ran-fail` | the recipe's code | The recipe ran and failed. |
 | `timeout`  | 124 | `--timeout-seconds` elapsed; the recipe's session was ended. |
 | `refused`  | 125 | Nothing ran. This covers an unknown recipe or route, an unmet requirement, a dirty or unknown commit, and a host that refused before acceptance (including a host older than the caller that rejects the request). |
-| `lost`     | 128 + signal, or 255 | The run's fate is unknown or was cut short. When the caller is interrupted, it exits 128 plus the signal it received: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. A signal that arrives before dispatch still writes a receipt. Otherwise, lost means the connection or host failed after dispatch: 255. |
+| `lost`     | 128 + signal, or 255 | The run's fate is unknown or was cut short. When the caller is interrupted, it exits 128 plus the signal it received: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. A signal that arrives before dispatch still writes a receipt and dispatches nothing; the caller first lets an in-flight step, such as a git push, finish. Otherwise, lost means the connection or host failed after dispatch: 255. |
 
 ## Limits
 

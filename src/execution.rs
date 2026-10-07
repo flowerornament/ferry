@@ -190,6 +190,22 @@ pub fn caught_signal() -> Option<i32> {
         .filter(|signal| *signal != 0)
 }
 
+pub fn signal_name(signal: i32) -> String {
+    nix::sys::signal::Signal::try_from(signal)
+        .map_or_else(|_| format!("signal {signal}"), |s| s.as_str().to_owned())
+}
+
+/// Refuses to start another phase once this process has been signalled.
+/// The caller checks at every phase boundary and immediately before dispatch.
+pub fn interrupted() -> Result<()> {
+    match caught_signal() {
+        Some(signal) => {
+            Err(format!("caller received {} before dispatch", signal_name(signal)).into())
+        }
+        None => Ok(()),
+    }
+}
+
 /// The exit code of an interrupted run: 128 plus the signal this process
 /// caught. A host whose client disappeared without signalling it keeps 130.
 pub fn interrupted_code() -> i32 {

@@ -193,18 +193,23 @@ fn event(value: &serde_json::Value) {
 /// Reads, validates and reserves a request. Any error here is a refusal.
 fn admit(input: &mut impl BufRead) -> Result<(Request, PathBuf, fs::File)> {
     let mut line = String::new();
-    input.read_line(&mut line)?;
-    let request: Request = serde_json::from_str(&line)?;
-    execution::validate(&request)?;
+    input
+        .read_line(&mut line)
+        .map_err(|e| format!("reading the request: {e}"))?;
+    let request: Request =
+        serde_json::from_str(&line).map_err(|e| format!("parsing the request: {e}"))?;
+    execution::validate(&request).map_err(|e| format!("validating the request: {e}"))?;
     let root =
         PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join(".local/state/ferry");
-    fs::create_dir_all(root.join("records"))?;
-    let record_path = root.join("records").join(format!("{}.json", request.id));
+    let records = root.join("records");
+    fs::create_dir_all(&records).map_err(|e| format!("creating {}: {e}", records.display()))?;
+    let record_path = records.join(format!("{}.json", request.id));
     // A reservation refuses reuse even after a crash, before acquiring any seat.
     let record = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(record_path)?;
+        .open(&record_path)
+        .map_err(|e| format!("reserving {}: {e}", record_path.display()))?;
     Ok((request, root, record))
 }
 pub fn host_run() -> Result<i32> {
@@ -318,6 +323,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         )?;
     }
     let stop = execution::stopped()?;
+    execution::interrupted()?;
     let (seat, lease, exclusive) = execution::prepare(&state, request, &stop)?;
     if json {
         event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
@@ -409,6 +415,8 @@ pub fn remote(
     )?;
     push_companions(root, machine, request)?;
     let stop = execution::stopped()?;
+    // The last moment before the host is asked to run anything.
+    execution::interrupted()?;
     let child = ssh()?
         .arg(&machine.ssh)
         .arg(format!("{} host-run", machine.binary))
@@ -446,12 +454,14 @@ pub fn remote(
     if let Some(result) = stream.result {
         accept_result(root, machine, request, record, &info, result)?;
     } else if let Some(reason) = stream.refusal {
+        refused_by(record, &info);
         record.outcome = Outcome::Refused;
         record.exit_code = 125;
         record.reason = Some(format!("host refused before acceptance: {reason}"));
     } else if !stream.accepted && status.code() == Some(125) {
         // A host from before the refusal event exits 125 for every error it
         // meets before acceptance, and the recipe cannot have started.
+        refused_by(record, &info);
         record.outcome = Outcome::Refused;
         record.exit_code = 125;
         record.reason = Some("host refused before acceptance (exit 125; see its stderr)".into());
@@ -459,6 +469,13 @@ pub fn remote(
         record.reason = Some(format!("no host result: {status}"));
     }
     Ok(())
+}
+
+/// A refusal names the host binary that refused, as host-info reported it.
+fn refused_by(record: &mut Receipt, info: &HostInfo) {
+    record.host_binary_sha256 = Some(info.binary_sha256.clone());
+    record.host_source_rev.clone_from(&info.source_rev);
+    record.host_exe.clone_from(&info.exe);
 }
 
 /// What the host said on the protocol stream.
