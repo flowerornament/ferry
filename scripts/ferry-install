@@ -108,18 +108,49 @@ flip() { # $1 link name, $2 target
   mv -T "$root/$1.next" "$root/$1"
 }
 
+# Verification reads only: it neither creates, locks, nor adopts anything.
+if [ "$action" = verify ]; then
+  if [ ! -e "$root/current" ] && [ -L "$root/installed" ]; then
+    die "legacy layout ($root/installed); the next install adopts it"
+  fi
+  verify "$rev"
+  exit 0
+fi
+
 mkdir -p "$root/installs" "$(dirname "$bin")"
 exec 9>"$root/install.lock"
 flock -n 9 || die "another install or rollback holds $root/install.lock"
 
-# Adopt the pre-procedure layout: one out-link named `installed`.
-if [ ! -e "$root/current" ] && [ -L "$root/installed" ]; then
+# Adopt the pre-procedure layout (one out-link named `installed`) as its own
+# transaction, so a later failure in this run leaves a working launcher: root
+# the old generation under installs/, point current and the launcher at it,
+# require the launcher to run the same binary as before, and only then drop
+# `installed`. Any failure restores the legacy layout.
+adopt() {
+  local store before old prior_bin after
+  store="$(readlink -f "$root/installed")"
+  before="$("$root/installed/bin/ferry" host-info | python3 -c 'import json,sys; print(json.load(sys.stdin)["binary_sha256"])')" \
+    || die "legacy launcher $root/installed/bin/ferry fails host-info; not adopting"
   old="$("$root/installed/bin/ferry" host-info | python3 -c 'import json,sys; print(json.load(sys.stdin).get("source_rev") or "")')"
-  [[ "$old" =~ ^[0-9a-f]{40}$ ]] || old="adopted-$(basename "$(readlink -f "$root/installed")")"
-  nix build --out-link "$root/installs/$old" "$(readlink -f "$root/installed")"
+  [[ "$old" =~ ^[0-9a-f]{40}$ ]] || old="adopted-$(basename "$store")"
+  nix build --out-link "$root/installs/$old" "$store" || die "could not root $store; legacy layout unchanged"
+  gc_rooted "$root/installs/$old"
+  prior_bin="$(readlink "$bin" 2>/dev/null || true)"
   flip current "$root/installs/$old"
+  if [ ! -e "$bin" ] || [ -L "$bin" ]; then
+    ln -sfn "$root/current/bin/ferry" "$bin.next"
+    mv -T "$bin.next" "$bin"
+  fi
+  after="$("$bin" host-info 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["binary_sha256"])' 2>/dev/null || true)"
+  if [ -L "$bin" ] && [ "$after" != "$before" ]; then
+    if [ -n "$prior_bin" ]; then ln -sfn "$prior_bin" "$bin.next" && mv -T "$bin.next" "$bin"; fi
+    rm -f "$root/current"
+    die "adopted launcher does not run the legacy binary ($after != $before); legacy layout restored"
+  fi
   rm "$root/installed"
-fi
+  echo "ferry-install(host): adopted $store as $root/installs/$old" >&2
+}
+if [ ! -e "$root/current" ] && [ -L "$root/installed" ]; then adopt; fi
 
 case "$action" in
   install)
@@ -158,7 +189,6 @@ case "$action" in
       die "rollback check failed; restored $prior"
     fi
     ;;
-  verify) verify "$rev" ;;
   *) die "unknown action $action" ;;
 esac
 HOST

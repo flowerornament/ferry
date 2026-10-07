@@ -51,7 +51,18 @@ it reports. The configuration's `flake.lock` must pin `<commit>`.
 
 Failure at any step leaves the working generation active, and a failed check
 after the flip flips back. `rollback <ssh>` swaps `current` and `previous`
-without rebuilding. `verify-host <ssh> [commit]` checks the active install.
+without rebuilding. `verify-host <ssh> [commit]` checks the active install and
+changes nothing.
+
+A host still in the old single-link layout (`installed`) is adopted by the
+next install as its own step:
+
+1. The old generation is rooted under `installs/`.
+2. `current` and the launcher are pointed at it.
+3. The launcher must still run the same binary.
+4. Only then is the old link removed.
+
+So even a failed first install leaves a working launcher.
 One `flock` serializes every activation and rollback. Only full commit ids
 reachable from `main` install on the live root.
 
@@ -68,10 +79,15 @@ reachable from `main` install on the live root.
   unknown. A receipt without these fields says nothing about provenance.
 
 **Qualification.** `just qualify-install <ssh> <commit>` runs the whole
-procedure in a scratch root on the host, without touching the live install.
+procedure in a private scratch root on the host, made with `mktemp -d`. It
+removes that root only after a pass and never touches the live install.
 It adopts the live generation, installs `<commit>`, and requires a receipt
 that joins both ends to `<commit>` and to the hashes of the executables that
-ran. It rolls back and forward. It requires two refusals: an install of a
-build without the source join, and a second activation while another holds
-the lock.
+ran. It rolls back and forward. It requires these refusals:
+
+- verification of the legacy layout, without changing it;
+- a first install of a build without the source join, which must leave the
+  launcher on the same binary;
+- the same install after a good one;
+- a second activation while a confirmed holder owns the lock.
 
