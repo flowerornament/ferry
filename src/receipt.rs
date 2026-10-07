@@ -8,6 +8,20 @@ use std::{
 };
 
 pub const PROTOCOL: u32 = 1;
+/// The source revision a Nix build compiled in, or `unpinned` for a build
+/// without one. Receipts that predate the field leave it null: unknown.
+pub fn source_rev() -> String {
+    option_env!("FERRY_SOURCE_REV")
+        .unwrap_or("unpinned")
+        .to_owned()
+}
+
+/// The path of the running executable, as the kernel resolved it.
+pub fn exe_path() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -55,6 +69,16 @@ pub struct Receipt {
     /// SHA-256 of the arguments as a JSON array of strings.
     #[serde(default)]
     pub args_sha256: Option<String>,
+    /// Source revision (`unpinned` when the build had none) and executable
+    /// path of the caller and host binaries; null on older receipts: unknown.
+    #[serde(default)]
+    pub caller_source_rev: Option<String>,
+    #[serde(default)]
+    pub caller_exe: Option<String>,
+    #[serde(default)]
+    pub host_source_rev: Option<String>,
+    #[serde(default)]
+    pub host_exe: Option<String>,
 }
 
 pub fn now_ms() -> u128 {

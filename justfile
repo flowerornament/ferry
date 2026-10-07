@@ -10,3 +10,7 @@ build:
 # (and push it, once a forge remote named origin exists)
 land *args:
     scripts/jj-land.sh {{args}}
+
+# Drill the install procedure for <rev> on <host> in a scratch root (live install untouched)
+qualify-install host rev:
+    scripts/qualify-install {{host}} {{rev}}

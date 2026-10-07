@@ -64,6 +64,10 @@ pub struct HostInfo {
     pub binary_sha256: String,
     pub os_arch: String,
     pub cores: usize,
+    #[serde(default)]
+    pub source_rev: Option<String>,
+    #[serde(default)]
+    pub exe: Option<String>,
 }
 pub fn host_info() -> Result<HostInfo> {
     Ok(HostInfo {
@@ -71,6 +75,8 @@ pub fn host_info() -> Result<HostInfo> {
         binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
         os_arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         cores: std::thread::available_parallelism()?.get(),
+        source_rev: Some(receipt::source_rev()),
+        exe: receipt::exe_path(),
     })
 }
 
@@ -174,6 +180,10 @@ pub struct HostResult {
     pub artifacts_error: Option<String>,
     #[serde(default)]
     pub collection: Option<execution::Collection>,
+    #[serde(default)]
+    pub source_rev: Option<String>,
+    #[serde(default)]
+    pub exe: Option<String>,
 }
 fn event(value: &serde_json::Value) {
     serde_json::to_writer(std::io::stdout(), value)
@@ -219,6 +229,8 @@ pub fn host_run() -> Result<i32> {
         artifacts_sha256: None,
         artifacts_error: None,
         collection: None,
+        source_rev: Some(receipt::source_rev()),
+        exe: receipt::exe_path(),
     };
     event(&serde_json::json!({"protocol":1,"event":"accepted","id":request.id}));
     let executed: Result<()> = (|| {
@@ -315,6 +327,8 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         Outcome::RanFail
     };
     record.host_binary_sha256 = Some(record.caller_binary_sha256.clone());
+    record.host_source_rev.clone_from(&record.caller_source_rev);
+    record.host_exe.clone_from(&record.caller_exe);
     if !request.recipe.artifacts.is_empty() {
         let output = state.join("runs").join(&request.id).join("artifacts.tar");
         match crate::artifacts::collect(&seat, &request.recipe.artifacts, &output) {
@@ -473,6 +487,8 @@ fn accept_result(
     record.exit_code = result.exit_code;
     record.reason = result.reason;
     record.host_binary_sha256 = Some(result.binary_sha256);
+    record.host_source_rev = result.source_rev;
+    record.host_exe = result.exe;
     if record.host_binary_sha256.as_deref() != Some(&info.binary_sha256) {
         record.outcome = Outcome::Lost;
         record.exit_code = 255;

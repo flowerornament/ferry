@@ -223,6 +223,10 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         collection: None,
         args: vec![],
         args_sha256: None,
+        caller_source_rev: Some(receipt::source_rev()),
+        caller_exe: receipt::exe_path(),
+        host_source_rev: None,
+        host_exe: None,
     })
 }
 

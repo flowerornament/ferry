@@ -27,11 +27,15 @@ objects are transported and materialized on the host. Old receipts without
 
 ## Install and run
 
-Install with `cargo install --locked --path . --root ~/.local`
-(Rust 1.99, edition 2024) on the caller and each host. One crate builds one binary:
-`ferry run` is the caller and `ferry host-run` receives the request. Git, SSH,
-and Unix process tools are required; jj is optional for colocated repositories.
-Murail's reviewed `8ba36cfa` transport is the behavioral specification.
+Ferry installs through Nix on the caller and on every host, from one reviewed
+commit, so each receipt can name the source and executable that ran on both
+ends (`caller_source_rev`/`caller_exe`, `host_source_rev`/`host_exe`, beside
+the binary SHA-256s). `scripts/ferry-install` is the supported procedure for
+hosts and for checking the caller; RELEASE.md describes install, upgrade and
+rollback. One crate builds one binary: `ferry run` is the caller and
+`ferry host-run` receives the request. Git, SSH, and Unix process tools are
+required; jj is optional for colocated repositories. A `cargo build` binary
+works but reports `source_rev` as `unpinned`.
 
 ```
 ferry recipes
@@ -41,8 +45,8 @@ ferry run test --local --json
 ferry receipt <id>
 ```
 
-Add this directory to PATH or use its absolute executable path. There is no
-published package or forge remote yet. This repository remains local-only.
+There is no published package or forge remote yet. This repository remains
+local-only.
 Ferry supplies non-interactive SSH (`BatchMode=yes`) and connection sharing
 (`ControlMaster=auto`, `ControlPersist=60`) itself, including Git transfers.
 Its control sockets live in a private `~/.cache/ferry/ssh` directory.

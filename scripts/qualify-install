@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Qualify scripts/ferry-install for <rev> on <ssh>, in a scratch root.
+#
+# Usage: scripts/qualify-install <ssh> <rev> [<old-rev>]
+#
+# The live install (~/.local/state/ferry, ~/.local/bin/ferry) is read, never
+# changed: the drill runs under FERRY_INSTALL_ROOT=.local/state/ferry-qualify,
+# seeded from the live generation in the pre-procedure layout. It proves, in
+# order: adoption of that layout; install of <rev>; a receipt joining caller
+# and host to <rev> and to the executables that ran; rollback and forward; a
+# refused install of <old-rev> (a revision without the source join, default
+# b85eb91e) that keeps the working generation; and a refusal while another
+# activation holds the install lock. Activating <rev> on the live root is a
+# separate, announced step.
+set -euo pipefail
+
+host="${1:?usage: qualify-install <ssh> <rev> [<old-rev>]}"
+rev="${2:?usage: qualify-install <ssh> <rev> [<old-rev>]}"
+old="${3:-b85eb91e323acc1046275537e4533180875dd1e3}"
+here="$(cd "$(dirname "$0")" && pwd)"
+export FERRY_INSTALL_ROOT=.local/state/ferry-qualify
+export FERRY_INSTALL_BIN=.local/state/ferry-qualify/bin/ferry
+install="$here/ferry-install"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+
+step() { printf '\n== %s\n' "$*"; }
+fail() { echo "qualify: FAILED: $*" >&2; exit 1; }
+refused() { if "$@" >"$scratch/out" 2>&1; then cat "$scratch/out"; fail "expected a refusal: $*"; fi; sed 's/^/   refused: /' "$scratch/out"; }
+field() { python3 -c 'import json,sys; d=json.load(sys.stdin)
+for k in sys.argv[1].split("."): d=d[k]
+print(d)' "$1"; }
+live() { ssh -o BatchMode=yes "$host" 'readlink -f ~/.local/bin/ferry; sha256sum "$(dirname "$(readlink -f ~/.local/bin/ferry)")/.ferry-wrapped" | cut -d" " -f1'; }
+
+step "live install before (must not change)"
+before="$(live)"; echo "$before"
+
+step "seed scratch root from the live generation, pre-procedure layout"
+ssh -o BatchMode=yes "$host" bash -s -- "$FERRY_INSTALL_ROOT" <<'SEED'
+set -euo pipefail
+export PATH="/nix/var/nix/profiles/default/bin:$PATH"
+root="$HOME/$1"; rm -rf "$root"; mkdir -p "$root"
+store="$(readlink -f "$HOME/.local/bin/ferry")"; store="${store%/bin/*}"
+nix build --out-link "$root/installed" "$store"
+echo "seeded $root/installed -> $store"
+SEED
+
+step "install $rev (adopts the seeded generation as previous)"
+"$install" host "$host" "$rev" | tee "$scratch/install.json"
+[[ "$(field current <"$scratch/install.json")" == */"$FERRY_INSTALL_ROOT/installs/$rev" ]] || fail "current is not $rev"
+[[ "$(field previous <"$scratch/install.json")" == */"$FERRY_INSTALL_ROOT/installs/"* ]] ||
+  fail "seeded generation was not adopted as previous"
+
+step "receipt joins caller and host to $rev and to the executables that ran"
+nix build --out-link "$scratch/caller" "git+file://$(git rev-parse --show-toplevel)?rev=$rev"
+mkdir -p "$scratch/config/ferry"
+printf 'host.%s = { ssh = "%s", triple = "x86_64-unknown-linux-gnu", cores = 1, features = ["linux"], binary = "%s" }\n' \
+  qualify "$host" "$FERRY_INSTALL_BIN" >"$scratch/config/ferry/machines.toml"
+XDG_CONFIG_HOME="$scratch/config" "$scratch/caller/bin/ferry" run smoke --on qualify --commit "$rev" --json >"$scratch/run.jsonl" ||
+  fail "smoke run did not pass"
+grep '"event":"receipt"' "$scratch/run.jsonl" | tail -1 >"$scratch/receipt.json"
+r() { field "receipt.$1" <"$scratch/receipt.json"; }
+echo "   receipt $(r id): $(r outcome)"
+[ "$(r outcome)" = ran-pass ] || fail "outcome $(r outcome)"
+[ "$(r caller_source_rev)" = "$rev" ] || fail "caller_source_rev $(r caller_source_rev)"
+[ "$(r host_source_rev)" = "$rev" ] || fail "host_source_rev $(r host_source_rev)"
+[ "$(shasum -a 256 "$(r caller_exe)" | cut -d' ' -f1)" = "$(r caller_binary_sha256)" ] || fail "caller_exe does not hash to caller_binary_sha256"
+[ "$(ssh -o BatchMode=yes "$host" sha256sum "$(r host_exe)" | cut -d' ' -f1)" = "$(r host_binary_sha256)" ] || fail "host_exe does not hash to host_binary_sha256"
+[[ "$(r host_exe)" == /nix/store/* && "$(r caller_exe)" == /nix/store/* ]] || fail "an executable outside the Nix store ran"
+echo "   caller $(r caller_exe) $(r caller_binary_sha256)"
+echo "   host   $(r host_exe) $(r host_binary_sha256)"
+
+step "rollback to the adopted generation, then forward"
+"$install" rollback "$host"
+"$install" verify-host "$host" >/dev/null
+"$install" rollback "$host" | tee "$scratch/forward.json"
+"$install" verify-host "$host" "$rev" >/dev/null
+
+step "install of $old (no source join) is refused and keeps $rev active"
+refused "$install" host "$host" "$old"
+"$install" verify-host "$host" "$rev" >/dev/null && echo "   $rev still active"
+
+step "a held install lock refuses a second activation"
+ssh -o BatchMode=yes "$host" "flock ~/$FERRY_INSTALL_ROOT/install.lock sleep 20" &
+holder=$!
+sleep 4
+refused "$install" rollback "$host"
+wait "$holder"
+"$install" verify-host "$host" "$rev" >/dev/null
+
+step "live install after (must equal before)"
+after="$(live)"; echo "$after"
+[ "$before" = "$after" ] || fail "the live install changed"
+
+printf '\nqualify: PASS %s on %s (scratch %s)\n' "$rev" "$host" "$FERRY_INSTALL_ROOT"

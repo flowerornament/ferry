@@ -1,4 +1,4 @@
-{ lib, rustPlatform, git, jujutsu, openssh, inetutils, procps, stdenv, makeWrapper, python3 }:
+{ lib, rustPlatform, git, jujutsu, openssh, inetutils, procps, stdenv, makeWrapper, python3, sourceRev ? null }:
 let
   version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 in rustPlatform.buildRustPackage {
@@ -9,6 +9,7 @@ in rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./rust-toolchain.toml ./src ./tests ];
   };
   cargoLock.lockFile = ./Cargo.lock;
+  env = lib.optionalAttrs (sourceRev != null) { FERRY_SOURCE_REV = sourceRev; };
   nativeBuildInputs = [ makeWrapper ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ rustPlatform.bindgenHook ];
   nativeCheckInputs = [ git jujutsu python3 inetutils ] ++ lib.optionals stdenv.hostPlatform.isLinux [ procps ];
   doCheck = true;
@@ -26,6 +27,7 @@ in rustPlatform.buildRustPackage {
     runHook preInstallCheck
     test "$($out/bin/ferry --version)" = "ferry ${version}"
     $out/bin/ferry --help >/dev/null
+    $out/bin/ferry host-info | grep -F '"source_rev":"${if sourceRev == null then "unpinned" else sourceRev}"'
     runHook postInstallCheck
   '';
   meta = {

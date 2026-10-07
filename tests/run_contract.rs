@@ -80,6 +80,10 @@ fn run(root: &Path, args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
+const SOURCE_REV: &str = match option_env!("FERRY_SOURCE_REV") {
+    Some(rev) => rev,
+    None => "unpinned",
+};
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -402,6 +406,12 @@ fn recipe_arguments_follow_the_command_and_are_recorded() {
     );
     let record = receipt(&out);
     assert_eq!(record["machine"], "local");
+    // The binary reports the revision its build compiled in, or `unpinned`;
+    // null is reserved for receipts that predate the field.
+    assert_eq!(record["caller_source_rev"], SOURCE_REV);
+    assert_eq!(record["caller_exe"], env!("CARGO_BIN_EXE_ferry"));
+    assert_eq!(record["host_source_rev"], record["caller_source_rev"]);
+    assert_eq!(record["host_exe"], record["caller_exe"]);
     assert_eq!(record["args"], serde_json::json!(args));
     assert_eq!(
         record["args_sha256"],
@@ -773,6 +783,15 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("remote-selected [a b --seat]"));
     assert_eq!(receipt(&out)["args"], serde_json::json!(["a b", "--seat"]));
+    assert_eq!(receipt(&out)["host_source_rev"], SOURCE_REV);
+    assert_eq!(
+        receipt(&out)["host_exe"],
+        host.join(".local/bin/ferry")
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+    );
 }
 
 #[test]

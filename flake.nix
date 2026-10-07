@@ -12,7 +12,11 @@
           pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
           rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
-        in pkgs.callPackage ./package.nix { inherit rustPlatform; };
+        in pkgs.callPackage ./package.nix {
+          inherit rustPlatform;
+          # Compiled in so receipts join each executable to its source.
+          sourceRev = self.rev or self.dirtyRev or null;
+        };
     in {
       packages = eachSystem (system: { default = package system; });
       apps = eachSystem (system: {

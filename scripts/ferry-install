@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Install, verify and roll back Ferry through Nix, on a host and on the caller.
+#
+# Usage:
+#   scripts/ferry-install host <ssh> <rev>       build <rev> on the host, then activate it
+#   scripts/ferry-install rollback <ssh>          swap the host's current and previous generations
+#   scripts/ferry-install verify-host <ssh> [rev] check the host's active install (and its rev)
+#   scripts/ferry-install verify-caller <rev>     check the caller's PATH resolves to <rev>
+#
+# Ferry itself provisions nothing; this is the one supported procedure around it.
+#
+# Source custody. <rev> must be a full commit id. On the live root it must be
+# reachable from the local `main` bookmark, so only landed work installs there;
+# a scratch FERRY_INSTALL_ROOT accepts a frozen commit, for qualification. The commit travels by
+# `git push` over SSH into the host's bare repository under
+# refs/ferry-install/<rev>; nothing is published to a forge. That ref keeps the
+# commit from git gc for as long as the generation exists. The host builds
+# `git+file://<repo>?rev=<rev>`: the flake's locked inputs (nixpkgs,
+# rust-overlay) are fetched by narHash on first build. A generation's output is
+# kept by its GC root, so rollback never rebuilds and needs no network.
+#
+# Host layout, under FERRY_INSTALL_ROOT (relative to the host's $HOME, default
+# .local/state/ferry):
+#   repo.git              bare repository, shared with Ferry's run transport
+#   installs/<rev>        one Nix out-link (an indirect GC root) per generation
+#   current, previous     symlinks to installs/<rev>; flipped by rename
+#   install.lock          flock held across every activation and rollback
+# FERRY_INSTALL_BIN (default .local/bin/ferry, the machines.toml default)
+# is one fixed symlink to <root>/current/bin/ferry.
+#
+# Safety. A new generation is built and verified in place before `current`
+# moves, so a failed build or check leaves the working generation active. A
+# failed check after the flip flips back. Running sessions keep the executable
+# they started with; a run whose host-info precedes a flip and whose host-run
+# follows it is reported lost ("host binary changed during run"), never
+# mis-attributed. Activating on a shared host still needs an announced window.
+#
+# verify-caller only reads: the caller pin lives in ~/.nix-config and
+# changes through the normal Nix configuration workflow.
+set -euo pipefail
+
+root="${FERRY_INSTALL_ROOT:-.local/state/ferry}"
+bin="${FERRY_INSTALL_BIN:-.local/bin/ferry}"
+
+die() { echo "ferry-install: $*" >&2; exit 1; }
+usage() { sed -n '4,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+
+full_rev() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die "revision must be a full 40-hex commit id: $1"
+}
+
+landed() {
+  git cat-file -e "$1^{commit}" 2>/dev/null || die "unknown commit $1"
+  git merge-base --is-ancestor "$1" main || die "$1 is not reachable from main; land it first"
+}
+
+# The host half. It runs under `bash -s` with: action root bin [rev].
+host_side() {
+  cat <<'HOST'
+set -euo pipefail
+action="$1"; root="$HOME/$2"; bin="$HOME/$3"; rev="${4:-}"
+export PATH="/nix/var/nix/profiles/default/bin:$PATH"
+die() { echo "ferry-install(host): $*" >&2; exit 1; }
+
+# Prints the verified executable's facts, or fails. $1: a ferry launcher.
+check() {
+  local launcher="$1" want="$2" info exe sha got
+  info="$("$launcher" host-info)" || die "host-info failed for $launcher"
+  exe="$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("exe") or "")')"
+  sha="$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["binary_sha256"])')"
+  got="$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("source_rev") or "")')"
+  [ -n "$want" ] && [ "$got" != "$want" ] && die "$launcher reports source_rev '$got', want $want"
+  if [ -z "$exe" ]; then
+    # A build from before the source join does not name its executable: accept
+    # the generation's own file only if it hashes to the reported binary.
+    local dir; dir="$(dirname "$(readlink -f "$launcher")")"
+    for candidate in "$dir/.ferry-wrapped" "$dir/ferry"; do
+      [ -f "$candidate" ] && [ "$(sha256sum "$candidate" | cut -d' ' -f1)" = "$sha" ] && { exe="$candidate"; break; }
+    done
+    got="${got:-unknown}"
+  fi
+  case "$exe" in /nix/store/*) ;; *) die "$launcher runs $exe, not a Nix store path" ;; esac
+  [ "$(sha256sum "$exe" | cut -d' ' -f1)" = "$sha" ] || die "$exe does not hash to the binary_sha256 it reports"
+  printf '{"launcher":"%s","exe":"%s","binary_sha256":"%s","source_rev":"%s"}\n' "$launcher" "$exe" "$sha" "$got"
+}
+
+gc_rooted() {
+  find /nix/var/nix/gcroots/auto -maxdepth 1 -lname "$1" 2>/dev/null | grep -q . \
+    || die "$1 is not registered as a Nix GC root"
+}
+
+verify() {
+  local want="$1" active out store
+  [ -L "$root/current" ] || die "no current generation at $root/current"
+  active="$(readlink "$root/current")"
+  gc_rooted "$active"
+  [ "$(readlink "$bin" 2>/dev/null)" = "$root/current/bin/ferry" ] \
+    || die "$bin is not the fixed link to $root/current/bin/ferry"
+  out="$(check "$bin" "$want")"
+  store="$(readlink -f "$active")"
+  case "$out" in *"\"exe\":\"$store/"*) ;; *) die "$bin does not run the current generation ($store)" ;; esac
+  printf '{"current":"%s","previous":"%s","store":"%s","run":%s}\n' \
+    "$active" "$(readlink "$root/previous" 2>/dev/null || true)" "$store" "$out"
+}
+
+flip() { # $1 link name, $2 target
+  ln -sfn "$2" "$root/$1.next"
+  mv -T "$root/$1.next" "$root/$1"
+}
+
+mkdir -p "$root/installs" "$(dirname "$bin")"
+exec 9>"$root/install.lock"
+flock -n 9 || die "another install or rollback holds $root/install.lock"
+
+# Adopt the pre-procedure layout: one out-link named `installed`.
+if [ ! -e "$root/current" ] && [ -L "$root/installed" ]; then
+  old="$("$root/installed/bin/ferry" host-info | python3 -c 'import json,sys; print(json.load(sys.stdin).get("source_rev") or "")')"
+  [[ "$old" =~ ^[0-9a-f]{40}$ ]] || old="adopted-$(basename "$(readlink -f "$root/installed")")"
+  nix build --out-link "$root/installs/$old" "$(readlink -f "$root/installed")"
+  flip current "$root/installs/$old"
+  rm "$root/installed"
+fi
+
+case "$action" in
+  install)
+    [ -d "$root/repo.git" ] || git init --bare -q "$root/repo.git"
+    new="$root/installs/$rev"
+    nix build --out-link "$new" "git+file://$root/repo.git?rev=$rev" \
+      || die "build of $rev failed; current generation unchanged"
+    gc_rooted "$new"
+    check "$new/bin/ferry" "$rev" >/dev/null || die "new generation failed its check; current unchanged"
+    prior="$(readlink "$root/current" 2>/dev/null || true)"
+    if [ "$prior" != "$new" ]; then
+      [ -n "$prior" ] && flip previous "$prior"
+      flip current "$new"
+    fi
+    if [ "$(readlink "$bin" 2>/dev/null)" != "$root/current/bin/ferry" ]; then
+      if [ -e "$bin" ] && [ ! -L "$bin" ]; then
+        mkdir -p "$root/rollback"
+        cp -p "$bin" "$root/rollback/ferry-replaced-$(date +%s)"
+      fi
+      ln -sfn "$root/current/bin/ferry" "$bin.next"
+      mv -T "$bin.next" "$bin"
+    fi
+    if ! verify "$rev"; then
+      [ -n "$prior" ] && flip current "$prior"
+      die "post-activation check failed; restored $prior"
+    fi
+    ;;
+  rollback)
+    [ -L "$root/previous" ] || die "no previous generation to roll back to"
+    prior="$(readlink "$root/current")"; target="$(readlink "$root/previous")"
+    gc_rooted "$target"
+    want="$(basename "$target")"; [[ "$want" =~ ^[0-9a-f]{40}$ ]] || want=""
+    flip current "$target"; flip previous "$prior"
+    if ! verify "$want"; then
+      flip current "$prior"; flip previous "$target"
+      die "rollback check failed; restored $prior"
+    fi
+    ;;
+  verify) verify "$rev" ;;
+  *) die "unknown action $action" ;;
+esac
+HOST
+}
+
+remote() { # $1 ssh, $2 action, [$3 rev]
+  local target="$1"; shift
+  host_side | ssh -o BatchMode=yes "$target" bash -s -- "$1" "$root" "$bin" "${2:-}"
+}
+
+case "${1:-}" in
+  host)
+    [ $# -eq 3 ] || usage
+    full_rev "$3"
+    # Only landed work reaches the live root; a scratch root may qualify a
+    # frozen revision before it lands.
+    if [ "$root" = .local/state/ferry ]; then landed "$3"; else git cat-file -e "$3^{commit}" || die "unknown commit $3"; fi
+    ssh -o BatchMode=yes "$2" "mkdir -p '$root' && { test -d '$root/repo.git' || git init --bare -q '$root/repo.git'; }"
+    git push -q "$2:$root/repo.git" "$3:refs/ferry-install/$3"
+    remote "$2" install "$3"
+    ;;
+  rollback)
+    [ $# -eq 2 ] || usage
+    remote "$2" rollback
+    ;;
+  verify-host)
+    [ $# -ge 2 ] && [ $# -le 3 ] || usage
+    [ $# -eq 3 ] && full_rev "$3"
+    remote "$2" verify "${3:-}"
+    ;;
+  verify-caller)
+    [ $# -eq 2 ] || usage
+    full_rev "$2"
+    first="$(command -v ferry)" || die "ferry is not on PATH"
+    info="$(ferry host-info)"
+    exe="$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["exe"] or "")')"
+    sha="$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["binary_sha256"])')"
+    got="$(printf '%s' "$info" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("source_rev") or "")')"
+    [ "$got" = "$2" ] || die "PATH ferry ($first) reports source_rev '$got', want $2"
+    case "$exe" in /nix/store/*) ;; *) die "PATH ferry runs $exe, not a Nix store path" ;; esac
+    [ "$(shasum -a 256 "$exe" | cut -d' ' -f1)" = "$sha" ] || die "$exe does not hash to the binary_sha256 it reports"
+    case "$(readlink -f "$first")" in /nix/store/*) ;; *) die "first ferry on PATH ($first) is not a Nix install" ;; esac
+    lock="${NIX_CONFIG_DIR:-$HOME/.nix-config}/flake.lock"
+    pinned="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["ferry"]["locked"]["rev"])' "$lock" 2>/dev/null || true)"
+    [ "$pinned" = "$2" ] || die "$lock pins ferry at '${pinned:-nothing}', want $2"
+    shadows="$(type -a ferry | awk '{print $NF}' | sed 1d | tr '\n' ' ')"
+    printf '{"first":"%s","exe":"%s","binary_sha256":"%s","source_rev":"%s","nix_config_pin":"%s","later_on_path":"%s"}\n' \
+      "$first" "$exe" "$sha" "$got" "$pinned" "${shadows% }"
+    ;;
+  *) usage ;;
+esac
