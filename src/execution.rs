@@ -258,13 +258,28 @@ pub struct Lease {
     pub mode: String,
     /// How long the session waited for the lease.
     pub wait_ms: u128,
+    /// When the lease was granted and released (ms since the epoch).
+    #[serde(default)]
+    pub acquired_ms: Option<u128>,
+    #[serde(default)]
+    pub released_ms: Option<u128>,
 }
 
 impl HostLease {
+    /// The lease record, stamped with the release time; the lease itself is
+    /// released when this value is dropped.
+    pub fn release(self) -> Lease {
+        Lease {
+            released_ms: Some(crate::receipt::now_ms()),
+            ..self.record
+        }
+    }
     fn acquire(root: &Path, request: &Request, stop: &AtomicBool) -> Result<Self> {
         let started = std::time::Instant::now();
         let gate = root.join("locks/host-gate");
-        let host = root.join("locks/host");
+        // The name earlier binaries used for their exclusive lock, so an old and
+        // a new exclusive run on one state root still exclude each other.
+        let host = root.join("locks/host-exclusive");
         let exclusive = request.recipe.requires.contains("exclusive");
         let held = if exclusive {
             let gate = acquire_as(&gate, stop, false)?;
@@ -280,6 +295,8 @@ impl HostLease {
             record: Lease {
                 mode: if exclusive { "exclusive" } else { "shared" }.into(),
                 wait_ms: started.elapsed().as_millis(),
+                acquired_ms: Some(crate::receipt::now_ms()),
+                released_ms: None,
             },
         })
     }

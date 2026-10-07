@@ -260,7 +260,7 @@ pub fn host_run() -> Result<i32> {
     event(&serde_json::json!({"protocol":1,"event":"accepted","id":request.id}));
     crate::custody::supervise()?;
     let executed: Result<()> = (|| {
-        let (seat, lease, exclusive) = execution::prepare(&root, &request, &stop)?;
+        let (seat, lease, host_lease) = execution::prepare(&root, &request, &stop)?;
         event(
             &serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit,"seat":request.seat}),
         );
@@ -289,8 +289,7 @@ pub fn host_run() -> Result<i32> {
             &request,
             terminal(result.outcome),
         )?);
-        result.lease = Some(exclusive.record.clone());
-        drop(exclusive);
+        result.lease = Some(host_lease.release());
         drop(lease);
         Ok(())
     })();
@@ -338,7 +337,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     let stop = execution::stopped()?;
     execution::interrupted()?;
     crate::custody::supervise()?;
-    let (seat, lease, exclusive) = execution::prepare(&state, request, &stop)?;
+    let (seat, lease, host_lease) = execution::prepare(&state, request, &stop)?;
     if json {
         event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
     }
@@ -377,8 +376,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         request,
         terminal(record.outcome),
     )?);
-    record.lease = Some(exclusive.record.clone());
-    drop(exclusive);
+    record.lease = Some(host_lease.release());
     drop(lease);
     Ok(())
 }

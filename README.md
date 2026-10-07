@@ -175,11 +175,15 @@ custody. It does not quiet:
 - processes started outside Ferry;
 - other users;
 - other virtual machines on the same hardware;
-- hosts whose Ferry predates the lease. Such a host holds only the exclusive
-  side and makes ordinary runs wait for nothing.
+- runs by a Ferry that predates the lease. An older binary takes the
+  `locks/host-exclusive` file only for its own exclusive runs, so old and new
+  exclusive runs still exclude each other. Older ordinary runs take no lease
+  at all. Install the lease on every caller and host before relying on it.
 
-The wait for the lease is not bounded by `--timeout-seconds`; interrupt the
-caller to give up.
+An exclusive run waits for the longest in-flight run under its state root.
+That wait is not bounded by `--timeout-seconds`; interrupt the caller to give
+up. The lease record also carries `acquired_ms` and `released_ms`, so a timing
+consumer can compare the window it held with its own load observations.
 
 ### Seat custody
 

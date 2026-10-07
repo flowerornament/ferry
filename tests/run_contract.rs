@@ -1363,6 +1363,31 @@ impl Drop for HoldRuns {
     }
 }
 
+/// The three lease receipts, in the order first, alone, later.
+fn assert_lease_windows(receipts: &[serde_json::Value], held_for: std::time::Duration, dir: &Path) {
+    assert_eq!(receipts[0]["lease"]["mode"], "shared");
+    assert_eq!(receipts[1]["lease"]["mode"], "exclusive");
+    // It held the gate and waited at least from then until A was released.
+    assert!(
+        u128::from(receipts[1]["lease"]["wait_ms"].as_u64().unwrap()) >= held_for.as_millis(),
+        "{} < {held_for:?}",
+        receipts[1]["lease"]["wait_ms"]
+    );
+    assert_eq!(receipts[2]["lease"]["mode"], "shared");
+    // The release and acquire times order the windows the same way.
+    let at = |i: usize, field: &str| receipts[i]["lease"][field].as_u64().unwrap();
+    assert!(at(0, "released_ms") <= at(1, "acquired_ms"));
+    assert!(at(1, "released_ms") <= at(2, "acquired_ms"));
+    // Older binaries used this name for their exclusive lock.
+    assert!(dir.join(".ferry/local/locks/host-exclusive").exists());
+    assert!(
+        receipts[1]["requirements"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("exclusive"))
+    );
+}
+
 #[test]
 fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     use std::{
@@ -1450,19 +1475,5 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
             "later-end"
         ]
     );
-    assert_eq!(receipts[0]["lease"]["mode"], "shared");
-    assert_eq!(receipts[1]["lease"]["mode"], "exclusive");
-    // It held the gate and waited at least from then until A was released.
-    assert!(
-        u128::from(receipts[1]["lease"]["wait_ms"].as_u64().unwrap()) >= held_for.as_millis(),
-        "{} < {held_for:?}",
-        receipts[1]["lease"]["wait_ms"]
-    );
-    assert_eq!(receipts[2]["lease"]["mode"], "shared");
-    assert!(
-        receipts[1]["requirements"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("exclusive"))
-    );
+    assert_lease_windows(&receipts, held_for, dir.path());
 }
