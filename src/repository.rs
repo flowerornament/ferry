@@ -125,6 +125,44 @@ pub fn committed_file(
             .args(["show", &format!("{sha}:{path}")]),
     )
 }
+
+/// Resolve once without fetching, peeling tags, or substituting a local branch.
+pub fn companion_commit(
+    root: &Path,
+    source: &crate::config::CompanionSource,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let published = match source {
+        crate::config::CompanionSource::Revision(revision) => return commit(root, Some(revision)),
+        crate::config::CompanionSource::Published(published) => published,
+    };
+    identifier(&published.remote)?;
+    let reference = format!("refs/remotes/{}/{}", published.remote, published.branch);
+    ref_name(&reference)?;
+    let dir = git_dir(root)?;
+    let value = String::from_utf8(output(
+        Command::new("git").arg("--git-dir").arg(&dir).args([
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &reference,
+        ]),
+    )?)?
+    .trim()
+    .to_owned();
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Refusal::Declaration("invalid tracking commit identity".into()).into());
+    }
+    let kind = output(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&dir)
+            .args(["cat-file", "-t", &value]),
+    )?;
+    if kind != b"commit\n" {
+        return Err(Refusal::Declaration("tracking ref must name a commit object".into()).into());
+    }
+    Ok(value)
+}
 pub fn declaration(
     root: &Path,
     sha: &str,

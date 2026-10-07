@@ -96,11 +96,12 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         config::preserve_path(path)?;
     }
     record.preserve.clone_from(&config.preserve);
+    record.companion_sources.clone_from(&config.companion_refs);
     for (name, revision) in &config.companion_refs {
         repository::ref_name(name)?;
         record
             .companion_refs
-            .insert(name.clone(), repository::commit(root, Some(revision))?);
+            .insert(name.clone(), repository::companion_commit(root, revision)?);
     }
     record.forwarded_env = config.environment.as_ref().map_or_else(
         || Ok(BTreeMap::default()),
@@ -211,6 +212,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         contract_sha256: None,
         forwarded_env: BTreeMap::default(),
         companion_refs: BTreeMap::default(),
+        companion_sources: BTreeMap::default(),
         preserve: vec![],
         collection: None,
     })

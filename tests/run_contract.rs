@@ -86,6 +86,132 @@ fn receipt(out: &Output) -> serde_json::Value {
         .unwrap()["receipt"]
         .clone()
 }
+
+#[test]
+fn published_companion_uses_tracking_ref_on_git_jj_and_worktree_callers() {
+    for backend in ["git", "jj", "worktree"] {
+        let dir = fixture();
+        let first = Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let first = String::from_utf8(first.stdout).unwrap().trim().to_owned();
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/master", &first],
+        );
+        fs::write(dir.path().join("ferry.toml"), "version=1\n[companion_refs]\n'refs/remotes/origin/master'={remote='origin',branch='master'}\n[recipe.pass]\ncommand=['git','rev-parse','refs/remotes/origin/master']\n").unwrap();
+        git(dir.path(), &["add", "ferry.toml"]);
+        git(dir.path(), &["commit", "-m", "typed companion"]);
+        let caller = if backend == "worktree" {
+            let path = dir.path().join("worktree");
+            git(
+                dir.path(),
+                &["worktree", "add", "--detach", path.to_str().unwrap()],
+            );
+            path
+        } else {
+            if backend == "jj" {
+                let out = Command::new("jj")
+                    .current_dir(dir.path())
+                    .args(["git", "init", "--colocate"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            dir.path().to_owned()
+        };
+        let out = run(&caller, &["run", "pass", "--local", "--json"]);
+        assert!(
+            out.status.success(),
+            "{backend}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let record = receipt(&out);
+        assert_eq!(
+            record["companion_refs"]["refs/remotes/origin/master"],
+            first
+        );
+        assert_eq!(
+            record["companion_sources"]["refs/remotes/origin/master"],
+            serde_json::json!({"remote":"origin", "branch":"master"})
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&first));
+        git(
+            dir.path(),
+            &["update-ref", "-d", "refs/remotes/origin/master"],
+        );
+        let out = run(&caller, &["run", "pass", "--local", "--json"]);
+        assert_eq!(out.status.code(), Some(125));
+        let refused = receipt(&out);
+        assert_eq!(
+            refused["companion_sources"]["refs/remotes/origin/master"],
+            serde_json::json!({"remote":"origin", "branch":"master"})
+        );
+        assert!(refused["companion_refs"].as_object().unwrap().is_empty());
+        assert_eq!(
+            record["companion_refs"]["refs/remotes/origin/master"],
+            first
+        );
+        for entry in fs::read_dir(caller.join(".ferry/local/slots")).unwrap() {
+            let output = Command::new("git")
+                .current_dir(entry.unwrap().path())
+                .args(["rev-parse", "refs/remotes/origin/master"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), first);
+        }
+    }
+}
+#[test]
+fn published_companion_refuses_malformed_sources_and_tag_objects() {
+    let dir = fixture();
+    for source in [
+        "{remote='origin'}",
+        "{branch='master'}",
+        "{remote='origin',branch='master',revision='HEAD'}",
+        "{remote='-origin',branch='master'}",
+        "{remote='origin',branch='../master'}",
+    ] {
+        fs::write(dir.path().join("ferry.toml"), format!("version=1\n[companion_refs]\n'refs/remotes/origin/master'={source}\n[recipe.pass]\ncommand=['true']\n")).unwrap();
+        git(dir.path(), &["add", "ferry.toml"]);
+        git(dir.path(), &["commit", "-m", "invalid source"]);
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        assert_eq!(out.status.code(), Some(125), "source: {source}");
+        assert!(
+            receipt(&out)["companion_refs"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    git(dir.path(), &["tag", "-a", "not-a-commit", "-m", "tag"]);
+    git(
+        dir.path(),
+        &[
+            "update-ref",
+            "refs/remotes/origin/master",
+            "refs/tags/not-a-commit",
+        ],
+    );
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[companion_refs]\n'refs/remotes/origin/master'={remote='origin',branch='master'}\n[recipe.pass]\ncommand=['true']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "tag refusal"]);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(
+        receipt(&out)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("commit object")
+    );
+}
 #[test]
 fn working_copy_edits_cannot_change_the_recipe() {
     let dir = fixture();

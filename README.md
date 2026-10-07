@@ -7,6 +7,24 @@ Ferry separates the project from the machine. A project declares recipes and
 their required features. You configure machines once. No machine configuration
 means local execution; a configured machine missing required features refuses.
 
+## Companion references
+
+Recipes can request exact companion commits under fully qualified host Git refs.
+A string source keeps the caller backend's revision syntax. A typed source is
+portable across Git, Git worktrees and Git-backed jj:
+
+```toml
+[companion_refs]
+'refs/remotes/origin/master' = { remote = 'origin', branch = 'master' }
+```
+
+This selects the caller's locally known tracking ref, not the local branch or
+the remote's current state. Ferry does not fetch or fall back. The tracking ref
+must directly name a commit, not a tag object. The caller receipt records the
+requested `companion_sources` and resolved `companion_refs`; only those exact
+objects are transported and materialized on the host. Old receipts without
+`companion_sources` provide no typed tracking provenance.
+
 ## Install and run
 
 Install with `cargo install --locked --path . --root ~/.local`

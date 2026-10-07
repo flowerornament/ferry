@@ -44,6 +44,8 @@ pub struct Receipt {
     #[serde(default)]
     pub companion_refs: std::collections::BTreeMap<String, String>,
     #[serde(default)]
+    pub companion_sources: std::collections::BTreeMap<String, crate::config::CompanionSource>,
+    #[serde(default)]
     pub preserve: Vec<String>,
     #[serde(default)]
     pub collection: Option<crate::execution::Collection>,

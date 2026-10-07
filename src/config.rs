@@ -50,9 +50,24 @@ pub struct Config {
     pub mirror: Vec<Mirror>,
     pub environment: Option<Environment>,
     #[serde(default)]
-    pub companion_refs: BTreeMap<String, String>,
+    pub companion_refs: BTreeMap<String, CompanionSource>,
     #[serde(default)]
     pub preserve: Vec<String>,
+}
+
+/// A caller revision, or an explicitly selected locally known tracking ref.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CompanionSource {
+    Revision(String),
+    Published(PublishedRef),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedRef {
+    pub remote: String,
+    pub branch: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -129,7 +144,7 @@ pub struct CatalogContract {
     pub mirror: Vec<Mirror>,
     pub environment: Option<Environment>,
     #[serde(default)]
-    pub companion_refs: BTreeMap<String, String>,
+    pub companion_refs: BTreeMap<String, CompanionSource>,
     #[serde(default)]
     pub preserve: Vec<String>,
 }
