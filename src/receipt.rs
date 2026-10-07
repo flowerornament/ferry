@@ -79,6 +79,9 @@ pub struct Receipt {
     pub host_source_rev: Option<String>,
     #[serde(default)]
     pub host_exe: Option<String>,
+    /// What the session left behind at release; null when it never released.
+    #[serde(default)]
+    pub custody: Option<crate::custody::Release>,
 }
 
 pub fn now_ms() -> u128 {

@@ -1,6 +1,7 @@
 //! Ferry runs committed repository recipes locally or over SSH.
 mod artifacts;
 mod config;
+mod custody;
 mod execution;
 mod receipt;
 mod repository;
@@ -252,6 +253,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         caller_exe: receipt::exe_path(),
         host_source_rev: None,
         host_exe: None,
+        custody: None,
     })
 }
 

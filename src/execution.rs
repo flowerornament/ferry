@@ -9,7 +9,7 @@ use nix::{
     unistd::{Pid, getsid, setsid},
 };
 use serde::{Deserialize, Serialize};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
 use std::{
     collections::BTreeMap,
     fs,
@@ -240,6 +240,7 @@ pub fn prepare(
     fs::create_dir_all(root.join("locks"))?;
     let lease = acquire(&root.join("locks").join(&request.seat), stop)?;
     crate::seat::check(root, &request.seat, root.ends_with("local"))?;
+    crate::custody::begin(root, &request.seat)?;
     for entry in fs::read_dir(root.join("locks"))? {
         if entry?
             .file_name()
@@ -447,8 +448,25 @@ pub fn session_members(sid: u32) -> Result<Vec<i32>> {
         .filter(|pid| {
             getsid(Some(Pid::from_raw(*pid)))
                 .is_ok_and(|session| u32::try_from(session.as_raw()).ok() == Some(sid))
+                && !zombie(*pid)
         })
         .collect())
+}
+
+/// A zombie has exited and holds nothing. Under the custody subreaper,
+/// killed session members wait as zombies until the release census reaps them.
+#[cfg(target_os = "linux")]
+fn zombie(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            == Some("Z")
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn zombie(_pid: i32) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -679,10 +697,15 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         .ok_or("invalid request path")?;
     crate::seat::bind(root, &request)?;
     let workdir = std::env::current_dir()?;
+    // A Ferry-owned, per-seat cache directory for regenerable build output.
+    let cache = root.join("caches").join(&request.seat);
+    fs::create_dir_all(&cache)?;
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700))?;
     let mut env = BTreeMap::from([
         ("FERRY_SEAT".to_owned(), request.seat.clone()),
         ("FERRY_COMMIT".to_owned(), request.commit.clone()),
         ("FERRY_WORKDIR".to_owned(), workdir.display().to_string()),
+        ("FERRY_CACHE_DIR".to_owned(), cache.display().to_string()),
         ("FERRY_ID".to_owned(), request.id.clone()),
         ("FERRY_REQUEST_FILE".to_owned(), spec.display().to_string()),
         (

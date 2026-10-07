@@ -685,6 +685,9 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(!ownership.exists());
+    // A killed supervisor never released: recovery clears the owner marker
+    // but leaves no idle record, so the seat is not eligible for eviction.
+    assert!(seat_record(dir.path(), "idle").is_none());
     drop(group);
 }
 #[test]
@@ -1227,4 +1230,73 @@ fn an_older_host_exiting_125_before_acceptance_is_refused_not_lost() {
     let record = receipt(&out);
     assert_eq!(record["outcome"], "refused");
     assert_eq!(record["exit_code"], 125);
+}
+
+fn seat_record(dir: &Path, kind: &str) -> Option<serde_json::Value> {
+    let records = dir.join(".ferry/local").join(kind);
+    let entry = fs::read_dir(records).ok()?.next()?.ok()?;
+    serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()
+}
+
+#[test]
+fn a_normal_release_records_the_seat_idle_where_custody_is_supported() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success());
+    let custody = &receipt(&out)["custody"];
+    if cfg!(target_os = "linux") {
+        assert_eq!(custody["census"], "empty");
+        assert_eq!(custody["record"], "idle");
+        assert!(seat_record(dir.path(), "idle").is_some());
+    } else {
+        // No complete census here, so the seat is never claimed idle.
+        assert_eq!(custody["census"], "unsupported");
+        assert_eq!(custody["record"], "none");
+        assert!(seat_record(dir.path(), "idle").is_none());
+    }
+    assert!(seat_record(dir.path(), "taint").is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_escaped_descendant_taints_the_seat_instead_of_leaving_it_idle() {
+    use std::{thread, time::Duration};
+    let dir = fixture();
+    // The escapee leaves the session, drops its environment, descriptors and
+    // directory, and uses the cache only later, by path.
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\n[recipe.escape]\ncommand=['sh','-c','late=\"$FERRY_CACHE_DIR/late\"; setsid env -i sh -c \"exec </dev/null >/dev/null 2>&1; cd /; sleep 5; touch $late\" & exit 0']\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "escape"]);
+    let out = run(dir.path(), &["run", "escape", "--local", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let record = receipt(&out);
+    let custody = &record["custody"];
+    assert_eq!(custody["record"], "taint", "{custody}");
+    let survivors = custody["census"]["survivors"].as_array().unwrap();
+    assert!(!survivors.is_empty());
+    assert!(seat_record(dir.path(), "idle").is_none());
+    assert!(seat_record(dir.path(), "taint").is_some());
+    // The escapee really was alive and did use the cache afterwards.
+    thread::sleep(Duration::from_secs(7));
+    let caches = fs::read_dir(dir.path().join(".ferry/local/caches"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(caches.join("late").exists());
+    for pid in survivors {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(pid.as_i64().unwrap()).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
 }

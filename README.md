@@ -138,9 +138,47 @@ inside the owned recipe session: prepare, env, recipe, collect. The env hook
 prints a JSON object of environment-variable strings, never shell code.
 Ferry reserves `FERRY_*` and `GIT_CONFIG_GLOBAL`; an env hook cannot replace
 run identity or the seat-local mirror configuration.
-Inputs include `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, and
-`FERRY_WORKDIR`; collect also receives `FERRY_EXIT_CODE`. Projects own their
-database preparation, cache homes, and artifact collection.
+Inputs include `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, `FERRY_WORKDIR`
+and `FERRY_CACHE_DIR`; collect also receives `FERRY_EXIT_CODE`. Projects own
+their database preparation and artifact collection.
+
+`FERRY_CACHE_DIR` is a per-seat directory that Ferry owns
+(`<state>/caches/<seat>`, mode 0700). Put regenerable build output there, for
+example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`. Under an explicit
+host policy, Ferry may later reclaim named subdirectories of it from idle
+seats. It never reclaims anything else.
+
+### Seat custody
+
+When a session releases its seat, the receipt's `custody` records what the
+session left behind:
+
+- `census` is one of:
+  - `empty`: no live descendant of the run's supervisor;
+  - `survivors`, with their pids;
+  - `unsupported`.
+- `record` is one of:
+  - `idle`: written only after ran-pass, ran-fail or timeout with an empty
+    census;
+  - `taint`: survivors were found;
+  - `none`.
+
+On Linux the supervisor is a child subreaper. A process that leaves the
+recipe's session (`setsid`, double fork, closed descriptors, a scrubbed
+environment) is reparented to it rather than to init, so it still counts. A
+session deletes its seat's idle record as soon as it holds the seat lock.
+
+What custody does not see:
+
+- processes the session did not start (pre-existing daemons, `systemd-run`,
+  SSH to self, cron);
+- other users;
+- other hosts;
+- a supervisor that dies before release. It records nothing, and its owner
+  marker keeps the seat refused until `ferry seat recover`.
+
+A tainted seat stays tainted. Other platforms report `unsupported` and never
+record idle.
 
 ## Safety and receipts
 

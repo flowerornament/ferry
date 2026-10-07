@@ -184,6 +184,8 @@ pub struct HostResult {
     pub source_rev: Option<String>,
     #[serde(default)]
     pub exe: Option<String>,
+    #[serde(default)]
+    pub custody: Option<crate::custody::Release>,
 }
 fn event(value: &serde_json::Value) {
     serde_json::to_writer(std::io::stdout(), value)
@@ -250,8 +252,10 @@ pub fn host_run() -> Result<i32> {
         collection: None,
         source_rev: Some(receipt::source_rev()),
         exe: receipt::exe_path(),
+        custody: None,
     };
     event(&serde_json::json!({"protocol":1,"event":"accepted","id":request.id}));
+    crate::custody::supervise()?;
     let executed: Result<()> = (|| {
         let (seat, lease, exclusive) = execution::prepare(&root, &request, &stop)?;
         event(
@@ -277,6 +281,11 @@ pub fn host_run() -> Result<i32> {
                 Err(e) => result.artifacts_error = Some(e.to_string()),
             }
         }
+        result.custody = Some(crate::custody::release(
+            &root,
+            &request,
+            terminal(result.outcome),
+        )?);
         drop(exclusive);
         drop(lease);
         Ok(())
@@ -324,6 +333,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     }
     let stop = execution::stopped()?;
     execution::interrupted()?;
+    crate::custody::supervise()?;
     let (seat, lease, exclusive) = execution::prepare(&state, request, &stop)?;
     if json {
         event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
@@ -358,6 +368,11 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
             Err(e) => record.reason = Some(format!("artifact collection failed: {e}")),
         }
     }
+    record.custody = Some(crate::custody::release(
+        &state,
+        request,
+        terminal(record.outcome),
+    )?);
     drop(exclusive);
     drop(lease);
     Ok(())
@@ -478,6 +493,14 @@ fn refused_by(record: &mut Receipt, info: &HostInfo) {
     record.host_exe.clone_from(&info.exe);
 }
 
+/// Only these outcomes may leave a seat idle.
+fn terminal(outcome: Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::RanPass | Outcome::RanFail | Outcome::Timeout
+    )
+}
+
 /// What the host said on the protocol stream.
 struct HostStream {
     result: Option<HostResult>,
@@ -555,6 +578,7 @@ fn accept_result(
     record.reason = result.reason;
     record.host_binary_sha256 = Some(result.binary_sha256);
     record.host_source_rev = result.source_rev;
+    record.custody = result.custody;
     record.host_exe = result.exe;
     if record.host_binary_sha256.as_deref() != Some(&info.binary_sha256) {
         record.outcome = Outcome::Lost;
