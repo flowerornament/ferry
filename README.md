@@ -151,12 +151,13 @@ evict = { mode = "idle-seat-targets", targets = ["cargo-target"] }
   oldest release first, until the floor is met.
 - **Eligible seats:** a seat is eligible only if all of these hold:
   - it has a custody `idle` record;
-  - it has no taint and no owner marker;
+  - it has no taint and no owner marker, and both are confirmed absent (an
+    unreadable marker means unknown, and the seat is skipped);
   - its lock can be taken without waiting;
   - its idle record is unchanged under that lock.
-- **Path checks:** every directory from the state root down, including
-  everything inside the target, must be a real directory on the state root's
-  filesystem, owned by the state root's owner. A symlinked target, or a mount
+- **Path checks:** every directory from the state root down to the target must
+  be a real directory, and every entry inside the target must be on the state
+  root's filesystem and owned by the state root's owner. A symlinked target, or a mount
   inside one, makes the seat ineligible. Removal never follows symlinks.
 - **Never removed:** checkouts, receipts, records, logs, other cache
   contents, seats without an idle record, and anything outside
@@ -174,7 +175,7 @@ The receipt and the host result carry `admission`, as far as the decision got:
 | `filesystem` | `{path, device}` of the state root that was measured |
 | `available_before`, `available_after` | bytes available to this user (statvfs), measured |
 | `evicted` | for each removed target: `seat`, `released_ms`, exact `path`, `logical_bytes` (sum of file lengths), `allocated_bytes` (allocated blocks, each inode once), and the measured `available_before`/`available_after` around it |
-| `skipped` | eligible-looking seats passed over: `locked`, `owners`, `tainted`, `no_idle_record`, `changed`, `unsafe_path` |
+| `skipped` | eligible-looking seats passed over: `locked`, `owners`, `tainted`, `no_idle_record`, `changed`, `unsafe_path`, and `unknown` (a custody marker could not be read) |
 | `result` | `admitted` or `refused` |
 
 Measured availability can move for reasons outside Ferry. The difference

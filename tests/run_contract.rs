@@ -1726,3 +1726,25 @@ fn a_real_idle_release_is_reclaimed_by_a_later_admission() {
     assert!(!cache.join("cargo-target").exists());
     assert!(cache.join("keep/warm").exists());
 }
+
+#[test]
+fn an_unreadable_custody_marker_leaves_the_seat_alone() {
+    let dir = fixture();
+    let state = dir.path().join(".ferry/local");
+    synthetic_seat(&state, "hidden", Some(1), None);
+    // The taint directory exists but cannot be searched: whether this seat is
+    // tainted is unknown, which must not read as "not tainted".
+    fs::create_dir_all(state.join("taint")).unwrap();
+    fs::set_permissions(state.join("taint"), fs::Permissions::from_mode(0o000)).unwrap();
+    with_host_policy(
+        dir.path(),
+        "version = 2\nmin_free_bytes = 1000000000000000000\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    fs::set_permissions(state.join("taint"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(125));
+    let admission = &receipt(&out)["admission"];
+    assert_eq!(admission["evicted"], serde_json::json!([]), "{admission}");
+    assert_eq!(admission["skipped"]["unknown"], 1, "{admission}");
+    assert!(state.join("caches/hidden/cargo-target/deps/blob").exists());
+}

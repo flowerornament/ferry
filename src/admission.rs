@@ -86,6 +86,9 @@ pub struct Skipped {
     pub no_idle_record: u32,
     pub changed: u32,
     pub unsafe_path: u32,
+    /// A custody marker could not be read, so the seat's state is unknown.
+    #[serde(default)]
+    pub unknown: u32,
 }
 
 fn policy_path() -> Option<PathBuf> {
@@ -266,9 +269,18 @@ fn reclaim(
         return available(root);
     }
     let file = |kind: &str| root.join(kind).join(format!("{seat}.json"));
-    if file("owners").exists() {
+    // Present, absent, or unknown: only a confirmed absence lets eviction go on.
+    let marker = |kind: &str| match fs::symlink_metadata(file(kind)) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    };
+    let (owners, taint) = (marker("owners"), marker("taint"));
+    if owners.is_none() || taint.is_none() {
+        admission.skipped.unknown += 1;
+    } else if owners == Some(true) {
         admission.skipped.owners += 1;
-    } else if file("taint").exists() {
+    } else if taint == Some(true) {
         admission.skipped.tainted += 1;
     } else if fs::read(file("idle")).ok().as_deref() != Some(sorted) {
         admission.skipped.changed += 1;
@@ -339,6 +351,11 @@ fn custody(root: &Path, target: &Path, device: u64) -> Result<Option<(u64, u64)>
             let meta = fs::symlink_metadata(&path)?;
             if meta.dev() != device {
                 return Err(format!("{} is on another filesystem", path.display()).into());
+            }
+            if meta.uid() != uid {
+                return Err(
+                    format!("{} is not owned by the state root's owner", path.display()).into(),
+                );
             }
             if meta.file_type().is_dir() {
                 pending.push(path);
