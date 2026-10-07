@@ -102,6 +102,44 @@ fn working_copy_edits_cannot_change_the_recipe() {
 }
 
 #[test]
+fn legacy_worktree_seats_migrate_under_the_existing_lease() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success());
+    let state = dir.path().join(".ferry/local");
+    let slot = fs::read_dir(state.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Recreate the old Ferry-owned layout, not an unrelated user checkout.
+    fs::remove_dir_all(&slot).unwrap();
+    let bare = state.join("repo.git");
+    git(
+        dir.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "worktree",
+            "add",
+            "--detach",
+            slot.to_str().unwrap(),
+            "FETCH_HEAD",
+        ],
+    );
+    assert!(slot.join(".git").is_file());
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(receipt(&out)["outcome"], "ran-pass");
+    assert!(slot.join(".git").is_dir());
+}
+
+#[test]
 fn companion_refs_are_pinned_and_isolated_between_seats() {
     let dir = fixture();
     let resolve = |root: &Path, revision: &str| {

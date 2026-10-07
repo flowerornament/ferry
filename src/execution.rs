@@ -220,6 +220,7 @@ pub fn prepare(
     ]))?;
     let seat = root.join("slots").join(&request.seat);
     fs::create_dir_all(root.join("slots"))?;
+    migrate_legacy(&bare, &seat)?;
     if !seat.exists() {
         repository::output(
             Command::new("git")
@@ -289,6 +290,54 @@ pub fn prepare(
         }
     }
     Ok((seat, lease, exclusive))
+}
+
+fn migrate_legacy(bare: &Path, seat: &Path) -> Result<()> {
+    if !seat.join(".git").is_file() {
+        return Ok(());
+    }
+    let common = repository::output(Command::new("git").current_dir(seat).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]))?;
+    if fs::canonicalize(String::from_utf8(common)?.trim())? != fs::canonicalize(bare)? {
+        return Err("legacy seat belongs to another repository".into());
+    }
+    let status = repository::output(Command::new("git").current_dir(seat).args([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    ]))?;
+    let index = repository::output(
+        Command::new("git")
+            .current_dir(seat)
+            .args(["ls-files", "-v"]),
+    )?;
+    if !status.is_empty()
+        || index.split(|b| *b == b'\n').any(|line| {
+            line.first()
+                .is_some_and(|b| b.is_ascii_lowercase() || *b == b'S')
+        })
+    {
+        return Err("legacy seat has changed or hidden entries".into());
+    }
+    // This is Ferry-owned state, checked under its lease and durable owner gate.
+    // Ignored build outputs have the same disposable contract as clean -ffdx.
+    repository::output(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(bare)
+            .args(["worktree", "remove", "--force"])
+            .arg(seat),
+    )?;
+    repository::output(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(bare)
+            .args(["worktree", "prune"]),
+    )?;
+    Ok(())
 }
 
 fn materialize_refs(root: &Path, seat: &Path, request: &Request) -> Result<()> {
