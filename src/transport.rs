@@ -17,6 +17,34 @@ use std::{
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+fn ssh_options() -> Result<Vec<String>> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join(".cache/ferry/ssh");
+    fs::create_dir_all(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let socket = directory.join("%C");
+    Ok(vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        "ControlPersist=60".into(),
+        "-o".into(),
+        format!(
+            "ControlPath={}",
+            socket.to_str().ok_or("non-UTF-8 SSH control path")?
+        ),
+    ])
+}
+
+fn ssh() -> Result<Command> {
+    let mut command = Command::new("ssh");
+    command.args(ssh_options()?);
+    Ok(command)
+}
+
 /// Closing a failed SSH conversation ends heartbeats and triggers host cleanup.
 struct Connection {
     child: std::process::Child,
@@ -47,10 +75,16 @@ pub fn host_info() -> Result<HostInfo> {
 }
 
 fn push(root: &Path, ssh: &str, store: &str, reference: &str) -> Result<()> {
+    let ssh_command = std::iter::once("ssh".to_owned())
+        .chain(ssh_options()?)
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
     repository::output(
         Command::new("git")
             .arg("--git-dir")
             .arg(repository::git_dir(root)?)
+            .env("GIT_SSH_COMMAND", ssh_command)
             .args(["push", "--no-verify"])
             .arg(format!("{ssh}:{store}"))
             .arg(reference),
@@ -71,7 +105,7 @@ pub fn mirror(
         let store = format!(".local/state/ferry/mirrors/{key}.git");
         if let Some(host) = host {
             config::identifier(&host.ssh)?;
-            repository::output(Command::new("ssh").arg(&host.ssh).arg(format!(
+            repository::output(ssh()?.arg(&host.ssh).arg(format!(
                 "mkdir -p .local/state/ferry/mirrors; test -d {store} || git init --bare {store}"
             )))?;
             push(
@@ -278,7 +312,7 @@ pub fn remote(
     record.outcome = Outcome::Lost;
     record.exit_code = 255;
     let info: HostInfo = serde_json::from_slice(&repository::output(
-        Command::new("ssh")
+        ssh()?
             .arg(&machine.ssh)
             .arg(format!("{} host-info", machine.binary)),
     )?)?;
@@ -296,7 +330,7 @@ pub fn remote(
             return Err("reported host architecture does not meet requirements".into());
         }
     }
-    repository::output(Command::new("ssh").arg(&machine.ssh).arg("mkdir -p .local/state/ferry; test -d .local/state/ferry/repo.git || git init --bare .local/state/ferry/repo.git"))?;
+    repository::output(ssh()?.arg(&machine.ssh).arg("mkdir -p .local/state/ferry; test -d .local/state/ferry/repo.git || git init --bare .local/state/ferry/repo.git"))?;
     push(
         root,
         &machine.ssh,
@@ -307,7 +341,7 @@ pub fn remote(
         ),
     )?;
     let stop = execution::stopped()?;
-    let child = Command::new("ssh")
+    let child = ssh()?
         .arg(&machine.ssh)
         .arg(format!("{} host-run", machine.binary))
         .stdin(Stdio::piped())
@@ -396,7 +430,7 @@ fn accept_result(
         fs::create_dir_all(&destination)?;
         let archive = destination.join("artifacts.tar");
         let file = fs::File::create(&archive)?;
-        let status = Command::new("ssh")
+        let status = ssh()?
             .arg(&machine.ssh)
             .arg(format!(
                 "cat .local/state/ferry/runs/{}/artifacts.tar",

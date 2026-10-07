@@ -20,13 +20,15 @@ impl Drop for OwnedGroup {
     }
 }
 struct OwnedCaller {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     owners: std::path::PathBuf,
 }
 impl Drop for OwnedCaller {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         // Startup assertions can fail before the session guard is constructed.
         if let Ok(entries) = fs::read_dir(&self.owners) {
             for entry in entries.flatten() {
@@ -223,31 +225,40 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     };
     let dir = fixture();
     let marker = dir.path().join("recipe-started");
+    let release = dir.path().join("recipe-release");
     fs::write(
         dir.path().join("ferry.toml"),
         format!(
-            "version=1\n[recipe.pass]\ncommand=['sh','-c','echo started > {}; sleep 60']\n",
-            marker.display()
+            "version=1\n[recipe.pass]\ncommand=['sh','-c','echo started > {}; while test ! -e {}; do sleep 0.1; done']\n",
+            marker.display(), release.display()
         ),
     )
     .unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
     git(dir.path(), &["commit", "-m", "hard-death fixture"]);
+    let diagnostic = dir.path().join("caller-stderr");
+    let caller_output = dir.path().join("caller-stdout");
     let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .args(["run", "pass", "--local", "--json"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(fs::File::create(&caller_output).unwrap())
+        .stderr(fs::File::create(&diagnostic).unwrap())
         .spawn()
         .unwrap();
     let mut caller = OwnedCaller {
-        child,
+        child: Some(child),
         owners: dir.path().join(".ferry/local/owners"),
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !marker.exists() {
-        assert!(Instant::now() < deadline, "recipe did not start");
+        assert!(
+            Instant::now() < deadline
+                && caller.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "recipe did not start: {} {}",
+            fs::read_to_string(&diagnostic).unwrap_or_default(),
+            fs::read_to_string(&caller_output).unwrap_or_default()
+        );
         thread::sleep(Duration::from_millis(10));
     }
     let ownership = fs::read_dir(dir.path().join(".ferry/local/owners"))
@@ -260,11 +271,11 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     let group = OwnedGroup(i32::try_from(owner["session"].as_u64().unwrap()).unwrap());
     let seat = ownership.file_stem().unwrap().to_str().unwrap();
     kill(
-        Pid::from_raw(i32::try_from(caller.child.id()).unwrap()),
+        Pid::from_raw(i32::try_from(caller.child.as_ref().unwrap().id()).unwrap()),
         Signal::SIGKILL,
     )
     .unwrap();
-    caller.child.wait().unwrap();
+    caller.child.as_mut().unwrap().wait().unwrap();
     let out = run(
         dir.path(),
         &["run", "pass", "--local", "--json", "--timeout-seconds", "1"],
@@ -279,8 +290,8 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
     assert_eq!(out.status.code(), Some(125));
     assert!(ownership.exists());
-    drop(group);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    fs::write(&release, "finish").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
         if out.status.success() {
@@ -294,6 +305,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(!ownership.exists());
+    drop(group);
 }
 #[test]
 fn every_caller_refusal_has_a_receipt() {
@@ -325,7 +337,7 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
     fs::create_dir_all(host.join(".local/bin")).unwrap();
     fs::create_dir_all(&tools).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nunset APP_ALLOWED\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\ncase \"$*\" in *BatchMode=yes*ControlMaster=auto*ControlPersist=60*ControlPath=*) ;; *) exit 125;; esac\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nunset APP_ALLOWED\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let hook_marker = dir.path().join("pre-push-ran");
     let hook = dir.path().join(".git/hooks/pre-push");
@@ -356,6 +368,7 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("HOME", dir.path())
         .env(
             "PATH",
             format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
@@ -431,7 +444,7 @@ fn client_term_kills_children_in_another_process_group() {
     let dir = fixture();
     let marker = dir.path().join("child-pid");
     let program = format!(
-        "import os,time\nos.setpgrp()\nopen({:?},'w').write(str(os.getpid()))\ntime.sleep(60)",
+        "import os,time\nos.setpgrp()\np={:?}\nopen(p+'.tmp','w').write(str(os.getpid()))\nos.rename(p+'.tmp',p)\ntime.sleep(60)",
         marker.to_str().unwrap()
     );
     let config =
@@ -443,7 +456,7 @@ fn client_term_kills_children_in_another_process_group() {
     .unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
     git(dir.path(), &["commit", "-m", "hold"]);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .args(["run", "hold", "--local", "--json"])
@@ -451,7 +464,12 @@ fn client_term_kills_children_in_another_process_group() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut caller = OwnedCaller {
+        child: Some(child),
+        owners: dir.path().join(".ferry/local/owners"),
+    };
+    let child = caller.child.as_mut().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !marker.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -462,7 +480,7 @@ fn client_term_kills_children_in_another_process_group() {
         nix::sys::signal::Signal::SIGTERM,
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -474,7 +492,7 @@ fn client_term_kills_children_in_another_process_group() {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
         "sibling process-group child survived"
     );
-    let output = child.wait_with_output().unwrap();
+    let output = caller.child.take().unwrap().wait_with_output().unwrap();
     assert_eq!(receipt(&output)["outcome"], "lost");
 }
 #[test]

@@ -438,6 +438,7 @@ pub fn run(
 }
 
 pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
+    let supervisor = nix::unistd::getppid();
     setsid()?;
     let request: Request = serde_json::from_slice(&fs::read(spec)?)?;
     validate(&request)?;
@@ -512,8 +513,10 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
     let tmp = result.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec(&code)?)?;
     fs::rename(tmp, result)?;
-    // Remain the live session owner until the supervising Ferry tears down all groups.
-    loop {
-        thread::sleep(Duration::from_secs(60));
+    // Retain the leader for supervised cleanup, but not forever after supervisor death.
+    // Direct parent identity cannot recycle without the kernel reparenting this process.
+    while nix::unistd::getppid() == supervisor {
+        thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
 }

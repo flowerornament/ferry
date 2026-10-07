@@ -9,8 +9,8 @@ means local execution; a configured machine missing required features refuses.
 
 ## Install and run
 
-Build with `cargo build --locked` (Rust 1.99, edition 2024), then install
-`target/debug/ferry` on the caller and each host. One crate builds one binary:
+Install with `cargo install --locked --path . --root ~/.local`
+(Rust 1.99, edition 2024) on the caller and each host. One crate builds one binary:
 `ferry run` is the caller and `ferry host-run` receives the request. Git, SSH,
 and Unix process tools are required; jj is optional for colocated repositories.
 Murail's reviewed `8ba36cfa` transport is the behavioral specification.
@@ -25,6 +25,9 @@ ferry receipt <id>
 
 Add this directory to PATH or use its absolute executable path. There is no
 published package or forge remote yet. This repository remains local-only.
+Ferry supplies non-interactive SSH (`BatchMode=yes`) and connection sharing
+(`ControlMaster=auto`, `ControlPersist=60`) itself, including Git transfers.
+Its control sockets live in a private `~/.cache/ferry/ssh` directory.
 
 ## Project configuration
 
@@ -137,6 +140,9 @@ not a recipe's printed text, to distinguish tool refusal from recipe failure.
 
 SIGKILL of `host-run` leaves the recipe's session running. Its durable ownership
 marker keeps that seat refused until recovery; cgroups are the later fix.
+After the recipe and collect hook finish, the session leader exits if its
+supervisor is gone. Background descendants may still require manual cleanup;
+recovery reports their PIDs and never kills them.
 The refusal names the internal seat and the exact `ferry seat recover <seat>`
 command to run on that host (`--local` for a local run). Recovery takes the seat
 lock, compares live session members against the leader's recorded start time,
