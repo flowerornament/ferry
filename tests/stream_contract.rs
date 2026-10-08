@@ -1002,3 +1002,73 @@ fn the_collect_hooks_output_is_in_the_runs_log_and_count() {
     assert_eq!(logged, 502, "{host}");
     assert_eq!(host["output_lines"], 502, "{host}");
 }
+
+#[test]
+fn recipe_and_collect_lines_never_interleave_in_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    git(d, &["init"]);
+    git(d, &["config", "user.name", "Ferry Test"]);
+    git(d, &["config", "user.email", "ferry@example.invalid"]);
+    fs::write(
+        d.join("emit.py"),
+        "import sys\nprefix, count = sys.argv[1], int(sys.argv[2])\nfor i in range(count):\n    sys.stdout.write('%s%06d\\n' % (prefix, i))\n",
+    )
+    .unwrap();
+    fs::write(
+        d.join("collect"),
+        "#!/bin/sh\nexec python3 emit.py C 100000\n",
+    )
+    .unwrap();
+    fs::set_permissions(d.join("collect"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        d.join("ferry.toml"),
+        "version=1\n[hooks]\ncollect='collect'\n[recipe.probe]\ncommand=['python3','emit.py','R','20000']\n",
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-m", "fixture"]);
+    let consumer = d.join("slow.py");
+    fs::write(
+        &consumer,
+        "import sys,time\nfor i,l in enumerate(sys.stdin):\n    if i % 100 == 0: time.sleep(0.01)\n",
+    )
+    .unwrap();
+    let out = Command::new("sh")
+        .current_dir(d)
+        .env_remove("GIT_DIR")
+        .env_remove("FERRY_ID")
+        .env("XDG_CONFIG_HOME", d.join("config"))
+        .arg("-c")
+        .arg(format!(
+            "{} run probe --local | python3 {}",
+            env!("CARGO_BIN_EXE_ferry"),
+            consumer.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record = only_record(&d.join(".ferry/receipts"));
+    let host = only_record(&d.join(".ferry/local/records"));
+    let id = record["id"].as_str().unwrap();
+    let log = fs::read_to_string(d.join(format!(".ferry/local/runs/{id}/output.log"))).unwrap();
+    let (mut recipe, mut collect) = (0, 0);
+    for line in log.lines() {
+        let whole = line.len() == 7 && line[1..].bytes().all(|b| b.is_ascii_digit());
+        assert!(whole, "a line from more than one writer: {line:?}");
+        match &line[..1] {
+            "R" => recipe += 1,
+            "C" => collect += 1,
+            _ => panic!("{line:?}"),
+        }
+    }
+    // The collect hook is bounded (60 s): in a slow environment it may be
+    // cut short, but every line it wrote is whole and counted.
+    assert_eq!(recipe, 20000);
+    assert!(collect > 0);
+    assert_eq!(host["output_lines"], recipe + collect, "{host}");
+}

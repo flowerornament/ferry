@@ -796,7 +796,7 @@ pub fn run_released(
     // and deliver, for as long as bytes move (Rule D).
     if !crate::output::settle(crate::output::STALL, crate::output::CAP, stop) {
         note_after(format!(
-            "output cut short (no progress for {:?}, {:?} in all, or a stop); undelivered lines are counted in output_dropped, and output.log has every line",
+            "output cut short (no progress for {:?}, {:?} in all, or a stop); undelivered lines are counted in output_dropped, and output.log has every line written before delivery ended",
             crate::output::STALL,
             crate::output::CAP
         ));
@@ -822,13 +822,19 @@ pub fn run(
     stop: &AtomicBool,
     locks: &[&fs::File],
 ) -> (Result<Ended>, Option<Collection>) {
-    let log_path = root.join("runs").join(&request.id).join("output.log");
-    let outcome = run_session(root, workdir, request, stop, locks, &log_path);
+    // One log for the run, one handle and one lock, shared by every
+    // session's readers: lines from the recipe and the collect hook never
+    // interleave within a line.
+    let log = match open_log(root, request) {
+        Ok(log) => log,
+        Err(error) => return (Err(error), None),
+    };
+    let outcome = run_session(root, workdir, request, stop, locks, &log);
     let collection = request
         .hooks
         .collect
         .as_ref()
-        .map(|hook| collect(root, workdir, request, hook, &outcome, locks));
+        .map(|hook| collect(root, workdir, request, hook, &outcome, locks, &log));
     (outcome, collection)
 }
 
@@ -841,8 +847,9 @@ fn collect(
     hook: &str,
     outcome: &Result<Ended>,
     locks: &[&fs::File],
+    log: &RunLog,
 ) -> Collection {
-    let mut collection = match run_collect(root, workdir, request, hook, outcome, locks) {
+    let mut collection = match run_collect(root, workdir, request, hook, outcome, locks, log) {
         Ok((code, false)) => Collection {
             exit_code: Some(code),
             error: None,
@@ -881,6 +888,7 @@ fn run_collect(
     hook: &str,
     outcome: &Result<Ended>,
     locks: &[&fs::File],
+    log: &RunLog,
 ) -> Result<(i32, bool)> {
     {
         let mut collect = request.clone();
@@ -910,15 +918,7 @@ fn run_collect(
         if crate::seat::path(root, &request.seat).exists() {
             return Err("recipe teardown unconfirmed; collection not started".into());
         }
-        let log_path = root.join("runs").join(&request.id).join("output.log");
-        match run_session(
-            root,
-            workdir,
-            &collect,
-            &AtomicBool::new(false),
-            locks,
-            &log_path,
-        )? {
+        match run_session(root, workdir, &collect, &AtomicBool::new(false), locks, log)? {
             Ended::Result(code) => Ok((code, false)),
             Ended::Timeout => Ok((124, true)),
             Ended::Stopped => Err("collection stopped".into()),
@@ -972,26 +972,34 @@ pub const SESSION_CLEANUP: Duration = Duration::from_secs(5);
 /// The collect hook's own bound.
 pub const COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// A run's output log: one handle and one lock for every session.
+type RunLog = Arc<std::sync::Mutex<fs::File>>;
+
+fn open_log(root: &Path, request: &Request) -> Result<RunLog> {
+    let run_dir = root.join("runs").join(&request.id);
+    fs::create_dir_all(&run_dir)?;
+    Ok(Arc::new(std::sync::Mutex::new(
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("output.log"))?,
+    )))
+}
+
 fn run_session(
     root: &Path,
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
     locks: &[&fs::File],
-    log_path: &Path,
+    log: &RunLog,
 ) -> Result<Ended> {
     let run_dir = root.join("runs").join(&request.id);
     fs::create_dir_all(&run_dir)?;
     let spec = run_dir.join("request.json");
     fs::write(&spec, serde_json::to_vec(request)?)?;
     let result_path = run_dir.join("result.json");
-    // One log per run: the collect session appends to the recipe's.
-    let log = std::sync::Arc::new(std::sync::Mutex::new(
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)?,
-    ));
+    let log = log.clone();
     crate::seat::reserve(root, request)?;
     let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks)?;
     let mut child = spawned?;
@@ -1064,11 +1072,12 @@ fn read_output<T: std::io::Read + std::os::fd::AsFd>(
     let mut lines = LineReader::default();
     let mut drain: Option<(Instant, usize)> = None;
     let emit = |line: &[u8]| match crate::output::admit(|| {
-        log.lock().is_ok_and(|mut log| {
-            log.write_all(line)
-                .and_then(|()| log.write_all(b"\n"))
-                .is_ok()
-        })
+        // A line and its newline in one write: never split by another writer.
+        let mut whole = Vec::with_capacity(line.len() + 1);
+        whole.extend_from_slice(line);
+        whole.push(b'\n');
+        log.lock()
+            .is_ok_and(|mut log| log.write_all(&whole).is_ok())
     }) {
         crate::output::Admit::Relay => {
             relay(stream, line);
