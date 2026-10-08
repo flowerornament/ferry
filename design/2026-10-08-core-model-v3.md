@@ -1,6 +1,6 @@
 # Ferry core model v3: a run is a bounded, detached job held by the kernel
 
-Status: proposed, 2026-10-08. Owner: the ferry seat.
+Status: proposed, 2026-10-08, amended the same day by the adversarial design review (§14 wins where it differs). Owner: the ferry seat.
 
 - **Supersedes** `design/2026-10-08-core-model-v2.md` wherever the two differ.
   v2 stays the record of the review history: §3's amendment (rules A–C), §8.1
@@ -345,3 +345,50 @@ Amended in the same landing, as its own change:
 5. **Herald and Murail adapters.** They consume receipts and output events
    today. The migration needs their review (contract change): receipts become
    pointers to final records, and output is the file.
+
+---
+
+## 14. Amendment 2026-10-08: adversarial design review (decisions)
+
+An adversarial review of this document, made before any modelling, found five
+problems that block a model and ten that must be decided now. The evidence:
+
+- the P0 critic rounds (ferry-ljc.22);
+- the model reality review r3 (findings G1–G6 and X5–X8);
+- code at ac753768;
+- bench, read-only;
+- Herald and Murail, read-only;
+- an experiment on the Mac: `scratchpad/review-v3/probe.py`.
+
+These decisions bind the round-4 model and M1. Where they contradict §3–§13,
+this section wins.
+
+| # | Decision | Fixes |
+|---|---|---|
+| E1 | **Work carries its own deadline, and a dead run is stopped with proof.** The supervisor spawns the work behind a start barrier: the child waits on a pipe until the supervisor has written the seat marker and the reservation naming the work's leader pid, start time, session id and the boot id. The session leader enforces the same absolute deadline: if its supervisor is gone when the deadline passes, it kills its own session. `ferry stop <dead run>` signals the recorded session and groups (checking start times), then runs the relock probe (E4). It clears the marker only when both prove the work gone; otherwise it refuses, and `--accept-unknown --reason` is the explicit operator act. | review 1 (orphaned work without bound; markers cleared without proof) |
+| E2 | **An exclusive arrival also refuses on a dead run anywhere on the place.** After it holds the gate and the host lease (check after the grant), it scans `seats/*/marker.json` and refuses 125 on any busy marker whose supervisor is gone, naming the run and the `ferry stop` step. | review 2, reality X7/G3 |
+| E3 | **The record cycle, made buildable:** (a) the caller picks the id (as today); (b) the supervisor child creates `<id>.reserved.json` with O_EXCL, then signals the parent over a pipe, so a retried submit with the same id follows the existing run (idempotent); (c) finalize by `link(2)` or a no-replace rename (`renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`), with fsync of the file and its directory; (d) "gone" means a different boot id, or a dead pid, or a start-time mismatch; after a reboot, busy seats recover automatically; (e) the caller writes its receipt at submit, with every caller fact (args, forwarded environment, adapter and contract digests, caller exe), and a caller-side refusal is a full final receipt. | review 3 |
+| E4 | **Custody is "known" by the relock probe on every platform.** The supervisor closes its own lease descriptors and try-locks each lease anew. If every try succeeds, nothing the run started still holds a lease. With the Linux census on top, custody is `complete`; on macOS it is `session-only` plus the probe result. The only residue is an escapee that closed its descriptors (§7). | review 4 |
+| E5 | **Liveness, stated honestly.** The deadline is absolute from submit, in wall-clock time, and checked in every phase (wait, eviction, fetch, checkout, run, collect, finalize); a Mac asleep past it fires on wake. PermittedEventuallyRuns becomes: "runs, or is refused 125 at its wait bound, naming the holder". There is no queue fairness (no intents). | review 5, rigor 6 |
+| E6 | **Waits:** the seat lease wait is 0; the holder is nearly always your own earlier run, so refuse at once, naming the run, its age and `ferry stop`/`ferry follow`. Only the host lease waits (default 30 min; the recipe or flag may change it). Holders are named by mechanism: Linux `/proc/*/fdinfo` lock lines, macOS `lsof`. There is no extra run file. | review 6 |
+| E7 | **Abandoned runs (open question 4).** SIGINT, SIGTERM and SIGHUP to `ferry run` all request a stop (best effort over the link); only `--detach` detaches. A SIGKILLed caller leaves the run to its deadline (unavoidable, and visible). `status` flags runs nobody is following. If the link is down, the caller prints "not stopped; continues until <deadline>; `ferry stop <id>`". | review 7, 15 (and open question 1: Ctrl-C stops, no prompt) |
+| E8 | **Output.** The work's stdout and stderr are pipes read by one writer in the supervisor, which writes only to `runs/<id>/output.log` (merged, in arrival order, with per-stream counts). The writer never involves a client. A per-run byte cap (host policy `max_output_bytes`, default 1 GiB) drops and counts beyond it, so there is no disk-fill or `/dev/stdout` truncation class. The drain at release is bounded; the record says `complete` or `capped` and gives the counts. | review 8 (and open questions 2 and 3) |
+| E9 | **Stop.** Your own workspace's runs by default; `--other --reason` for others. A stop-request file (who, why) is written before the signal. Rule B holds: a stop after the result is a note, and the verdict stands. | review 9 |
+| E10 | **Migration.** (a) Under the old `host-exclusive` lock, taken exclusively, write `locks/cleanup-pending-v3-migrated` into each old root (bench `~/.local/state/ferry`, every repository's `.ferry/local`): old binaries then refuse 125, and new ones never use the old roots. (b) The host keeps `host-run` as a shim (submit + follow + stop on EOF, emitting the old events) for old callers. (c) A new caller uses the new route only when the host advertises the `detach` capability. (d) A generation in use by a live run is never pruned (installs record their users). | review 10 |
+| E11 | **Consumers.** (a) A declared timeout above `max_timeout` refuses (125); consumers declare timeouts before v3 ships (Murail's exhaustive suite is ~40 min). (b) Artifacts are listed in the final record and fetched by `ferry record` / at the end of `follow`. (c) Herald needs a repository land lock (tracked outside Ferry). (d) The cache moves to `seats/<key>/cache`: one cold rebuild per seat, announced. (e) The variable stays `FERRY_ID` (the code name). (f) Murail's `MACHINES.md` text on channel monitoring becomes false and is theirs to update. | review 11 |
+| E12 | **Admission without idle records.** A seat's targets are eligible when its marker is none, its last record is final, and a try on its seat lease succeeds; oldest first by the last final record. | review 12 |
+| E13 | **Nesting is checked on the caller** (S1: `FERRY_ID` set and the same place → 125). A nested supervisor also refuses when the environment shows it is inside a run on its place. | review 13 |
+| E14 | **`ferry check` reports what detaching relies on:** systemd-logind `KillUserProcesses` and linger on Linux, and whether the state root's filesystem supports flock. A network filesystem (NFS, SMB) refuses, as v2 D8 decided. | review 14, 15 |
+
+**Design gate fields for M1** (each item restates them in its freeze):
+
+- **Fallible points with injection:** reserve, the barrier, spawn, the marker
+  write, each lease, admission, checkout, the writer, the deadline kill,
+  collect, release (census and probe), finalize, stop.
+- **Record fields added:** boot id, the work session, `custody: complete |
+  session-only`, the probe result, `output: complete | capped` with per-stream
+  counts, `stopped_by`, and the deadline.
+- **Capabilities:** `detach` (submit, follow, stop).
+- **Cells:** the Darwin and Linux Nix checks, bench, and a Mac host.
+
+Unchanged: §1–§2 and the direction of §3–§12. The round-4 model encodes E1–E14.
