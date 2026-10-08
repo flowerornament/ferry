@@ -1,6 +1,6 @@
 # Ferry core model v2, and the roadmap
 
-Status: proposed, 2026-10-08 (landed before adversarial round 2; amend in place with a dated note). Owner: the ferry seat. This document has two
+Status: superseded, 2026-10-08, by `design/2026-10-08-core-model-v3.md` where they differ (user decisions: detached runs with a mandatory timeout; `hold` leaves Ferry). Kept for its review history. Originally proposed 2026-10-08. Owner: the ferry seat. This document has two
 jobs: it decides the design, and it orders the work.
 
 - **Supersedes** the unlanded v1 draft (`design: core model v1`, commit
