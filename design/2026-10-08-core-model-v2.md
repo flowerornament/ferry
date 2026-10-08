@@ -235,6 +235,32 @@ S8 and S5 together are what the v1 bugs violated (P1 F1/C1, ferry-ljc.16/.21).
 The refactor (§7) implements them once, in one Custodian, instead of at each
 call site.
 
+**Amendment 2026-10-08 (P0 critic rounds 3–4, ferry-ljc.22).** Every round-3
+and round-4 finding was one class: an output failure or a late event steering
+control flow or the verdict. S8 is refined by three rules:
+
+- **A. Data never controls; control has one channel.**
+  - Control is signals, the host's stdin heartbeat or EOF (client loss), and
+    the timeout.
+  - Output (the recipe's stdout and stderr, and events) is data. A closed or
+    failed output stream is never a stop: it is dropped, counted and
+    recorded.
+- **B. The verdict is decided once, by the first terminal fact.**
+  - Once the recipe has a result, the run is ran-pass, ran-fail or timeout.
+    Later client loss, signals or release errors are recorded diagnostics.
+  - Lost is reached only when control stopped the run before a result. Its
+    code is 128+signal if a signal was caught, else 255, with the cause
+    named.
+  - One pure function maps the facts to (outcome, exit code, reason) on
+    every route.
+- **C. The supervisor never blocks on data or starves on it.**
+  - Output goes through a bounded channel to one writer. The supervisor loop
+    drains with a bound per tick and checks stop, timeout and the result
+    every tick.
+  - The final emit is bounded, and the record on disk is the truth.
+
+In the model (§8), output is not an action that can change `phase`.
+
 ## 4. Interface
 
 ```
