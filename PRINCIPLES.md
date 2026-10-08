@@ -21,7 +21,9 @@ file.
    Ferry writes nowhere else. Anything else is its creator's to clean up.
 2. **Ferry owns nothing longer than a run.** No daemons, keep-alives or
    lifecycles beyond an attempt. What persists is files (seats, caches,
-   records), repositories, or the operator's host services.
+   records), repositories, or the operator's host services. Every run is
+   bounded by its deadline. A dropped connection never ends a run; its
+   deadline or an explicit stop does.
 3. **Each layer owns what only it knows.**
    - The project decides what runs and how.
    - The operator decides host policy, services and installs.
@@ -30,8 +32,9 @@ file.
    changes host configuration. When something is missing, it refuses and
    names the next step.
 5. **Safety from mechanism, liveness bounded.** Exclusion rests on kernel
-   primitives, never on other processes behaving well. Every wait and hold is
-   bounded or interruptible.
+   primitives, never on other processes behaving well. Each guarantee rests
+   on one kernel mechanism or one file. Every wait and hold is bounded or
+   interruptible.
 6. **Unknown is not empty.** What Ferry cannot prove, it keeps holding or
    refuses, and says so.
 7. **Explicit beats inferred.** No behaviour keyed on names, paths or
@@ -49,6 +52,8 @@ Requests in this list go to the layer that owns them, not into Ferry:
 
 - **a scheduler or queue service:** locks in the tool doing the work, nothing
   more;
+- **a lock service:** repositories own their land and coordination locks
+  (flock or lockf; `scripts/jj-land.sh` is the worked example);
 - **a service manager:** use launchd or systemd (operator);
 - **a CI system or gate runner:** repositories own their gates and land laws;
 - **a cluster or fleet manager:** machines are declared by the user;
