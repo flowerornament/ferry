@@ -177,22 +177,43 @@ pub fn host_info() -> Result<HostInfo> {
     })
 }
 
-fn push(root: &Path, ssh: &str, store: &str, reference: &str) -> Result<()> {
+/// Publishes `refspec` (`<commit>:<ref>`) to the host. Ferry's refs name
+/// their commit, so a concurrent run of the same commit may create the same
+/// ref first and win git's ref lock: a failed push whose ref now holds that
+/// commit is published, not an error.
+fn push(root: &Path, ssh: &str, store: &str, refspec: &str) -> Result<()> {
     let ssh_command = std::iter::once("ssh".to_owned())
         .chain(ssh_options(ssh)?)
         .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ");
-    repository::output(
-        Command::new("git")
+    let git = |args: &[&str]| {
+        let mut command = Command::new("git");
+        command
             .arg("--git-dir")
             .arg(repository::git_dir(root)?)
-            .env("GIT_SSH_COMMAND", ssh_command)
-            .args(["push", "--no-verify"])
-            .arg(format!("{ssh}:{store}"))
-            .arg(reference),
-    )?;
-    Ok(())
+            .env("GIT_SSH_COMMAND", &ssh_command)
+            .args(args)
+            .arg(format!("{ssh}:{store}"));
+        Ok::<_, Box<dyn std::error::Error>>(command)
+    };
+    let pushed = repository::output(git(&["push", "--no-verify"])?.arg(refspec));
+    let Err(error) = pushed else {
+        return Ok(());
+    };
+    let (commit, reference) = refspec.split_once(':').ok_or("invalid refspec")?;
+    // Any failure to check keeps the push's own error. ls-remote matches
+    // pattern tails, so only the line naming exactly this ref counts.
+    let listed =
+        git(&["ls-remote"]).and_then(|mut command| repository::output(command.arg(reference)));
+    let Ok(listed) = listed else {
+        return Err(error);
+    };
+    let published = String::from_utf8_lossy(&listed).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(commit) && fields.next() == Some(reference)
+    });
+    if published { Ok(()) } else { Err(error) }
 }
 
 pub fn mirror(
