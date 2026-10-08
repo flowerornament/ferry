@@ -279,7 +279,7 @@ Checks with a verdict and a next step each. Exit code 0 means healthy, 1 means p
 
 ### 5.8 Documentation, and the skill (`ferry-c3t.1`, `.2`, `.4`)
 
-- **Reference** (`docs/reference.md`, c3t.1): `ferry.toml` and the adapter contract; `machines.toml`; `host.toml`; the hook environment (`FERRY_*`); the receipt schema with field meanings and since-which-revision; JSON events; outcomes and exit codes; capabilities; the state layout; the lock taxonomy and ordering (§7.1); and the refusal → next table.
+- **Reference** (`REFERENCE.md`, c3t.1): `ferry.toml` and the adapter contract; `machines.toml`; `host.toml`; the hook environment (`FERRY_*`); the receipt schema with field meanings and since-which-revision; JSON events; outcomes and exit codes; capabilities; the state layout; the lock taxonomy and ordering (§7.1); and the refusal → next table.
 - **README** (c3t.2): restructured as the model, the three files, the three verbs, a worked example outside Herald and Murail, then "advanced" (companion refs, mirrors, custody, admission, capabilities, holds) linking to the reference.
 - **Skill** (c3t.4), the same pattern as hail, anneal and peat:
   - `skills/ferry/SKILL.md`, with front matter name, description and metadata (version, os, requires bins `ferry ssh git`);
