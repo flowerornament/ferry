@@ -6,13 +6,14 @@ requires = []
 routable = true
 
 [recipe.test]
-command = ["sh", "-c", "export PATH=\"$HOME/.cargo/bin:$PATH\"; exec cargo test --locked"]
+command = ["sh", "-c", "command -v nix >/dev/null || . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; exec nix develop -c cargo test --locked --no-fail-fast"]
 requires = []
 routable = true
 
-# The same gate as `just check`, for Linux-only code a Mac never compiles.
+# The same gate as `just check`, in the flake's dev shell (jj, git, python3,
+# procps, util-linux), for Linux-only code a Mac never compiles.
 [recipe.check]
-command = ["sh", "-c", "export PATH=\"$HOME/.cargo/bin:$PATH\"; cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && exec cargo test --locked --no-fail-fast"]
+command = ["sh", "-c", "command -v nix >/dev/null || . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; exec nix develop -c just check"]
 requires = []
 routable = true
 
