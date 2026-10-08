@@ -82,7 +82,7 @@ impl Drop for SessionOwner {
         if !self.cleaned
             && let Err(e) = self.cleanup()
         {
-            eprintln!("ferry: cleanup failed: {e}");
+            warn(&format!("ferry: cleanup failed: {e}"));
         }
     }
 }
@@ -171,6 +171,49 @@ pub fn validate(request: &Request) -> Result<()> {
     }
     Ok(())
 }
+/// Set once a write to the client (stdout) fails: the client is gone, which
+/// counts as a stop. Never a panic: after spawn nothing may unwind past
+/// custody release (S8).
+static CLIENT_LOST: AtomicBool = AtomicBool::new(false);
+
+/// Whether a write to the client has failed.
+pub fn client_lost() -> bool {
+    CLIENT_LOST.load(Ordering::SeqCst)
+}
+
+/// Writes one line to stdout. A failed write marks the client lost.
+pub fn emit(line: &[u8]) -> bool {
+    let mut out = std::io::stdout().lock();
+    let written = out
+        .write_all(line)
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
+        .is_ok();
+    if !written {
+        CLIENT_LOST.store(true, Ordering::SeqCst);
+    }
+    written
+}
+
+/// Writes a diagnostic line to stderr, ignoring a closed stderr.
+pub fn warn(message: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
+}
+
+/// Debug builds only: whether a control asked this fallible point to fail
+/// (`FERRY_FAIL_AT=<point>[,<point>…]`). Release builds never read it.
+pub fn fail_at(point: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("FERRY_FAIL_AT").is_ok_and(|points| points.split(',').any(|p| p == point))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = point;
+        false
+    }
+}
+
 /// The last of SIGINT, SIGTERM or SIGHUP this process caught; zero for none.
 static CAUGHT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 
@@ -247,7 +290,9 @@ fn acquire_as(
                 if !said && started.elapsed() >= Duration::from_secs(3) {
                     said = true;
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    eprintln!("ferry: waiting for lock {name}: another run holds it");
+                    warn(&format!(
+                        "ferry: waiting for lock {name}: another run holds it"
+                    ));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -637,7 +682,7 @@ fn close_on_exec(file: &fs::File, close: bool) -> Result<()> {
 /// may have been spawned (S8).
 pub struct Finished {
     pub executed: Result<(i32, bool)>,
-    pub collection: Result<Option<Collection>>,
+    pub collection: Option<Collection>,
     pub custody: crate::custody::Release,
 }
 
@@ -664,9 +709,20 @@ pub fn run_released(
     json: bool,
     locks: &[&fs::File],
 ) -> Finished {
-    let executed = run(root, workdir, request, stop, json, locks);
-    let collection = collection(root, request);
-    let terminal = executed.is_ok() && !stop.load(Ordering::SeqCst);
+    // A backstop: nothing in here should panic, but an unwind must still
+    // reach the release below.
+    let (executed, collection) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(root, workdir, request, stop, json, locks)
+    }))
+    .unwrap_or_else(|panic| {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        (Err(format!("supervisor panicked: {what}").into()), None)
+    });
+    let terminal = executed.is_ok() && !stop.load(Ordering::SeqCst) && !client_lost();
     let custody = crate::custody::release(root, request, terminal);
     Finished {
         executed,
@@ -685,9 +741,69 @@ pub fn run(
     stop: &AtomicBool,
     json: bool,
     locks: &[&fs::File],
-) -> Result<(i32, bool)> {
+) -> (Result<(i32, bool)>, Option<Collection>) {
     let outcome = run_session(root, workdir, request, stop, json, locks);
-    if let Some(hook) = &request.hooks.collect {
+    let collection = request
+        .hooks
+        .collect
+        .as_ref()
+        .map(|hook| collect(root, workdir, request, hook, &outcome, json, locks));
+    (outcome, collection)
+}
+
+/// Runs the collect hook in its own bounded session after recipe teardown,
+/// and records it. Its failures are its own: they never touch the verdict.
+fn collect(
+    root: &Path,
+    workdir: &Path,
+    request: &Request,
+    hook: &str,
+    outcome: &Result<(i32, bool)>,
+    json: bool,
+    locks: &[&fs::File],
+) -> Collection {
+    let mut collection = match run_collect(root, workdir, request, hook, outcome, json, locks) {
+        Ok((code, false)) => Collection {
+            exit_code: Some(code),
+            error: None,
+        },
+        Ok((code, true)) => Collection {
+            exit_code: Some(code),
+            error: Some("collection timed out".into()),
+        },
+        Err(error) => Collection {
+            exit_code: None,
+            error: Some(error.to_string()),
+        },
+    };
+    let path = root.join("runs").join(&request.id).join("collection.json");
+    let written = if fail_at("collection-write") {
+        Err(std::io::Error::other("injected by FERRY_FAIL_AT"))
+    } else {
+        serde_json::to_vec(&collection)
+            .map_err(std::io::Error::from)
+            .and_then(|bytes| fs::write(&path, bytes))
+    };
+    if let Err(error) = written {
+        let note = format!("writing {}: {error}", path.display());
+        collection.error = Some(match collection.error.take() {
+            Some(previous) => format!("{previous}; {note}"),
+            None => note,
+        });
+    }
+    collection
+}
+
+fn run_collect(
+    root: &Path,
+    workdir: &Path,
+    request: &Request,
+    hook: &str,
+    outcome: &Result<(i32, bool)>,
+    json: bool,
+    locks: &[&fs::File],
+) -> Result<(i32, bool)> {
+    {
         let mut collect = request.clone();
         collect.id = receipt::run_id()?;
         collect.hooks.prepare = None;
@@ -708,52 +824,24 @@ pub fn run(
         collect.timeout_seconds = Some(60);
         // Collection has its own bounded session after recipe teardown, including
         // timeout or preparation failure. Never reinterpret the recipe verdict.
-        let result = if crate::seat::path(root, &request.seat).exists() {
-            Err("recipe teardown unconfirmed; collection not started".into())
-        } else {
-            run_session(
-                root,
-                workdir,
-                &collect,
-                &AtomicBool::new(false),
-                json,
-                locks,
-            )
-        };
-        let collection = match result {
-            Ok((code, false)) => Collection {
-                exit_code: Some(code),
-                error: None,
-            },
-            Ok((code, true)) => Collection {
-                exit_code: Some(code),
-                error: Some("collection timed out".into()),
-            },
-            Err(error) => Collection {
-                exit_code: None,
-                error: Some(error.to_string()),
-            },
-        };
-        fs::write(
-            root.join("runs").join(&request.id).join("collection.json"),
-            serde_json::to_vec(&collection)?,
-        )?;
+        if crate::seat::path(root, &request.seat).exists() {
+            return Err("recipe teardown unconfirmed; collection not started".into());
+        }
+        run_session(
+            root,
+            workdir,
+            &collect,
+            &AtomicBool::new(false),
+            json,
+            locks,
+        )
     }
-    outcome
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
     pub exit_code: Option<i32>,
     pub error: Option<String>,
-}
-
-pub fn collection(root: &Path, request: &Request) -> Result<Option<Collection>> {
-    match fs::read(root.join("runs").join(&request.id).join("collection.json")) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
 }
 
 /// Spawns the session owner with the locks inherited. Only the session
@@ -837,24 +925,11 @@ fn run_session(
     let code = loop {
         crate::custody::reap_adopted(owner.child.id());
         while let Ok((stream, line)) = receiver.try_recv() {
-            log.write_all(&line)?;
-            log.write_all(b"\n")?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"protocol": receipt::PROTOCOL,"event":"output","stream":stream,"text":String::from_utf8_lossy(&line)})
-                );
-            } else {
-                let mut target: Box<dyn Write> = if stream == "stdout" {
-                    Box::new(std::io::stdout())
-                } else {
-                    Box::new(std::io::stderr())
-                };
-                target.write_all(&line)?;
-                target.write_all(b"\n")?;
-            }
+            // The output log is a diagnostic: a failed write never ends the run.
+            let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
+            relay(stream, &line, json);
         }
-        if stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) || client_lost() {
             break interrupted_code();
         }
         if request
@@ -874,16 +949,36 @@ fn run_session(
     };
     owner.cleanup()?;
     for (stream, line) in receiver.try_iter() {
-        log.write_all(&line)?;
-        log.write_all(b"\n")?;
+        let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
         if json {
-            println!(
-                "{}",
-                serde_json::json!({"protocol":1,"event":"output","stream":stream,"text":String::from_utf8_lossy(&line)})
-            );
+            relay(stream, &line, true);
         }
     }
     Ok((code, timeout))
+}
+
+/// Relays one line of recipe output. As an event, the line travels as `text`
+/// when it is UTF-8; otherwise also as `base64`, so a caller can write the
+/// exact bytes (older callers read the lossy `text`). A failed write marks
+/// the client lost; it never ends the run early by unwinding.
+fn relay(stream: &str, line: &[u8], json: bool) {
+    if json {
+        let mut event = serde_json::json!({
+            "protocol": receipt::PROTOCOL,
+            "event": "output",
+            "stream": stream,
+            "text": String::from_utf8_lossy(line),
+        });
+        if std::str::from_utf8(line).is_err() {
+            event["base64"] = receipt::base64(line).into();
+        }
+        emit(event.to_string().as_bytes());
+    } else if stream == "stdout" {
+        emit(line);
+    } else {
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(line).and_then(|()| err.write_all(b"\n"));
+    }
 }
 
 pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {

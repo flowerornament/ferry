@@ -273,7 +273,7 @@ pub fn release(root: &Path, request: &crate::execution::Request, terminal: bool)
                     reason: format!("custody release failed: {error}"),
                     pids: vec![],
                     survivors: vec![],
-                    locks: Some(held_locks(request)),
+                    locks: held_locks(request),
                 },
             );
             Release {
@@ -292,13 +292,15 @@ pub fn release(root: &Path, request: &crate::execution::Request, terminal: bool)
     }
 }
 
-fn held_locks(request: &crate::execution::Request) -> HeldLocks {
+/// The locks a session inherited, so its survivors may hold: only where
+/// sessions inherit them (Linux; see `execution::inherited`).
+fn held_locks(request: &crate::execution::Request) -> Option<HeldLocks> {
     let exclusive = request.recipe.requires.contains("exclusive");
-    HeldLocks {
+    cfg!(target_os = "linux").then(|| HeldLocks {
         seat: request.seat.clone(),
         host: if exclusive { "exclusive" } else { "shared" }.into(),
         gate: exclusive,
-    }
+    })
 }
 
 fn try_release(
@@ -332,7 +334,7 @@ fn try_release(
                             start: crate::seat::start_time(*pid).ok(),
                         })
                         .collect(),
-                    locks: Some(held_locks(request)),
+                    locks: held_locks(request),
                 },
             )?;
             "taint"
@@ -347,7 +349,7 @@ fn try_release(
                     reason: format!("custody census could not be taken: {error}"),
                     pids: vec![],
                     survivors: vec![],
-                    locks: Some(held_locks(request)),
+                    locks: held_locks(request),
                 },
             )?;
             "taint"

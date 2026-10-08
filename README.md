@@ -399,8 +399,31 @@ Receipts live in `.ferry/receipts/`. Machine timings must not be pooled across
 platforms. A remote result is evidence, not automatic publication authority.
 
 `--json` emits version-one NDJSON with prepared, output and receipt events.
-The host also emits `accepted` and a bound `host-result`. Before acceptance
-it may instead emit `refused` with a reason. Output is escaped as data.
+The host also emits `accepted` (with the supervisor's `pid`) and a bound
+`host-result`. Before acceptance it may instead emit `refused` with a
+reason. Output is escaped as data: an `output` event carries the line as
+`text`, and a line that is not UTF-8 also as `base64`. Without `--json`
+the caller writes those exact bytes, so output is byte-exact either way.
+
+After acceptance nothing the run prints can end it early or change its
+verdict:
+
+- If the host cannot write to its caller (the caller is gone), it treats the
+  client as lost. It stops the work, releases custody, and still writes its
+  record.
+- If the caller cannot write its own output (`ferry run … | head -1`), it
+  stops relaying and stops the run, then reads the rest of the events and
+  writes its receipt.
+- A failed diagnostic is recorded in `reason` and leaves the outcome and
+  exit code as they were. This covers writing the collection result, the
+  artifact digest, the host record and the output log.
+- If the local caller fails before the run ends, it closes the supervisor's
+  input and gives it 60 seconds to stop and release. It kills the
+  supervisor only after that, and says so.
+
+Debug builds take `FERRY_FAIL_AT=<point>[,<point>…]` (`collection-write`,
+`artifact-digest`) to inject those failures in controls. Release builds
+never read it.
 
 ### Outcomes and exit codes
 

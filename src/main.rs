@@ -232,18 +232,20 @@ fn run(options: &Run) -> Result<i32> {
     }
     record.elapsed_ms = receipt::now_ms() - start;
     receipt::save(&root, &record)?;
+    // The receipt is stored; a closed stdout or stderr never changes the code.
     if options.json {
-        println!(
-            "{}",
+        execution::emit(
             serde_json::json!({"protocol": receipt::PROTOCOL, "event": "receipt", "receipt": record})
+                .to_string()
+                .as_bytes(),
         );
     } else {
-        eprintln!(
+        execution::warn(&format!(
             "ferry: {:?}: {} (receipt {})",
             record.outcome,
             record.reason.as_deref().unwrap_or(""),
             record.id
-        );
+        ));
     }
     Ok(record.exit_code)
 }
@@ -305,9 +307,10 @@ fn recover(seat: &str, local: bool, accept_unknown: Option<&str>) -> Result<i32>
     }
     record.elapsed_ms = receipt::now_ms() - record.started_ms;
     receipt::save(&root, &record)?;
-    println!(
-        "{}",
+    execution::emit(
         serde_json::json!({"protocol":receipt::PROTOCOL,"event":"receipt","receipt":record})
+            .to_string()
+            .as_bytes(),
     );
     Ok(record.exit_code)
 }

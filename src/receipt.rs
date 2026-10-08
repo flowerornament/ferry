@@ -124,6 +124,56 @@ pub fn now_ms() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding, for output bytes that are not UTF-8.
+pub fn base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(char::from(BASE64[((n >> shift) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Decodes standard base64; `None` for anything malformed.
+pub fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let text = text.as_bytes();
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for chunk in text.chunks(4) {
+        let mut n = 0u32;
+        let mut padding = 0;
+        for &c in chunk {
+            let value = if c == b'=' {
+                padding += 1;
+                0
+            } else if padding > 0 {
+                return None;
+            } else {
+                u32::try_from(BASE64.iter().position(|&b| b == c)?).ok()?
+            };
+            n = (n << 6) | value;
+        }
+        let bytes = n.to_be_bytes();
+        out.extend_from_slice(&bytes[1..4 - padding]);
+    }
+    Some(out)
+}
+
 pub fn digest(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
@@ -174,6 +224,16 @@ pub fn save(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Er
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn base64_round_trips_every_length() {
+        for len in 0..10 {
+            let bytes: Vec<u8> = (0..len).map(|i| 0xff - i).collect();
+            assert_eq!(super::unbase64(&super::base64(&bytes)), Some(bytes));
+        }
+        assert_eq!(super::base64(b"foob"), "Zm9vYg==");
+        assert_eq!(super::unbase64("Zm9v!g=="), None);
+    }
+
     use super::*;
     #[test]
     fn recipe_125_is_still_a_recipe_failure() {
