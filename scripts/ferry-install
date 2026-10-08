@@ -39,6 +39,12 @@
 # changes through the normal Nix configuration workflow.
 set -euo pipefail
 
+# Git runs only in the colocated checkout: a jj workspace has no .git, and git
+# there would walk up and silently answer about another repository (~/.git).
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+[ -d "$repo_root/.git" ] || { echo "$(basename "$0"): run this from the colocated checkout (~/code/ferry), not a jj workspace" >&2; exit 1; }
+unset GIT_DIR GIT_WORK_TREE
+cd "$repo_root"
 root="${FERRY_INSTALL_ROOT:-.local/state/ferry}"
 bin="${FERRY_INSTALL_BIN:-.local/bin/ferry}"
 

@@ -48,7 +48,10 @@ impl Drop for OwnedCaller {
 }
 
 fn git(root: &Path, args: &[&str]) {
+    // Each test owns its repository; never inherit another one's.
     let out = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .current_dir(root)
         .args(args)
         .output()
@@ -74,6 +77,8 @@ fn fixture() -> TempDir {
 }
 fn run(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .args(args)

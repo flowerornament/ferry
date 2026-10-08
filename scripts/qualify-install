@@ -20,6 +20,11 @@
 # install lock. Activating <rev> on the live root is a separate, announced step.
 set -euo pipefail
 
+# Git runs only in the colocated checkout: a jj workspace has no .git, and git
+# there would walk up and silently answer about another repository (~/.git).
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+[ -d "$repo_root/.git" ] || { echo "$(basename "$0"): run this from the colocated checkout (~/code/ferry), not a jj workspace" >&2; exit 1; }
+unset GIT_DIR GIT_WORK_TREE
 host="${1:?usage: qualify-install <ssh> <rev> [<old-rev>]}"
 rev="${2:?usage: qualify-install <ssh> <rev> [<old-rev>]}"
 old="${3:-b85eb91e323acc1046275537e4533180875dd1e3}"
