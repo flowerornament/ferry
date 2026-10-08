@@ -49,10 +49,18 @@ enum Action {
 }
 #[derive(Subcommand)]
 enum SeatAction {
+    /// Clear a seat's owner marker or taint once its processes are proven gone.
     Recover {
         seat: String,
         #[arg(long)]
         local: bool,
+        /// Clear a taint whose survivors cannot be proven gone (it names none,
+        /// or its record is unreadable): an operator's explicit act.
+        #[arg(long, requires = "reason")]
+        accept_unknown: bool,
+        /// Why the operator accepts it; recorded in the recover receipt.
+        #[arg(long, requires = "accept_unknown")]
+        reason: Option<String>,
     },
 }
 #[derive(Args)]
@@ -273,17 +281,20 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
     })
 }
 
-fn recover(seat: &str, local: bool) -> Result<i32> {
+fn recover(seat: &str, local: bool, accept_unknown: Option<&str>) -> Result<i32> {
     let root = if local {
         repository::root()?.join(".ferry/local")
     } else {
         PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join(".local/state/ferry")
     };
     let mut record = new_record("seat-recover", seat)?;
-    match crate::seat::recover(&root, seat) {
+    match crate::seat::recover(&root, seat, accept_unknown) {
         Ok(()) => {
             record.outcome = receipt::Outcome::RanPass;
             record.exit_code = 0;
+            if let Some(reason) = accept_unknown {
+                record.reason = Some(format!("accepted unknown custody: {reason}"));
+            }
         }
         Err(error) => record.reason = Some(error.to_string()),
     }
@@ -299,8 +310,14 @@ fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Action::Run(options) => run(&options),
         Action::Seat {
-            command: SeatAction::Recover { seat, local },
-        } => recover(&seat, local),
+            command:
+                SeatAction::Recover {
+                    seat,
+                    local,
+                    accept_unknown,
+                    reason,
+                },
+        } => recover(&seat, local, reason.as_deref().filter(|_| accept_unknown)),
         Action::Machines => {
             println!("{}", serde_json::to_string_pretty(&machines()?.host)?);
             Ok(0)

@@ -215,10 +215,14 @@ pub fn interrupted() -> Result<()> {
 pub fn interrupted_code() -> i32 {
     caught_signal().map_or(130, |signal| 128 + signal)
 }
-fn acquire(path: &Path, stop: &AtomicBool) -> Result<fs::File> {
-    acquire_as(path, stop, false)
-}
-fn acquire_as(path: &Path, stop: &AtomicBool, shared: bool) -> Result<fs::File> {
+/// Polls for a lock until it is granted, `stop` is set, or `waiting` (run
+/// on every contended attempt) refuses.
+fn acquire_as(
+    path: &Path,
+    stop: &AtomicBool,
+    shared: bool,
+    waiting: &dyn Fn() -> Result<()>,
+) -> Result<fs::File> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -237,6 +241,7 @@ fn acquire_as(path: &Path, stop: &AtomicBool, shared: bool) -> Result<fs::File> 
         match locked {
             Ok(()) => return Ok(file),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                waiting()?;
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => return Err(e.into()),
@@ -274,12 +279,12 @@ impl HostLease {
     pub fn files(&self) -> impl Iterator<Item = &fs::File> {
         self.held.iter()
     }
-    /// The lease record, stamped with the release time; the lease itself is
-    /// released when this value is dropped.
-    pub fn release(self) -> Lease {
+    /// The lease record, stamped with the release time while the lease is
+    /// still held; the lease itself is released when this value is dropped.
+    pub fn stamp(&self) -> Lease {
         Lease {
             released_ms: Some(crate::receipt::now_ms()),
-            ..self.record
+            ..self.record.clone()
         }
     }
     fn acquire(root: &Path, request: &Request, stop: &AtomicBool) -> Result<Self> {
@@ -289,12 +294,18 @@ impl HostLease {
         // a new exclusive run on one state root still exclude each other.
         let host = root.join("locks/host-exclusive");
         let exclusive = request.recipe.requires.contains("exclusive");
+        let local = root.ends_with("local");
         let held = if exclusive {
-            let gate = acquire_as(&gate, stop, false)?;
-            vec![gate, acquire_as(&host, stop, false)?]
+            // A tainted seat's survivors may hold the lease: no exclusive claim.
+            let tainted = || crate::custody::check_exclusive(root, local);
+            tainted()?;
+            let gate = acquire_as(&gate, stop, false, &tainted)?;
+            let host = acquire_as(&host, stop, false, &tainted)?;
+            tainted()?;
+            vec![gate, host]
         } else {
-            let gate = acquire_as(&gate, stop, true)?;
-            let host = acquire_as(&host, stop, true)?;
+            let gate = acquire_as(&gate, stop, true, &|| Ok(()))?;
+            let host = acquire_as(&host, stop, true, &|| Ok(()))?;
             drop(gate);
             vec![host]
         };
@@ -318,9 +329,19 @@ pub fn prepare(
 ) -> Result<(PathBuf, fs::File, HostLease)> {
     validate(request)?;
     fs::create_dir_all(root.join("locks"))?;
-    let lease = acquire(&root.join("locks").join(&request.seat), stop)?;
-    crate::seat::check(root, &request.seat, root.ends_with("local"))?;
-    crate::custody::check(root, &request.seat, root.ends_with("local"))?;
+    let local = root.ends_with("local");
+    // A tainted seat refuses before, while and after waiting for its lock: a
+    // survivor that kept the lock would otherwise keep this run waiting.
+    let tainted = || crate::custody::check(root, &request.seat, local);
+    tainted()?;
+    let lease = acquire_as(
+        &root.join("locks").join(&request.seat),
+        stop,
+        false,
+        &tainted,
+    )?;
+    crate::seat::check(root, &request.seat, local)?;
+    tainted()?;
     crate::custody::begin(root, &request.seat)?;
     for entry in fs::read_dir(root.join("locks"))? {
         if entry?
@@ -601,6 +622,48 @@ fn close_on_exec(file: &fs::File, close: bool) -> Result<()> {
     };
     fcntl(file, FcntlArg::F_SETFD(flags))?;
     Ok(())
+}
+
+/// What a supervised run came to. Custody is always present once a session
+/// may have been spawned (S8).
+pub struct Finished {
+    pub executed: Result<(i32, bool)>,
+    pub collection: Result<Option<Collection>>,
+    pub custody: Result<crate::custody::Release>,
+}
+
+/// The lock descriptors a session inherits: the seat lock and the host
+/// lease, only where survivors can be stopped (the Linux census). Elsewhere
+/// a survivor that kept them would hold them indefinitely, so they stay
+/// close-on-exec and a killed supervisor frees them while the recipe lives.
+pub fn inherited<'a>(seat: &'a fs::File, lease: &'a HostLease) -> Vec<&'a fs::File> {
+    if cfg!(target_os = "linux") {
+        std::iter::once(seat).chain(lease.files()).collect()
+    } else {
+        vec![]
+    }
+}
+
+/// Runs the recipe and collect sessions, then custody release, while the
+/// locks are still held. No failure in between skips the release: every
+/// path collects, censuses and stops survivors, then reports.
+pub fn run_released(
+    root: &Path,
+    workdir: &Path,
+    request: &Request,
+    stop: &AtomicBool,
+    json: bool,
+    locks: &[&fs::File],
+) -> Finished {
+    let executed = run(root, workdir, request, stop, json, locks);
+    let collection = collection(root, request);
+    let terminal = executed.is_ok() && !stop.load(Ordering::SeqCst);
+    let custody = crate::custody::release(root, request, terminal);
+    Finished {
+        executed,
+        collection,
+        custody,
+    }
 }
 
 /// Runs the recipe session, then the collect hook's. `locks` are the seat

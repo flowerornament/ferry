@@ -89,12 +89,38 @@ struct Idle<'a> {
     stopped: Vec<i32>,
 }
 
-/// Makes this process the reaper of its orphaned descendants (Linux).
+/// Children this process already had when it began supervising (pid and
+/// start time): a wrapper's background job, say. They are not the run's, so
+/// the census and stopping leave them alone.
+#[cfg(target_os = "linux")]
+static PREEXISTING: std::sync::OnceLock<Vec<(i32, Option<u128>)>> = std::sync::OnceLock::new();
+
+/// Makes this process the reaper of its orphaned descendants (Linux), and
+/// notes the children it already has.
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn supervise() -> Result<()> {
     #[cfg(target_os = "linux")]
-    nix::sys::prctl::set_child_subreaper(true)?;
+    {
+        let _ = PREEXISTING.set(
+            children()
+                .into_iter()
+                .map(|pid| (pid, crate::seat::start_time(pid).ok()))
+                .collect(),
+        );
+        nix::sys::prctl::set_child_subreaper(true)?;
+    }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Whether `pid` is a child this process had before it began supervising.
+/// Without a recorded start time, the pid alone counts: never signal it.
+fn preexisting(pid: i32) -> bool {
+    PREEXISTING.get().is_some_and(|known| {
+        known.iter().any(|(known, start)| {
+            *known == pid && (start.is_none() || crate::seat::start_time(pid).ok() == *start)
+        })
+    })
 }
 
 /// Reaps adopted descendants that have already exited, so they do not linger
@@ -146,19 +172,59 @@ pub fn taint_path(root: &Path, seat: &str) -> std::path::PathBuf {
     root.join("taint").join(format!("{seat}.json"))
 }
 
-/// Called under the seat lock before a session: a tainted seat refuses.
+/// Refuses a tainted seat, with the next step. Also called before waiting
+/// for the seat lock and while waiting, since a survivor that kept the
+/// inherited lock would otherwise make the run wait forever.
 pub fn check(root: &Path, seat: &str, local: bool) -> Result<()> {
-    let taint: Taint = match fs::read(taint_path(root, seat)) {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
+    let path = taint_path(root, seat);
+    let next = |extra: &str| crate::seat::recover_hint(seat, local, extra);
+    let taint: Taint = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "seat {seat} is tainted, but its record {} is unreadable ({error}); confirm nothing it ran is alive, then run {}",
+                path.display(),
+                next(" --accept-unknown --reason '<why>'")
+            )
+        })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            return Err(format!(
+                "seat {seat}: whether it is tainted is unknown ({}: {e}); fix access to it",
+                path.display()
+            )
+            .into());
+        }
     };
-    let local = if local { " --local" } else { "" };
     Err(format!(
-        "seat {seat} is tainted: run {} left survivors (pids {:?}); stop them, then run ferry seat recover {seat}{local}",
-        taint.id, taint.pids
+        "seat {seat} is tainted: run {} left survivors (pids {:?}); stop them, then run {}",
+        taint.id,
+        taint.pids,
+        next("")
     )
     .into())
+}
+
+/// Refuses an exclusive run while any seat under this root is tainted: its
+/// survivors may still hold the host lease, so exclusivity cannot be claimed.
+pub fn check_exclusive(root: &Path, local: bool) -> Result<()> {
+    let tainted = match fs::read_dir(root.join("taint")) {
+        Ok(entries) => entries.flatten().find_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".json")
+                .map(str::to_owned)
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("whether any seat is tainted is unknown: {e}").into()),
+    };
+    match tainted {
+        None => Ok(()),
+        Some(seat) => Err(format!(
+            "an exclusive run cannot claim the host while seat {seat} is tainted; stop its survivors, then run {}",
+            crate::seat::recover_hint(&seat, local, "")
+        )
+        .into()),
+    }
 }
 
 /// Called under the seat lock after a session ends. `terminal` is true only
@@ -237,27 +303,30 @@ pub fn release(
     })
 }
 
-/// Stops survivors this run's census attributed to it: TERM each (and its
-/// group, when it leads one), re-census through the grace period so newly
-/// adopted descendants are stopped too, then KILL what remains. Returns the
-/// pids signalled and the final census. Pids come only from our own census:
-/// unreaped children of this supervisor, so none can have been reused.
+/// Stops what this run's census attributes to it: each survivor and all of
+/// its descendants. TERM goes to the whole set first (and to process groups
+/// led by a member), the census is retaken through the grace period so newly
+/// adopted descendants get TERM too, then the same with KILL, then one final
+/// census. Returns the pids signalled and that final census. Survivors are
+/// unreaped children of this supervisor, so their pids cannot be reused;
+/// a deeper descendant is signalled only while its start time still matches.
 fn stop(first: &[i32]) -> (Vec<i32>, Census) {
     use nix::sys::signal::Signal;
     let mut stopped: Vec<i32> = vec![];
     let mut current = Census::Survivors(first.to_vec());
     for (signal, grace) in [(Signal::SIGTERM, STOP_GRACE), (Signal::SIGKILL, KILL_GRACE)] {
         let deadline = Instant::now() + grace;
-        let mut signalled: Vec<i32> = vec![];
+        let mut signalled: Vec<(i32, Option<u128>)> = vec![];
         loop {
             match &current {
                 Census::Survivors(pids) if !pids.is_empty() => {
-                    for pid in pids {
-                        if !signalled.contains(pid) {
-                            signalled.push(*pid);
-                            send(*pid, pids, signal);
-                            if !stopped.contains(pid) {
-                                stopped.push(*pid);
+                    let members = attributed(pids);
+                    for member in &members {
+                        if !signalled.contains(member) {
+                            signalled.push(*member);
+                            send(*member, &members, signal);
+                            if !stopped.contains(&member.0) {
+                                stopped.push(member.0);
                             }
                         }
                     }
@@ -272,19 +341,69 @@ fn stop(first: &[i32]) -> (Vec<i32>, Census) {
             current = census();
         }
     }
-    (stopped, current)
+    // What the last KILL batch left: reap it, then the final word.
+    std::thread::sleep(Duration::from_millis(50));
+    (stopped, census())
 }
 
-/// Signals one survivor, and its process group when the group's leader is
-/// itself one of this run's survivors.
-fn send(pid: i32, survivors: &[i32], signal: nix::sys::signal::Signal) {
+/// The survivors and every descendant of theirs, with start times.
+fn attributed(survivors: &[i32]) -> Vec<(i32, Option<u128>)> {
+    let mut members: Vec<i32> = survivors.to_vec();
+    let parents = parents();
+    let mut frontier = members.clone();
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid) in &parents {
+            if *ppid == parent && !members.contains(pid) {
+                members.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+    }
+    members
+        .into_iter()
+        .map(|pid| (pid, crate::seat::start_time(pid).ok()))
+        .collect()
+}
+
+/// Every process's parent, as /proc shows it (Linux; elsewhere none).
+fn parents() -> Vec<(i32, i32)> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
+                let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+                let (_, fields) = stat.rsplit_once(')')?;
+                let parent = fields.split_whitespace().nth(1)?.parse().ok()?;
+                Some((pid, parent))
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    vec![]
+}
+
+/// Signals one member if it is still the process it was, and its process
+/// group when the group's leader is itself a member.
+fn send(
+    member: (i32, Option<u128>),
+    members: &[(i32, Option<u128>)],
+    signal: nix::sys::signal::Signal,
+) {
     use nix::{
         sys::signal::{kill, killpg},
         unistd::{Pid, getpgid},
     };
+    let (pid, start) = member;
+    if start.is_some() && crate::seat::start_time(pid).ok() != start {
+        return;
+    }
     let target = Pid::from_raw(pid);
     if let Ok(group) = getpgid(Some(target))
-        && (group == target || survivors.contains(&group.as_raw()))
+        && members.iter().any(|(leader, _)| *leader == group.as_raw())
     {
         let _ = killpg(group, signal);
     }
@@ -304,6 +423,12 @@ fn write(root: &Path, kind: &str, seat: &str, value: &impl Serialize) -> Result<
 /// child remains, and a live child proves a survivor. Because the supervisor
 /// is a subreaper, every surviving descendant is, or sits under, a direct
 /// child. Any other wait error leaves custody unknown.
+///
+/// Children this process had before supervising are not the run's. When one
+/// of them still lives, the kernel cannot tell it from a survivor, so /proc
+/// decides: empty only if every live child it lists is pre-existing. A
+/// listing that shows no live child at all, though the kernel reports one,
+/// is blind: survivors, unattributed.
 #[cfg(target_os = "linux")]
 fn census() -> Census {
     use nix::{
@@ -313,10 +438,21 @@ fn census() -> Census {
     loop {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Err(Errno::ECHILD) => return Census::Empty,
-            Ok(WaitStatus::StillAlive) => return Census::Survivors(children()),
+            Ok(WaitStatus::StillAlive) => break,
             Ok(_) => {}
             Err(error) => return Census::Unknown(error.to_string()),
         }
+    }
+    let live = children();
+    let ours: Vec<i32> = live
+        .iter()
+        .copied()
+        .filter(|pid| !preexisting(*pid))
+        .collect();
+    if ours.is_empty() && !live.is_empty() {
+        Census::Empty
+    } else {
+        Census::Survivors(ours)
     }
 }
 

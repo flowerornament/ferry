@@ -662,8 +662,6 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     )
     .unwrap();
     caller.child.as_mut().unwrap().wait().unwrap();
-    // The session inherited the seat lock and host lease: they stay held
-    // while the recipe lives, though its supervisor is gone.
     let locks = dir.path().join(".ferry/local/locks");
     let held = |name: &str| {
         let probe = fs::File::open(locks.join(name)).unwrap();
@@ -673,6 +671,36 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
             Err(e) => panic!("probing {name}: {e}"),
         }
     };
+    if !cfg!(target_os = "linux") {
+        // No census to stop survivors here, so sessions do not inherit the
+        // locks: a killed supervisor frees them while the recipe lives (the
+        // documented residue), and the owner marker refuses the seat.
+        assert!(!held(seat), "the seat lock outlived its supervisor here");
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        assert_eq!(out.status.code(), Some(125));
+        assert!(
+            receipt(&out)["reason"]
+                .as_str()
+                .unwrap()
+                .contains("seat recover")
+        );
+        let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
+        assert_eq!(out.status.code(), Some(125));
+        fs::write(&release, "finish").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !run(dir.path(), &["seat", "recover", seat, "--local"])
+            .status
+            .success()
+        {
+            assert!(Instant::now() < deadline, "session did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!ownership.exists());
+        drop(group);
+        return;
+    }
+    // The session inherited the seat lock and host lease: they stay held
+    // while the recipe lives, though its supervisor is gone.
     assert!(held(seat), "the seat lock freed while the recipe lives");
     assert!(
         held("host-exclusive"),
@@ -693,6 +721,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     );
     let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
     assert_eq!(out.status.code(), Some(125));
+    assert!(receipt(&out)["reason"].as_str().unwrap().contains("in use"));
     assert!(ownership.exists());
     fs::write(&release, "finish").unwrap();
     // Once the session is gone, the waiting run takes the seat and refuses:

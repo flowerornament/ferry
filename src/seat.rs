@@ -20,16 +20,34 @@ pub fn path(root: &Path, seat: &str) -> PathBuf {
     root.join("owners").join(format!("{seat}.json"))
 }
 
+/// The recovery command for a seat, saying where to run it and which
+/// `--seat` it is: seat keys are `<caller hash>-<seat name>`.
+pub fn recover_hint(seat: &str, local: bool, extra: &str) -> String {
+    let name = seat.split_once('-').map_or(seat, |(_, name)| name);
+    if local {
+        format!("`ferry seat recover {seat} --local{extra}` (your --seat {name})")
+    } else {
+        let host = std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "the host".into());
+        format!("`ferry seat recover {seat}{extra}` on {host} (your --seat {name})")
+    }
+}
+
 pub fn check(root: &Path, seat: &str, local: bool) -> Result<()> {
     let owner = match fs::read(path(root, seat)) {
         Ok(bytes) => serde_json::from_slice::<Owner>(&bytes)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let local = if local { " --local" } else { "" };
     Err(format!(
-        "cleanup_pending: seat {seat}, session {:?}; run ferry seat recover {seat}{local}",
-        owner.session
+        "cleanup_pending: seat {seat}, session {:?}; run {}",
+        owner.session,
+        recover_hint(seat, local, "")
     )
     .into())
 }
@@ -75,7 +93,7 @@ pub fn bind(root: &Path, request: &execution::Request) -> Result<()> {
 /// Clears what keeps a seat refused, only once it is proven safe: an owner
 /// marker when its recorded session is empty, and a taint record when every
 /// recorded survivor is gone. Never kills.
-pub fn recover(root: &Path, seat: &str) -> Result<()> {
+pub fn recover(root: &Path, seat: &str, accept_unknown: Option<&str>) -> Result<()> {
     config::identifier(seat)?;
     fs::create_dir_all(root.join("locks"))?;
     let lease = fs::OpenOptions::new()
@@ -84,7 +102,16 @@ pub fn recover(root: &Path, seat: &str) -> Result<()> {
         .create(true)
         .truncate(false)
         .open(root.join("locks").join(seat))?;
-    fs2::FileExt::try_lock_exclusive(&lease)?;
+    match fs2::FileExt::try_lock_exclusive(&lease) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(format!(
+                "seat {seat} is in use: a run, or a process it left that kept the seat lock, is still alive; stop it, then retry"
+            )
+            .into());
+        }
+        Err(e) => return Err(e.into()),
+    }
     let marker = path(root, seat);
     let taint = crate::custody::taint_path(root, seat);
     if !marker.exists() && !taint.exists() {
@@ -94,7 +121,7 @@ pub fn recover(root: &Path, seat: &str) -> Result<()> {
         recover_owner(root, seat, &marker)?;
     }
     if taint.exists() {
-        recover_taint(seat, &taint)?;
+        recover_taint(seat, &taint, accept_unknown)?;
     }
     Ok(())
 }
@@ -138,8 +165,24 @@ fn recover_owner(root: &Path, seat: &str, marker: &Path) -> Result<()> {
 /// A survivor is gone when no process has its pid, or the process that has
 /// it started at another time. Without a recorded start time, any live
 /// process with the pid counts as the survivor.
-fn recover_taint(seat: &str, taint: &Path) -> Result<()> {
-    let record: crate::custody::Taint = serde_json::from_slice(&fs::read(taint)?)?;
+fn recover_taint(seat: &str, taint: &Path, accept_unknown: Option<&str>) -> Result<()> {
+    let record: crate::custody::Taint = match serde_json::from_slice(&fs::read(taint)?) {
+        Ok(record) => record,
+        Err(error) if accept_unknown.is_some() => {
+            // The operator vouches for a record Ferry cannot read; the seat
+            // lock was free, so no process kept it.
+            let _ = error;
+            fs::remove_file(taint)?;
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "seat {seat}: taint record {} is unreadable ({error}); confirm nothing it ran is alive, then add --accept-unknown --reason '<why>'",
+                taint.display()
+            )
+            .into());
+        }
+    };
     let survivors: Vec<crate::custody::Survivor> = if record.survivors.is_empty() {
         record
             .pids
@@ -153,8 +196,13 @@ fn recover_taint(seat: &str, taint: &Path) -> Result<()> {
         record.survivors
     };
     if survivors.is_empty() {
+        if accept_unknown.is_some() {
+            // An explicit operator act, recorded in the recover receipt.
+            fs::remove_file(taint)?;
+            return Ok(());
+        }
         return Err(format!(
-            "seat {seat} is tainted ({}) but names no survivors; recovery cannot prove absence. Use another --seat",
+            "seat {seat} is tainted ({}) but names no survivors, so recovery cannot prove them gone; confirm nothing it ran is alive, then add --accept-unknown --reason '<why>'",
             record.reason
         )
         .into());

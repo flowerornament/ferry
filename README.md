@@ -299,11 +299,22 @@ session left behind:
 
 **Survivors are stopped.** A run owns what it started, and nothing it
 started outlives it. At release, each survivor the census attributes to this
-run gets SIGTERM, and so does its process group when the survivor leads it.
-For 10 seconds the census is retaken, and descendants adopted meanwhile get
-SIGTERM too. Then whatever remains gets SIGKILL, and the census is taken
-again. Only pids from this supervisor's own census are signalled. They are
-its unreaped children, so none can have been reused by another process.
+run gets SIGTERM, together with all of its descendants, and so does any
+process group one of them leads. For 10 seconds the census is retaken, and
+descendants adopted meanwhile get SIGTERM too. Then whatever remains gets
+SIGKILL, and a final census is taken. Survivors are this supervisor's
+unreaped children, so their pids cannot have been reused. A deeper
+descendant is signalled only while its start time still matches.
+
+Release always happens. Once the session is spawned, every path runs the
+collect hook, then the census and stop, then records custody, before the
+locks are dropped. That holds even when a hook, the session or collection
+fails.
+
+Children the supervisor already had when the run began (a wrapper's
+background job, before it `exec`s `ferry run`) are not the run's. The census
+and the stop leave them alone. While one of them lives, emptiness rests on
+`/proc`'s listing rather than on the kernel alone.
 A service a run starts and expects to outlive it belongs to the operator's
 service manager, not to the run (PRINCIPLES.md, worked example).
 
@@ -323,11 +334,20 @@ What custody does not see:
   `ferry seat recover`.
 
 **A tainted seat refuses** new runs (125) with the run and pids that tainted
-it. The next step is to stop those processes, then run
-`ferry seat recover <seat>`. Recovery never kills. It clears the taint only
-when every recorded survivor is gone, checked by pid and start time. A taint
-that names no survivors, because the census was unknown or attributed no pids,
-cannot be proven clear. That seat stays refused, so use another `--seat`.
+it, before waiting for the seat lock and again while waiting, since a
+survivor may still hold that lock. The next step is to stop those
+processes, then run `ferry seat recover <seat>` on the host that ran it.
+The refusal names the command, the host, and your `--seat`. While any seat
+is tainted, an `--exclusive` run refuses too, because a survivor may still
+hold the host lease.
+
+Recovery never kills. It refuses while the seat lock is held, and clears the
+taint only when every recorded survivor is gone, checked by pid and start
+time. Some taints cannot be proven clear: one that names no survivors
+(because the census was unknown or attributed no pids), or a record that
+cannot be read. For those, the operator confirms nothing is left and runs
+`ferry seat recover <seat> --accept-unknown --reason '<why>'`. That reason
+is kept in the recover receipt.
 
 **Other platforms** report `unsupported`: there is no census, so nothing is
 stopped at release and the seat is never recorded idle. The session teardown
@@ -335,12 +355,16 @@ still kills every member of the recipe's session. A descendant that leaves
 the session (`setsid`, a double fork) escapes there, and this is reported
 rather than hidden.
 
-**Locks outlive a killed supervisor.** The seat lock and the host lease are
-inherited by the session and the recipe. If the supervisor (`host-run`, or
-the local caller) is killed, they stay held until the recipe's processes
-that kept them exit. A new run waits instead of starting beside a live
-recipe. A survivor that keeps them also keeps them held. That is why
-survivors are stopped at release.
+**Locks outlive a killed supervisor, on Linux.** There the seat lock and the
+host lease are inherited by the session and the recipe. If the supervisor
+(`host-run`, or the local caller) is killed, they stay held until the
+recipe's processes that kept them exit, and a new run waits instead of
+starting beside a live recipe. A survivor that kept them also keeps them,
+until it is stopped at release or, if it cannot be, the seat is tainted.
+Elsewhere, survivors cannot be stopped, so the locks are not inherited:
+a killed supervisor frees them while the recipe lives. The dead
+supervisor's owner marker still refuses that seat until recovery, but an
+`--exclusive` run on another seat is not kept out.
 
 ## Safety and receipts
 

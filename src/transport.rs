@@ -386,10 +386,18 @@ pub fn host_run() -> Result<i32> {
         event(
             &serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit,"seat":request.seat}),
         );
-        let locks: Vec<&fs::File> = std::iter::once(&lease).chain(host_lease.files()).collect();
-        let executed = execution::run(&root, &seat, &request, &stop, true, &locks);
-        result.collection = execution::collection(&root, &request)?;
-        let (code, timeout) = executed?;
+        let locks = execution::inherited(&lease, &host_lease);
+        let finished = execution::run_released(&root, &seat, &request, &stop, true, &locks);
+        // Custody first: it is recorded whatever else failed (S8).
+        let custody = finished
+            .custody
+            .map_err(|e| format!("custody release: {e}"));
+        result.custody = custody.as_ref().ok().cloned();
+        // Stamped while held; the locks drop as this scope ends.
+        result.lease = Some(host_lease.stamp());
+        result.collection = finished.collection?;
+        let (code, timeout) = finished.executed?;
+        custody?;
         result.exit_code = code;
         result.outcome = if stop.load(Ordering::SeqCst) {
             Outcome::Lost
@@ -407,13 +415,7 @@ pub fn host_run() -> Result<i32> {
                 Err(e) => result.artifacts_error = Some(e.to_string()),
             }
         }
-        result.custody = Some(crate::custody::release(
-            &root,
-            &request,
-            terminal(result.outcome),
-        )?);
-        result.lease = Some(host_lease.release());
-        drop(lease);
+        result.lease = Some(host_lease.stamp());
         Ok(())
     })();
     if let Err(error) = executed {
@@ -465,15 +467,23 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     if json {
         event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
     }
-    let locks: Vec<&fs::File> = std::iter::once(&lease).chain(host_lease.files()).collect();
-    let executed = execution::run(&state, &seat, request, &stop, json, &locks);
-    record.collection = execution::collection(&state, request)?;
-    let (code, timeout) = executed.inspect_err(|_| {
+    let locks = execution::inherited(&lease, &host_lease);
+    let finished = execution::run_released(&state, &seat, request, &stop, json, &locks);
+    // Custody first: it is recorded whatever else failed (S8).
+    let custody = finished
+        .custody
+        .map_err(|e| format!("custody release: {e}"));
+    record.custody = custody.as_ref().ok().cloned();
+    // Stamped while held; the locks drop as this function returns.
+    record.lease = Some(host_lease.stamp());
+    record.collection = finished.collection?;
+    let (code, timeout) = finished.executed.inspect_err(|_| {
         if execution::attempted(&state, request) {
             record.outcome = Outcome::Lost;
             record.exit_code = 255;
         }
     })?;
+    custody?;
     record.exit_code = code;
     record.outcome = if stop.load(Ordering::SeqCst) {
         Outcome::Lost
@@ -496,13 +506,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
             Err(e) => record.reason = Some(format!("artifact collection failed: {e}")),
         }
     }
-    record.custody = Some(crate::custody::release(
-        &state,
-        request,
-        terminal(record.outcome),
-    )?);
-    record.lease = Some(host_lease.release());
-    drop(lease);
+    record.lease = Some(host_lease.stamp());
     Ok(())
 }
 
@@ -622,14 +626,6 @@ fn refused_by(record: &mut Receipt, info: &HostInfo) {
     record.host_binary_sha256 = Some(info.binary_sha256.clone());
     record.host_source_rev.clone_from(&info.source_rev);
     record.host_exe.clone_from(&info.exe);
-}
-
-/// Only these outcomes may leave a seat idle.
-fn terminal(outcome: Outcome) -> bool {
-    matches!(
-        outcome,
-        Outcome::RanPass | Outcome::RanFail | Outcome::Timeout
-    )
 }
 
 /// What the host said on the protocol stream.
