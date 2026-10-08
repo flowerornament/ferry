@@ -116,6 +116,10 @@ pub struct Receipt {
     /// The provider capabilities the project required.
     #[serde(default)]
     pub provider_requires: Vec<String>,
+    /// Output lines that could not be delivered, by where they were lost:
+    /// `stdout`/`stderr` (this caller's), `host` (the host's stream).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub output_dropped: std::collections::BTreeMap<String, u64>,
 }
 
 pub fn now_ms() -> u128 {

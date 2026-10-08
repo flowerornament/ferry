@@ -405,25 +405,43 @@ reason. Output is escaped as data: an `output` event carries the line as
 `text`, and a line that is not UTF-8 also as `base64`. Without `--json`
 the caller writes those exact bytes, so output is byte-exact either way.
 
-After acceptance nothing the run prints can end it early or change its
-verdict:
+After acceptance three rules hold:
 
-- If the host cannot write to its caller (the caller is gone), it treats the
-  client as lost. It stops the work, releases custody, and still writes its
-  record.
-- If the caller cannot write its own output (`ferry run … | head -1`), it
-  stops relaying and stops the run, then reads the rest of the events and
-  writes its receipt.
-- A failed diagnostic is recorded in `reason` and leaves the outcome and
-  exit code as they were. This covers writing the collection result, the
-  artifact digest, the host record and the output log.
-- If the local caller fails before the run ends, it closes the supervisor's
-  input and gives it 60 seconds to stop and release. It kills the
-  supervisor only after that, and says so.
+- **Output is data, never control.** Recipe output and events travel to
+  the client through one writer thread and a bounded queue.
+  - A slow reader slows the recipe through backpressure, never the
+    supervisor.
+  - A stream that cannot be written, such as `ferry run … | head -1` or a
+    closed stderr, is dropped and its lost lines counted in the receipt's
+    `output_dropped` (`stdout`, `stderr`, or `host` for lines the host could
+    not deliver). The run goes on to its own end or its timeout.
+  - Only signals, the client's heartbeat ending (stdin EOF: "client lost"),
+    and the timeout stop a run.
+- **The verdict is decided once, by the first terminal fact.**
+  - A recipe that reached its result keeps ran-pass, ran-fail or timeout,
+    with its own code or 124. Anything after it (a lost client, a signal
+    during the collect hook, a failed release) is noted in `reason` as
+    "after the verdict: …".
+  - A run is lost only when a stop came first: 128 plus the signal when one
+    was caught, else 255. The reason always names the cause ("caller
+    received SIGINT", "client lost: heartbeat EOF").
+  - A failed diagnostic is recorded in `reason` and leaves the outcome and
+    exit code as they were. This covers writing the collection result, the
+    artifact digest, the host record and the output log.
+- **The supervisor never waits on data.** Its loop checks stop, the timeout
+  and the recipe's result every tick. After writing its record it waits at
+  most 5 seconds for the final `host-result` to reach the client. If it
+  does not, the caller reads the verdict from the host record (locally, or
+  over SSH), and the receipt says so.
+
+If the local caller fails before the run ends, it closes the supervisor's
+input (its heartbeats stop). It then gives the supervisor longer than its
+worst-case stop: session teardown, the collect hook, stopping survivors and
+the final emit. Only after that does it kill the supervisor, and it says so.
 
 Debug builds take `FERRY_FAIL_AT=<point>[,<point>…]` (`collection-write`,
-`artifact-digest`) to inject those failures in controls. Release builds
-never read it.
+`artifact-digest`, `output-write`, `run-panic`) to inject those failures in
+controls. Release builds never read it.
 
 ### Outcomes and exit codes
 
@@ -436,7 +454,7 @@ refusal from a recipe failure. A recipe may itself exit 125.
 | `ran-fail` | the recipe's code | The recipe ran and failed. |
 | `timeout`  | 124 | `--timeout-seconds` elapsed; the recipe's session was ended. |
 | `refused`  | 125 | Nothing ran. This covers an unknown recipe or route, an unmet requirement, a dirty or unknown commit, and a host that refused before acceptance (including a host older than the caller that rejects the request). |
-| `lost`     | 128 + signal, or 255 | The run's fate is unknown or was cut short. When the caller is interrupted, it exits 128 plus the signal it received: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. A signal that arrives before dispatch still writes a receipt and dispatches nothing; the caller first lets an in-flight step, such as a git push, finish. Otherwise, lost means the connection or host failed after dispatch: 255. |
+| `lost`     | 128 + signal, or 255 | The run's fate is unknown or was cut short. When the caller is interrupted, it exits 128 plus the signal it received: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. A signal that arrives before dispatch still writes a receipt and dispatches nothing; the caller first lets an in-flight step, such as a git push, finish. Otherwise, lost means a stop came before the recipe's result, and the host lost its client or failed after dispatch: 255. The reason names the cause. A recipe that already reached its result is never lost; later events are noted. |
 
 ## Limits
 

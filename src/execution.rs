@@ -47,7 +47,7 @@ impl SessionOwner {
     fn cleanup_session(&mut self) -> Result<()> {
         let sid = self.child.id();
         signal_session(sid, Signal::SIGTERM)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SESSION_CLEANUP;
         while Instant::now() < deadline {
             // Do not reap the owner until all other session members are gone.
             let members = session_members(sid)?;
@@ -171,28 +171,13 @@ pub fn validate(request: &Request) -> Result<()> {
     }
     Ok(())
 }
-/// Set once a write to the client (stdout) fails: the client is gone, which
-/// counts as a stop. Never a panic: after spawn nothing may unwind past
-/// custody release (S8).
-static CLIENT_LOST: AtomicBool = AtomicBool::new(false);
-
-/// Whether a write to the client has failed.
-pub fn client_lost() -> bool {
-    CLIENT_LOST.load(Ordering::SeqCst)
-}
-
-/// Writes one line to stdout. A failed write marks the client lost.
+/// Writes one line to stdout, never panicking. False if it could not.
 pub fn emit(line: &[u8]) -> bool {
     let mut out = std::io::stdout().lock();
-    let written = out
-        .write_all(line)
+    out.write_all(line)
         .and_then(|()| out.write_all(b"\n"))
         .and_then(|()| out.flush())
-        .is_ok();
-    if !written {
-        CLIENT_LOST.store(true, Ordering::SeqCst);
-    }
-    written
+        .is_ok()
 }
 
 /// Writes a diagnostic line to stderr, ignoring a closed stderr.
@@ -253,11 +238,6 @@ pub fn interrupted() -> Result<()> {
     }
 }
 
-/// The exit code of an interrupted run: 128 plus the signal this process
-/// caught. A host whose client disappeared without signalling it keeps 130.
-pub fn interrupted_code() -> i32 {
-    caught_signal().map_or(130, |signal| 128 + signal)
-}
 /// Polls for a lock until it is granted, `stop` is set, or `waiting` (run
 /// on every contended attempt) refuses.
 fn acquire_as(
@@ -678,10 +658,73 @@ fn close_on_exec(file: &fs::File, close: bool) -> Result<()> {
     Ok(())
 }
 
+/// What stopped a run before its result: a signal the supervisor caught,
+/// or the client lost (heartbeat EOF on stdin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopCause {
+    Signal(i32),
+    ClientLost,
+}
+
+/// The cause of a stop this process saw, if any.
+pub fn stop_cause(stop: &AtomicBool) -> Option<StopCause> {
+    match caught_signal() {
+        Some(signal) => Some(StopCause::Signal(signal)),
+        None if stop.load(Ordering::SeqCst) => Some(StopCause::ClientLost),
+        None => None,
+    }
+}
+
+/// The verdict, decided once by the first terminal fact (Rule B):
+/// - a recipe that reached its result, or timed out, keeps that verdict
+///   whatever happened later; a later stop is only noted;
+/// - a stop before the result is lost: 128 plus a caught signal, else 255,
+///   with the cause named;
+/// - any other failure after spawn (`attempted`) is lost 255; before it,
+///   refused 125.
+pub fn verdict(
+    ended: &std::result::Result<Ended, String>,
+    cause: Option<StopCause>,
+    attempted: bool,
+) -> (receipt::Outcome, i32, Option<String>) {
+    use receipt::Outcome;
+    let named = |cause: StopCause| match cause {
+        StopCause::Signal(signal) => format!("supervisor received {}", signal_name(signal)),
+        StopCause::ClientLost => "client lost: heartbeat EOF".to_owned(),
+    };
+    let code = |cause: Option<StopCause>| match cause {
+        Some(StopCause::Signal(signal)) => 128 + signal,
+        _ => 255,
+    };
+    let after = |reason: Option<String>| match cause {
+        Some(cause) => Some(format!("after the verdict: {}", named(cause))),
+        None => reason,
+    };
+    match ended {
+        Ok(Ended::Result(0)) => (Outcome::RanPass, 0, after(None)),
+        Ok(Ended::Result(exit)) => (Outcome::RanFail, *exit, after(None)),
+        Ok(Ended::Timeout) => (Outcome::Timeout, 124, after(None)),
+        Ok(Ended::Stopped) => (
+            Outcome::Lost,
+            code(cause),
+            Some(cause.map_or_else(|| "stopped".to_owned(), named)),
+        ),
+        Err(error) => match cause {
+            Some(cause) => (
+                Outcome::Lost,
+                code(Some(cause)),
+                Some(format!("{}; {error}", named(cause))),
+            ),
+            None if attempted => (Outcome::Lost, 255, Some(error.clone())),
+            None => (Outcome::Refused, 125, Some(error.clone())),
+        },
+    }
+}
+
 /// What a supervised run came to. Custody is always present once a session
 /// may have been spawned (S8).
 pub struct Finished {
-    pub executed: Result<(i32, bool)>,
+    pub executed: Result<Ended>,
     pub collection: Option<Collection>,
     pub custody: crate::custody::Release,
 }
@@ -706,13 +749,13 @@ pub fn run_released(
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
-    json: bool,
     locks: &[&fs::File],
 ) -> Finished {
     // A backstop: nothing in here should panic, but an unwind must still
     // reach the release below.
     let (executed, collection) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(root, workdir, request, stop, json, locks)
+        assert!(!fail_at("run-panic"), "injected by FERRY_FAIL_AT");
+        run(root, workdir, request, stop, locks)
     }))
     .unwrap_or_else(|panic| {
         let what = panic
@@ -722,7 +765,9 @@ pub fn run_released(
             .unwrap_or_default();
         (Err(format!("supervisor panicked: {what}").into()), None)
     });
-    let terminal = executed.is_ok() && !stop.load(Ordering::SeqCst) && !client_lost();
+    // Only a recipe that reached its own result (or timed out) may leave the
+    // seat idle.
+    let terminal = matches!(executed, Ok(Ended::Result(_) | Ended::Timeout));
     let custody = crate::custody::release(root, request, terminal);
     Finished {
         executed,
@@ -739,15 +784,14 @@ pub fn run(
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
-    json: bool,
     locks: &[&fs::File],
-) -> (Result<(i32, bool)>, Option<Collection>) {
-    let outcome = run_session(root, workdir, request, stop, json, locks);
+) -> (Result<Ended>, Option<Collection>) {
+    let outcome = run_session(root, workdir, request, stop, locks);
     let collection = request
         .hooks
         .collect
         .as_ref()
-        .map(|hook| collect(root, workdir, request, hook, &outcome, json, locks));
+        .map(|hook| collect(root, workdir, request, hook, &outcome, locks));
     (outcome, collection)
 }
 
@@ -758,11 +802,10 @@ fn collect(
     workdir: &Path,
     request: &Request,
     hook: &str,
-    outcome: &Result<(i32, bool)>,
-    json: bool,
+    outcome: &Result<Ended>,
     locks: &[&fs::File],
 ) -> Collection {
-    let mut collection = match run_collect(root, workdir, request, hook, outcome, json, locks) {
+    let mut collection = match run_collect(root, workdir, request, hook, outcome, locks) {
         Ok((code, false)) => Collection {
             exit_code: Some(code),
             error: None,
@@ -799,8 +842,7 @@ fn run_collect(
     workdir: &Path,
     request: &Request,
     hook: &str,
-    outcome: &Result<(i32, bool)>,
-    json: bool,
+    outcome: &Result<Ended>,
     locks: &[&fs::File],
 ) -> Result<(i32, bool)> {
     {
@@ -813,7 +855,11 @@ fn run_collect(
             "env".into(),
             format!(
                 "FERRY_EXIT_CODE={}",
-                outcome.as_ref().map_or(125, |(code, _)| *code)
+                match outcome {
+                    Ok(Ended::Result(code)) => *code,
+                    Ok(Ended::Timeout) => 124,
+                    _ => 125,
+                }
             ),
             workdir
                 .join(hook)
@@ -821,20 +867,17 @@ fn run_collect(
                 .ok_or("non-UTF-8 collect path")?
                 .to_owned(),
         ];
-        collect.timeout_seconds = Some(60);
+        collect.timeout_seconds = Some(COLLECT_TIMEOUT.as_secs());
         // Collection has its own bounded session after recipe teardown, including
         // timeout or preparation failure. Never reinterpret the recipe verdict.
         if crate::seat::path(root, &request.seat).exists() {
             return Err("recipe teardown unconfirmed; collection not started".into());
         }
-        run_session(
-            root,
-            workdir,
-            &collect,
-            &AtomicBool::new(false),
-            json,
-            locks,
-        )
+        match run_session(root, workdir, &collect, &AtomicBool::new(false), locks)? {
+            Ended::Result(code) => Ok((code, false)),
+            Ended::Timeout => Ok((124, true)),
+            Ended::Stopped => Err("collection stopped".into()),
+        }
     }
 }
 
@@ -870,24 +913,41 @@ fn spawn_session(
     Ok((spawned, restored))
 }
 
+/// How a session ended: the recipe's own result, the timeout, or a stop
+/// (a signal or client loss) before either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    Result(i32),
+    Timeout,
+    Stopped,
+}
+
+/// How long the session teardown waits for members to leave before KILL.
+pub const SESSION_CLEANUP: Duration = Duration::from_secs(5);
+/// The collect hook's own bound.
+pub const COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a session's output readers get to finish after teardown, so
+/// its last lines precede the verdict; a stalled client never holds it.
+const READERS_GRACE: Duration = Duration::from_secs(2);
+
 fn run_session(
     root: &Path,
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
-    json: bool,
     locks: &[&fs::File],
-) -> Result<(i32, bool)> {
+) -> Result<Ended> {
     let run_dir = root.join("runs").join(&request.id);
     fs::create_dir_all(&run_dir)?;
     let spec = run_dir.join("request.json");
     fs::write(&spec, serde_json::to_vec(request)?)?;
     let result_path = run_dir.join("result.json");
-    let log = fs::File::create(run_dir.join("output.log"))?;
+    let log = std::sync::Arc::new(std::sync::Mutex::new(fs::File::create(
+        run_dir.join("output.log"),
+    )?));
     crate::seat::reserve(root, request)?;
     let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks)?;
     let mut child = spawned?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
     let stdout = child.stdout.take().ok_or("missing stdout")?;
     let stderr = child.stderr.take().ok_or("missing stderr")?;
     let mut owner = SessionOwner {
@@ -900,47 +960,41 @@ fn run_session(
     };
     // After the owner exists, so a failure here still tears the session down.
     restored?;
+    // Readers log each line and hand it to the output writer. They never
+    // touch this loop: output is data, and the loop is control.
+    let readers = Arc::new(AtomicUsize::new(2));
     for (stream, reader) in [
         ("stdout", Box::new(stdout) as Box<dyn std::io::Read + Send>),
         ("stderr", Box::new(stderr) as Box<dyn std::io::Read + Send>),
     ] {
-        let sender = sender.clone();
+        let log = log.clone();
+        let readers = readers.clone();
         thread::spawn(move || {
             for line in std::io::BufReader::new(reader).split(b'\n') {
-                match line {
-                    Ok(line) => {
-                        if sender.send((stream, line)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+                let Ok(line) = line else { break };
+                // The output log is a diagnostic: a failed write never ends the run.
+                if let Ok(mut log) = log.lock() {
+                    let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
                 }
+                relay(stream, &line);
             }
+            readers.fetch_sub(1, Ordering::SeqCst);
         });
     }
-    drop(sender);
     let start = Instant::now();
-    let mut log = log;
-    let mut timeout = false;
-    let code = loop {
+    let ended = loop {
         crate::custody::reap_adopted(owner.child.id());
-        while let Ok((stream, line)) = receiver.try_recv() {
-            // The output log is a diagnostic: a failed write never ends the run.
-            let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
-            relay(stream, &line, json);
-        }
-        if stop.load(Ordering::SeqCst) || client_lost() {
-            break interrupted_code();
+        if stop.load(Ordering::SeqCst) {
+            break Ended::Stopped;
         }
         if request
             .timeout_seconds
             .is_some_and(|t| start.elapsed() >= Duration::from_secs(t))
         {
-            timeout = true;
-            break 124;
+            break Ended::Timeout;
         }
         if let Ok(bytes) = fs::read(&result_path) {
-            break serde_json::from_slice::<i32>(&bytes)?;
+            break Ended::Result(serde_json::from_slice::<i32>(&bytes)?);
         }
         if let Some(status) = owner.child.try_wait()? {
             return Err(format!("session owner exited without result: {status}").into());
@@ -948,37 +1002,27 @@ fn run_session(
         thread::sleep(Duration::from_millis(20));
     };
     owner.cleanup()?;
-    for (stream, line) in receiver.try_iter() {
-        let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
-        if json {
-            relay(stream, &line, true);
-        }
+    let deadline = Instant::now() + READERS_GRACE;
+    while readers.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
     }
-    Ok((code, timeout))
+    Ok(ended)
 }
 
-/// Relays one line of recipe output. As an event, the line travels as `text`
+/// Relays one line of recipe output as an event. The line travels as `text`
 /// when it is UTF-8; otherwise also as `base64`, so a caller can write the
-/// exact bytes (older callers read the lossy `text`). A failed write marks
-/// the client lost; it never ends the run early by unwinding.
-fn relay(stream: &str, line: &[u8], json: bool) {
-    if json {
-        let mut event = serde_json::json!({
-            "protocol": receipt::PROTOCOL,
-            "event": "output",
-            "stream": stream,
-            "text": String::from_utf8_lossy(line),
-        });
-        if std::str::from_utf8(line).is_err() {
-            event["base64"] = receipt::base64(line).into();
-        }
-        emit(event.to_string().as_bytes());
-    } else if stream == "stdout" {
-        emit(line);
-    } else {
-        let mut err = std::io::stderr().lock();
-        let _ = err.write_all(line).and_then(|()| err.write_all(b"\n"));
+/// exact bytes (older callers read the lossy `text`).
+fn relay(stream: &str, line: &[u8]) {
+    let mut event = serde_json::json!({
+        "protocol": receipt::PROTOCOL,
+        "event": "output",
+        "stream": stream,
+        "text": String::from_utf8_lossy(line),
+    });
+    if std::str::from_utf8(line).is_err() {
+        event["base64"] = receipt::base64(line).into();
     }
+    crate::output::line(event.to_string().into_bytes());
 }
 
 pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
@@ -1065,4 +1109,83 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ended, StopCause, verdict};
+    use crate::receipt::Outcome;
+
+    #[test]
+    fn the_verdict_is_decided_once_by_the_first_terminal_fact() {
+        type Row = (
+            Result<Ended, String>,
+            Option<StopCause>,
+            bool,
+            Outcome,
+            i32,
+            Option<&'static str>,
+        );
+        let signal = Some(StopCause::Signal(2));
+        let lost = Some(StopCause::ClientLost);
+        let failed = || Err::<Ended, String>("boom".into());
+        let table: [Row; 10] = [
+            (Ok(Ended::Result(0)), None, true, Outcome::RanPass, 0, None),
+            (Ok(Ended::Result(3)), None, true, Outcome::RanFail, 3, None),
+            (Ok(Ended::Timeout), None, true, Outcome::Timeout, 124, None),
+            // A stop after the result is only noted.
+            (
+                Ok(Ended::Result(0)),
+                lost,
+                true,
+                Outcome::RanPass,
+                0,
+                Some("after the verdict: client lost: heartbeat EOF"),
+            ),
+            (
+                Ok(Ended::Timeout),
+                signal,
+                true,
+                Outcome::Timeout,
+                124,
+                Some("after the verdict: supervisor received SIGINT"),
+            ),
+            // A stop before it is lost, with the cause and its code.
+            (
+                Ok(Ended::Stopped),
+                signal,
+                true,
+                Outcome::Lost,
+                130,
+                Some("supervisor received SIGINT"),
+            ),
+            (
+                Ok(Ended::Stopped),
+                lost,
+                true,
+                Outcome::Lost,
+                255,
+                Some("client lost: heartbeat EOF"),
+            ),
+            (
+                failed(),
+                lost,
+                true,
+                Outcome::Lost,
+                255,
+                Some("client lost: heartbeat EOF; boom"),
+            ),
+            // Any other failure: lost after spawn, refused before.
+            (failed(), None, true, Outcome::Lost, 255, Some("boom")),
+            (failed(), None, false, Outcome::Refused, 125, Some("boom")),
+        ];
+        for (ended, cause, attempted, outcome, code, reason) in table {
+            let got = verdict(&ended, cause, attempted);
+            assert_eq!(
+                got,
+                (outcome, code, reason.map(str::to_owned)),
+                "{ended:?} {cause:?} {attempted}"
+            );
+        }
+    }
 }

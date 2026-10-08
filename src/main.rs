@@ -4,6 +4,7 @@ mod artifacts;
 mod config;
 mod custody;
 mod execution;
+mod output;
 mod receipt;
 mod repository;
 mod seat;
@@ -226,9 +227,14 @@ fn run(options: &Run) -> Result<i32> {
     {
         record.outcome = receipt::Outcome::Lost;
         record.exit_code = 128 + signal;
-        if record.reason.is_none() {
-            record.reason = Some(format!("caller received {}", signal_name(signal)));
-        }
+        // The caller's signal is the cause; what the host saw (its client
+        // lost) is a consequence, kept as a note.
+        let cause = format!("caller received {}", signal_name(signal));
+        record.reason = Some(match record.reason.take() {
+            Some(reason) if reason.starts_with(&cause) => reason,
+            Some(reason) => format!("{cause}; {reason}"),
+            None => cause,
+        });
     }
     record.elapsed_ms = receipt::now_ms() - start;
     receipt::save(&root, &record)?;
@@ -285,6 +291,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         lease: None,
         admission: None,
         provider_requires: vec![],
+        output_dropped: BTreeMap::default(),
     })
 }
 
@@ -373,7 +380,7 @@ fn main() {
     let code = match execute(Cli::parse()) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("ferry: {error}");
+            execution::warn(&format!("ferry: {error}"));
             125
         }
     };

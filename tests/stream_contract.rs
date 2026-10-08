@@ -167,10 +167,29 @@ fn a_killed_caller_still_gets_a_complete_host_record_and_a_released_seat() {
     assert_eq!(receipt(&next)["outcome"], "ran-pass", "{record}");
 }
 
+/// A process that holds a pipe and never reads it, for a stalled consumer.
+struct Stalled(std::process::Child);
+impl Stalled {
+    fn new() -> (Self, Stdio) {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pipe = Stdio::from(child.stdin.take().unwrap());
+        (Self(child), pipe)
+    }
+}
+impl Drop for Stalled {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
-fn a_closed_caller_pipe_stops_the_run_and_still_writes_a_receipt() {
+fn a_closed_caller_pipe_is_data_and_the_run_reaches_its_own_end() {
     let dir = fixture("while :; do echo tick; sleep 0.01; done", "");
-    let started = Instant::now();
     let out = Command::new("sh")
         .current_dir(dir.path())
         .env_remove("GIT_DIR")
@@ -178,16 +197,146 @@ fn a_closed_caller_pipe_stops_the_run_and_still_writes_a_receipt() {
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .arg("-c")
         .arg(format!(
-            "{} run probe --local | head -1",
+            "{} run probe --local --timeout-seconds 3 | head -1",
             env!("CARGO_BIN_EXE_ferry")
         ))
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "tick\n");
-    assert!(started.elapsed() < Duration::from_secs(60));
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    assert_eq!(record["outcome"], "timeout", "{record}");
+    assert_eq!(record["exit_code"], 124, "{record}");
+    assert!(
+        record["output_dropped"]["stdout"].as_u64().unwrap() > 0,
+        "{record}"
+    );
+    let next = ferry(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(receipt(&next)["outcome"], "ran-pass");
+}
+
+#[test]
+fn a_stalled_consumer_never_holds_the_supervisor_past_the_timeout() {
+    let dir = fixture("exec yes", "");
+    let (stalled, pipe) = Stalled::new();
+    let started = Instant::now();
+    let mut caller = ferry(dir.path())
+        .args(["run", "probe", "--local", "--timeout-seconds", "3"])
+        .stdout(pipe)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The host record is the truth, written while the consumer still stalls.
+    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let took = started.elapsed();
+    assert_eq!(host["outcome"], "timeout", "{host}");
+    assert_eq!(host["exit_code"], 124, "{host}");
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(
+        caller.try_wait().unwrap().is_none(),
+        "the consumer was stalled"
+    );
+    drop(stalled);
+    assert_eq!(caller.wait().unwrap().code(), Some(124));
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    assert_eq!(record["outcome"], "timeout", "{record}");
+}
+
+#[test]
+fn a_signal_stops_a_run_whose_consumer_stalls() {
+    let dir = fixture("exec yes", "");
+    let (stalled, pipe) = Stalled::new();
+    let mut caller = ferry(dir.path())
+        .args(["run", "probe", "--local", "--timeout-seconds", "60"])
+        .stdout(pipe)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    let signalled = Instant::now();
+    kill(
+        Pid::from_raw(i32::try_from(caller.id()).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+    let mut code = None;
+    wait_until("the signalled caller ended", || {
+        code = caller.try_wait().unwrap().map(|status| status.code());
+        code.is_some()
+    });
+    assert!(signalled.elapsed() < Duration::from_secs(30));
+    assert_eq!(code.flatten(), Some(130));
     let record = only_record(&dir.path().join(".ferry/receipts"));
     assert_eq!(record["outcome"], "lost", "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("SIGINT"),
+        "{record}"
+    );
+    drop(stalled);
+}
+
+#[test]
+fn a_closed_caller_stderr_is_dropped_and_counted_not_a_stop() {
+    let dir = fixture(
+        "i=0; while [ $i -lt 20 ]; do echo err >&2; i=$((i+1)); done; echo done",
+        "",
+    );
+    let mut caller = ferry(dir.path())
+        .args(["run", "probe", "--local"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(caller.stderr.take());
+    let out = caller.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"done\n");
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["output_dropped"]["stderr"], 20, "{record}");
+}
+
+#[test]
+fn a_host_that_cannot_write_still_delivers_its_verdict_through_the_record() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo hidden", "");
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "output-write")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("host record"),
+        "{record}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("hidden"));
+}
+
+#[test]
+fn a_panic_inside_the_run_still_reaches_custody_release() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo never", "");
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "run-panic")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
     assert!(!record["custody"].is_null(), "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("panicked"),
+        "{record}"
+    );
+    assert_ne!(record["outcome"], "ran-pass", "{record}");
     let next = ferry(dir.path())
         .args(["run", "pass", "--local", "--json"])
         .output()
