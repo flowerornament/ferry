@@ -73,6 +73,22 @@ there.
 1. `jj describe -m "ferry: subject (ferry-xxx)"`, then `just land`.
 2. `bd close <id>`, then `bd dolt push`.
 
+## Design gate
+
+Design questions are decided by `docs/principles.md`. Every freeze description
+states:
+
+1. which principles it touches;
+2. which core-model concepts and synchronizations it changes;
+3. the lock rank of any lock it takes;
+4. its fallible points, each with an injection test;
+5. the record fields it adds;
+6. the capability name of any host behaviour it changes;
+7. which environment cells passed (Darwin and Linux Nix check, bench, a Mac host).
+
+A change that needs a principle to bend amends `docs/principles.md` first, in
+its own reviewed change.
+
 ## Specs
 
 Designs live in `docs/specs/`, one dated file per decision, each referencing
