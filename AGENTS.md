@@ -22,39 +22,56 @@ not branches in Ferry. Recipe requirements have one home in the project catalog.
 Keep receipts honest: focused controls are not project gates, and remote
 evidence does not certify Herald's local `just land`.
 
-## Version Control
+## Version control: jj, one workspace per agent
 
-This project uses jj, colocated with git. The `main` bookmark is the only
-landed history; jj records edits continuously, so there is nothing to stage.
-When more than one agent writes, each gets its own jj workspace
-(`jj workspace add --name ferry-1a ../ferry-1a`); no agent then edits code in
-this colocated checkout.
+```text
+~/code/ferry      colocated checkout (.git + .jj): bd home, the git object store.
+                  No agent edits code here.
+~/code/ferry-1a   jj workspace: coordinator (reviews, gives GO, installs)
+~/code/ferry-1b   jj workspace: implementer
+```
 
-- Work: `jj new main`, edit, `jj describe -m "ferry: subject"`. Pick up
-  others' landings with `jj rebase -d main`.
-- Land: `just land` runs `just check` on exactly the described change, then
-  moves `main` to it. It refuses undescribed work, a stale parent, and any
-  edit made while the check ran. With no `origin` remote it pushes nothing;
-  never add a remote or run `jj git push` yourself.
-- Every description gains `Jj-Workspace:`, `Agent:` and `Session:` trailers
-  from `scripts/jj-identity`, which a SessionStart hook runs. Do not type or
-  strip them.
-- Git runs only in this checkout, and only to read. A jj workspace has no
-  `.git`, and `~/.git` exists, so git there silently answers about the home
-  directory. Never run a mutating git command.
-- Staleness: when another agent rewrites a commit under your `@`, run
-  `jj workspace update-stale`. Never `jj edit` an ancestor of another
-  workspace's `@`.
-- Stop a process only by its exact pid, or a process group you created and
-  recorded. Never `pkill -f`, `killall` or any name or pattern match: this Mac
-  and bench are shared by many agents' seats, and a pattern kills theirs.
-- Recovery starts at `jj op log`, `jj undo` and `jj op restore`, before any
-  destructive file operation. The `jj-ops` skill holds the jj model.
+Each agent gets its own workspace, so it never snapshots another agent's
+half-finished edits. hail names a seat after the jj root, so each workspace
+is also a hail address: `hail ferry-1b ask '…'` reaches the agent working
+there.
 
-## Completion
+- **Work:** `jj new main`, edit, then `jj describe -m "ferry: subject
+  (ferry-xxx)"`. To pick up others' work, run `jj rebase -d main`.
+- **Publish:** `just land`. It runs `just check` on your change, together
+  with any described commits beneath it, and only then moves `main`. It
+  refuses undescribed commits in the range, a stale parent, and any edit made
+  while the check ran. With no `origin` remote it pushes nothing: ferry is
+  local-only, so never add a remote or run `jj git push`. The implementer
+  lands after the coordinator's GO; contract changes also need the consumer
+  reviewers' GO (murail-2a, murail-4a), by execution.
+- **Install:** only landed commits install, through `scripts/ferry-install`
+  on hosts and the caller's Nix configuration (RELEASE.md). Announce a window
+  to the seats that run Ferry first, and qualify with `just qualify-install`.
+- **Trailers:** a SessionStart hook (`scripts/jj-identity`) adds
+  `Jj-Workspace:`, `Agent:` and `Session:` to every description. Don't type
+  or strip them.
+- **Git:** run it only in `~/code/ferry`, and only to read. A workspace has
+  no `.git`, and `~/.git` exists, so git in a workspace silently answers
+  about your home directory. (`scripts/ferry-install` and `qualify-install`
+  use git to read and push commits; run them from `~/code/ferry`.)
+- **Processes:** stop a process only by its exact pid, or a process group you
+  created and recorded. Never `pkill -f`, `killall` or any name or pattern
+  match: this Mac and bench are shared by many agents' seats, and a pattern
+  kills theirs.
+- **Stale workspace:** when another agent rewrites a commit under your `@`,
+  jj refuses until you run `jj workspace update-stale`. Never `jj edit` a
+  change that is an ancestor of another workspace's `@`.
+- **Recovery:** start with `jj op log`, `jj undo` or `jj op restore`, before
+  any destructive file operation. The `jj-ops` skill has the full model.
+- **New workspace:** run `just workspace-add ferry-<pair><letter>` in
+  `~/code/ferry`. It also points bd and Claude's memory at the main checkout.
+  `jj workspace list` is the roster.
 
-`jj describe -m "ferry: subject"`, then `just land`. Work is not complete
-until `just land` succeeds.
+## Done means landed
+
+1. `jj describe -m "ferry: subject (ferry-xxx)"`, then `just land`.
+2. `bd close <id>`, then `bd dolt push`.
 
 ## Issues
 

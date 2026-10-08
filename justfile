@@ -14,3 +14,7 @@ land *args:
 # Drill the install procedure for <rev> on <host> in a scratch root (live install untouched)
 qualify-install host rev:
     scripts/qualify-install {{host}} {{rev}}
+
+# Add a jj workspace for one more agent (run in ~/code/ferry): ../<name>, with bd and Claude memory linked
+workspace-add name:
+    scripts/workspace-add.sh {{quote(name)}}
