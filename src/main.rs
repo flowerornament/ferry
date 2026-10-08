@@ -352,5 +352,6 @@ fn main() {
             125
         }
     };
+    transport::close_connections();
     std::process::exit(code);
 }

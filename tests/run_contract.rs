@@ -725,7 +725,7 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
     fs::create_dir_all(host.join(".local/bin")).unwrap();
     fs::create_dir_all(&tools).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
-    fs::write(tools.join("ssh"), "#!/bin/sh\ncase \"$*\" in *BatchMode=yes*ControlMaster=auto*ControlPersist=60*ControlPath=*) ;; *) exit 125;; esac\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nunset APP_ALLOWED\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\ncase \"$*\" in *BatchMode=yes*ControlMaster=auto*ControlPersist=10*ControlPath=*/.cache/ferry/ssh/*|*BatchMode=yes*ControlMaster=no*ControlPath=none*) ;; *) exit 125;; esac\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nunset APP_ALLOWED\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let hook_marker = dir.path().join("pre-push-ran");
     let hook = dir.path().join(".git/hooks/pre-push");

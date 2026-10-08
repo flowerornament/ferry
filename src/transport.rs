@@ -17,31 +17,124 @@ use std::{
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-fn ssh_options() -> Result<Vec<String>> {
+/// This process's SSH control directory. Each caller process multiplexes its
+/// own SSH commands over one connection per destination that it alone owns: a
+/// run never rides on a connection another run opened, whose transport (a
+/// `ProxyJump` helper, say) lives in that other caller's process group and
+/// dies with it.
+fn control_directory() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?)
+            .join(".cache/ferry/ssh")
+            .join(std::process::id().to_string()),
+    )
+}
+
+/// The longest Unix socket path every supported platform accepts (macOS:
+/// 104 bytes with the terminator), less the 17 bytes of the temporary name
+/// ssh binds before renaming it into place.
+const SOCKET_PATH_BUDGET: usize = 103 - 17;
+
+/// This caller's control socket for `destination`, or `None` when its path
+/// would be too long for a Unix socket.
+fn control_socket(destination: &str) -> Result<Option<String>> {
+    // A short name of our own instead of ssh's 40-hex %C keeps the path in
+    // budget; one caller talks to a handful of destinations at most.
+    let socket = control_directory()?.join(&receipt::digest(destination.as_bytes())[..16]);
+    let socket = socket.to_str().ok_or("non-UTF-8 SSH control path")?;
+    Ok((socket.len() <= SOCKET_PATH_BUDGET).then(|| socket.to_owned()))
+}
+
+fn ssh_options(destination: &str) -> Result<Vec<String>> {
     use std::os::unix::fs::PermissionsExt;
-    let directory =
-        PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join(".cache/ferry/ssh");
+    static PREPARED: std::sync::Once = std::sync::Once::new();
+    let Some(socket) = control_socket(destination)? else {
+        // Multiplexing only saves handshakes: without a usable socket path
+        // (a long HOME), every command opens its own connection.
+        return Ok(vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "ControlPath=none".into(),
+        ]);
+    };
+    let directory = control_directory()?;
+    let parent = directory.parent().ok_or("invalid SSH control directory")?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    PREPARED.call_once(|| {
+        // A directory with this pid can only be left by a dead process.
+        let _ = fs::remove_dir_all(&directory);
+        prune_dead(parent);
+    });
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    let socket = directory.join("%C");
     Ok(vec![
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
-        "ControlPersist=60".into(),
+        // Bounds how long a master outlives a caller that was killed.
+        "ControlPersist=10".into(),
         "-o".into(),
-        format!(
-            "ControlPath={}",
-            socket.to_str().ok_or("non-UTF-8 SSH control path")?
-        ),
+        format!("ControlPath={socket}"),
     ])
 }
 
-fn ssh() -> Result<Command> {
+/// Removes the empty control directories of callers that are gone (a killed
+/// caller leaves one). A non-empty directory, or one whose pid is alive, is
+/// left alone.
+fn prune_dead(parent: &Path) {
+    for entry in fs::read_dir(parent).into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+            == Err(nix::errno::Errno::ESRCH)
+        {
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+}
+
+/// Closes this process's SSH connections and removes its control directory.
+/// Called as the caller exits; each close waits at most 2 s. A killed
+/// caller's master exits by itself after its `ControlPersist` idle time.
+pub fn close_connections() {
+    let Ok(directory) = control_directory() else {
+        return;
+    };
+    for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+        let Ok(mut close) = Command::new("ssh")
+            .arg("-S")
+            .arg(entry.path())
+            .args(["-O", "exit", "ferry-control"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while matches!(close.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if matches!(close.try_wait(), Ok(None)) {
+            let _ = close.kill();
+            let _ = close.wait();
+        }
+    }
+    let _ = fs::remove_dir_all(&directory);
+}
+
+/// An SSH command to `destination`, over this caller's own connection.
+fn ssh(destination: &str) -> Result<Command> {
     let mut command = Command::new("ssh");
-    command.args(ssh_options()?);
+    command.args(ssh_options(destination)?).arg(destination);
     Ok(command)
 }
 
@@ -86,7 +179,7 @@ pub fn host_info() -> Result<HostInfo> {
 
 fn push(root: &Path, ssh: &str, store: &str, reference: &str) -> Result<()> {
     let ssh_command = std::iter::once("ssh".to_owned())
-        .chain(ssh_options()?)
+        .chain(ssh_options(ssh)?)
         .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ");
@@ -115,7 +208,7 @@ pub fn mirror(
         let store = format!(".local/state/ferry/mirrors/{key}.git");
         if let Some(host) = host {
             config::identifier(&host.ssh)?;
-            repository::output(ssh()?.arg(&host.ssh).arg(format!(
+            repository::output(ssh(&host.ssh)?.arg(format!(
                 "mkdir -p .local/state/ferry/mirrors; test -d {store} || git init --bare {store}"
             )))?;
             push(
@@ -164,7 +257,7 @@ fn pin_mirror(store: &str, commit: &str, host: Option<&config::Machine>) -> Resu
             .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
             .collect::<Vec<_>>()
             .join(" ");
-        repository::output(ssh()?.arg(&host.ssh).arg(command))?;
+        repository::output(ssh(&host.ssh)?.arg(command))?;
     } else {
         repository::output(Command::new("sh").args(["-c", script, "ferry-mirror", store, commit]))?;
     }
@@ -412,9 +505,7 @@ pub fn remote(
     record.outcome = Outcome::Lost;
     record.exit_code = 255;
     let info: HostInfo = serde_json::from_slice(&repository::output(
-        ssh()?
-            .arg(&machine.ssh)
-            .arg(format!("{} host-info", machine.binary)),
+        ssh(&machine.ssh)?.arg(format!("{} host-info", machine.binary)),
     )?)?;
     if let Err(missing) = receipt::provides(&request.provider_requires, &info.capabilities) {
         refused_by(record, &info);
@@ -436,7 +527,7 @@ pub fn remote(
             return Err("reported host architecture does not meet requirements".into());
         }
     }
-    repository::output(ssh()?.arg(&machine.ssh).arg("mkdir -p .local/state/ferry; test -d .local/state/ferry/repo.git || git init --bare .local/state/ferry/repo.git"))?;
+    repository::output(ssh(&machine.ssh)?.arg("mkdir -p .local/state/ferry; test -d .local/state/ferry/repo.git || git init --bare .local/state/ferry/repo.git"))?;
     push(
         root,
         &machine.ssh,
@@ -450,8 +541,7 @@ pub fn remote(
     let stop = execution::stopped()?;
     // The last moment before the host is asked to run anything.
     execution::interrupted()?;
-    let child = ssh()?
-        .arg(&machine.ssh)
+    let child = ssh(&machine.ssh)?
         .arg(format!("{} host-run", machine.binary))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -613,8 +703,7 @@ fn accept_result(
         fs::create_dir_all(&destination)?;
         let archive = destination.join("artifacts.tar");
         let file = fs::File::create(&archive)?;
-        let status = ssh()?
-            .arg(&machine.ssh)
+        let status = ssh(&machine.ssh)?
             .arg(format!(
                 "cat .local/state/ferry/runs/{}/artifacts.tar",
                 request.id
