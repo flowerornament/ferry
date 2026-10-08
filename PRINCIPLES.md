@@ -8,8 +8,17 @@ file.
 
 ## Principles
 
-1. **Ownership follows lifetime.** A process belongs to whatever shares its
-   lifetime. A run owns only what should end with it.
+1. **Ownership follows lifetime, for processes and files.** A run owns only
+   what should end with it. Every file Ferry creates has one declared
+   lifetime and lives under Ferry's roots:
+   - **run** (scratch `FERRY_TMP`, request files): removed at release, so
+     nothing is left behind;
+   - **cache** (seat checkouts, `caches/<seat>/`): regenerable, removed only
+     under host policy;
+   - **record** (receipts, host records, run output): kept until the
+     operator's retention says otherwise.
+
+   Ferry writes nowhere else. Anything else is its creator's to clean up.
 2. **Ferry owns nothing longer than a run.** No daemons, keep-alives or
    lifecycles beyond an attempt. What persists is files (seats, caches,
    records), repositories, or the operator's host services.
