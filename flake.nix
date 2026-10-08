@@ -7,10 +7,12 @@
     let
       systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
       eachSystem = nixpkgs.lib.genAttrs systems;
+      pkgsFor = system: import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
+      rustFor = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       package = system:
         let
-          pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
-          rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          pkgs = pkgsFor system;
+          rust = rustFor pkgs;
           rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
         in pkgs.callPackage ./package.nix {
           inherit rustPlatform;
@@ -23,5 +25,16 @@
         default = { type = "app"; program = "${self.packages.${system}.default}/bin/ferry"; };
       });
       checks = eachSystem (system: { package = self.packages.${system}.default; });
+      # Everything `just check` and the contract tests need, on any machine
+      # with Nix: the recipes run in it, so no host needs these installed.
+      devShells = eachSystem (system:
+        let pkgs = pkgsFor system; in {
+          default = pkgs.mkShell {
+            packages = [ (rustFor pkgs) pkgs.just pkgs.git pkgs.jujutsu pkgs.python3 pkgs.inetutils pkgs.openssh ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.procps pkgs.util-linux ];
+            # git never discovers a repository at or above $HOME (a stray ~/.git).
+            shellHook = ''export GIT_CEILING_DIRECTORIES="$HOME"'';
+          };
+        });
     };
 }
