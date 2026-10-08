@@ -603,6 +603,7 @@ fn unconfirmed_cleanup_quarantines_the_host_before_dispatch() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     use std::{
         thread,
@@ -661,10 +662,42 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     )
     .unwrap();
     caller.child.as_mut().unwrap().wait().unwrap();
-    let out = run(
-        dir.path(),
-        &["run", "pass", "--local", "--json", "--timeout-seconds", "1"],
+    // The session inherited the seat lock and host lease: they stay held
+    // while the recipe lives, though its supervisor is gone.
+    let locks = dir.path().join(".ferry/local/locks");
+    let held = |name: &str| {
+        let probe = fs::File::open(locks.join(name)).unwrap();
+        match fs2::FileExt::try_lock_exclusive(&probe) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(e) => panic!("probing {name}: {e}"),
+        }
+    };
+    assert!(held(seat), "the seat lock freed while the recipe lives");
+    assert!(
+        held("host-exclusive"),
+        "the host lease freed while the recipe lives"
     );
+    // A new run on the seat waits for it rather than starting beside it.
+    let mut next = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .args(["run", "pass", "--local", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(1000));
+    assert!(
+        next.try_wait().unwrap().is_none(),
+        "a run started beside a live recipe"
+    );
+    let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(ownership.exists());
+    fs::write(&release, "finish").unwrap();
+    // Once the session is gone, the waiting run takes the seat and refuses:
+    // the dead supervisor's owner marker remains until recovery.
+    let out = next.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(125));
     assert!(
         receipt(&out)["reason"]
@@ -672,10 +705,6 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
             .unwrap()
             .contains("seat recover")
     );
-    let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
-    assert_eq!(out.status.code(), Some(125));
-    assert!(ownership.exists());
-    fs::write(&release, "finish").unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
@@ -1262,68 +1291,247 @@ fn a_normal_release_records_the_seat_idle_where_custody_is_supported() {
     assert!(seat_record(dir.path(), "taint").is_none());
 }
 
+/// Commits a recipe `escape` running `script` (and an optional collect hook),
+/// runs it locally, and returns its receipt and elapsed time.
 #[cfg(target_os = "linux")]
-#[test]
-fn an_escaped_descendant_taints_the_seat_instead_of_leaving_it_idle() {
-    escaped_descendant_taints(None);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn a_blind_diagnostic_never_turns_a_live_child_into_idle() {
-    // /proc shows nothing, but the kernel still reports the live child.
-    escaped_descendant_taints(Some("/nonexistent"));
-}
-
-#[cfg(target_os = "linux")]
-fn escaped_descendant_taints(diagnostic_proc: Option<&str>) {
-    use std::{thread, time::Duration};
-    let dir = fixture();
-    // The escapee leaves the session, drops its environment, descriptors and
-    // directory, and uses the cache only later, by path.
-    fs::write(
-        dir.path().join("ferry.toml"),
-        "version=1\n[recipe.escape]\ncommand=['sh','-c','command -v setsid >/dev/null || exit 97; late=\"$FERRY_CACHE_DIR/late\"; nap=$(command -v sleep); mark=$(command -v touch); setsid env -i sh -c \"exec </dev/null >/dev/null 2>&1; cd /; $nap 5; $mark $late\" & exit 0']\n",
+fn run_escape(
+    dir: &Path,
+    script: &str,
+    collect: Option<&str>,
+    diagnostic_proc: Option<&str>,
+) -> (Output, std::time::Duration) {
+    let mut config = String::from("version=1\n");
+    if let Some(hook) = collect {
+        fs::write(dir.join("collect"), hook).unwrap();
+        fs::set_permissions(dir.join("collect"), fs::Permissions::from_mode(0o755)).unwrap();
+        git(dir, &["add", "collect"]);
+        config.push_str("[hooks]\ncollect='collect'\n");
+    }
+    let recipe = toml::to_string(
+        &serde_json::json!({"recipe": {"escape": {"command": ["sh", "-c", script]}}}),
     )
     .unwrap();
-    git(dir.path(), &["add", "ferry.toml"]);
-    git(dir.path(), &["commit", "-m", "escape"]);
+    config.push_str(&recipe);
+    fs::write(dir.join("ferry.toml"), config).unwrap();
+    git(dir, &["add", "ferry.toml"]);
+    git(dir, &["commit", "-m", "escape"]);
     let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
     command
-        .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .current_dir(dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
         .args(["run", "escape", "--local", "--json"]);
     if let Some(proc_root) = diagnostic_proc {
         command.env("FERRY_DIAGNOSTIC_PROC", proc_root);
     }
+    let started = std::time::Instant::now();
     let out = command.output().unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let record = receipt(&out);
-    let custody = &record["custody"];
-    assert_eq!(custody["record"], "taint", "{custody}");
-    let survivors = custody["census"]["survivors"].as_array().unwrap();
-    assert_eq!(survivors.is_empty(), diagnostic_proc.is_some(), "{custody}");
-    assert!(seat_record(dir.path(), "idle").is_none());
-    assert!(seat_record(dir.path(), "taint").is_some());
-    // The escapee really was alive and did use the cache afterwards.
-    thread::sleep(Duration::from_secs(7));
-    let caches = fs::read_dir(dir.path().join(".ferry/local/caches"))
+    (out, started.elapsed())
+}
+
+/// A setsid escapee that drops environment, descriptors and directory, then
+/// uses the cache by path after a delay.
+#[cfg(target_os = "linux")]
+const ESCAPEE: &str = "command -v setsid >/dev/null || exit 97; late=\"$FERRY_CACHE_DIR/late\"; nap=$(command -v sleep); mark=$(command -v touch); setsid env -i sh -c \"exec </dev/null >/dev/null 2>&1; cd /; $nap 5; $mark $late\" & exit 0";
+
+#[cfg(target_os = "linux")]
+fn late_mark(dir: &Path) -> bool {
+    let caches = fs::read_dir(dir.join(".ferry/local/caches"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
         .path();
-    assert!(caches.join("late").exists());
-    for pid in survivors {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(i32::try_from(pid.as_i64().unwrap()).unwrap()),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
+    caches.join("late").exists()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_escaped_descendant_is_stopped_at_release_and_the_seat_is_idle() {
+    use std::{thread, time::Duration};
+    let dir = fixture();
+    let (out, _) = run_escape(dir.path(), ESCAPEE, None, None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let custody = receipt(&out)["custody"].clone();
+    assert!(
+        !custody["census"]["survivors"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{custody}"
+    );
+    assert!(
+        !custody["stopped"].as_array().unwrap().is_empty(),
+        "{custody}"
+    );
+    assert_eq!(custody["after"], "empty", "{custody}");
+    assert_eq!(custody["record"], "idle", "{custody}");
+    let idle = seat_record(dir.path(), "idle").unwrap();
+    assert_eq!(idle["stopped"], custody["stopped"]);
+    assert!(seat_record(dir.path(), "taint").is_none());
+    // Stopped before it could use the cache.
+    thread::sleep(Duration::from_secs(7));
+    assert!(!late_mark(dir.path()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_term_ignoring_survivor_is_killed_after_the_grace_period() {
+    let dir = fixture();
+    let script = "command -v setsid >/dev/null || exit 97; setsid sh -c 'trap \"\" TERM; exec </dev/null >/dev/null 2>&1; while :; do sleep 0.1; done' & exit 0";
+    let (out, elapsed) = run_escape(dir.path(), script, None, None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let custody = receipt(&out)["custody"].clone();
+    assert_eq!(custody["record"], "idle", "{custody}");
+    assert_eq!(custody["after"], "empty", "{custody}");
+    assert!(elapsed >= std::time::Duration::from_secs(10), "{elapsed:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blind_diagnostic_cannot_attribute_survivors_so_the_seat_is_tainted() {
+    use std::{thread, time::Duration};
+    // /proc shows nothing, but the kernel still reports the live child: it
+    // cannot be stopped by pid, so the seat is tainted and refuses.
+    let dir = fixture();
+    let (out, _) = run_escape(dir.path(), ESCAPEE, None, Some("/nonexistent"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let custody = receipt(&out)["custody"].clone();
+    assert_eq!(custody["record"], "taint", "{custody}");
+    assert!(custody["stopped"].is_null(), "{custody}");
+    assert!(seat_record(dir.path(), "idle").is_none());
+    let taint = seat_record(dir.path(), "taint").unwrap();
+    let again = run(dir.path(), &["run", "escape", "--local", "--json"]);
+    assert_eq!(again.status.code(), Some(125));
+    assert!(
+        receipt(&again)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("tainted"),
+        "{}",
+        receipt(&again)
+    );
+    // Not stopped: the escapee did use the cache afterwards.
+    thread::sleep(Duration::from_secs(7));
+    assert!(late_mark(dir.path()));
+    assert_eq!(taint["survivors"], serde_json::json!([]));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn collect_runs_before_survivors_are_stopped_and_its_failure_is_recorded() {
+    let dir = fixture();
+    let pidfile = dir.path().join("escapee.pid");
+    let seen = dir.path().join("collect-saw");
+    let script = format!(
+        "command -v setsid >/dev/null || exit 97; setsid sh -c 'echo $$ > {pid}; exec </dev/null >/dev/null 2>&1; while :; do sleep 0.1; done' & while [ ! -s {pid} ]; do sleep 0.05; done; exit 0",
+        pid = pidfile.display()
+    );
+    let hook = format!(
+        "#!/bin/sh\nif kill -0 \"$(cat {pid})\" 2>/dev/null; then echo alive > {seen}; else echo gone > {seen}; fi\nexit 3\n",
+        pid = pidfile.display(),
+        seen = seen.display()
+    );
+    let (out, _) = run_escape(dir.path(), &script, Some(&hook), None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(fs::read_to_string(&seen).unwrap().trim(), "alive");
+    let record = receipt(&out);
+    assert_eq!(record["collection"]["exit_code"], 3, "{record}");
+    assert_eq!(record["custody"]["record"], "idle", "{record}");
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        record["custody"]["stopped"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(pid)),
+        "{record}"
+    );
+    assert!(
+        kill(Pid::from_raw(pid), None).is_err(),
+        "the escapee survived"
+    );
+}
+
+/// The internal name of the only seat a local run has used.
+fn local_seat(dir: &Path) -> String {
+    fs::read_dir(dir.join(".ferry/local/locks"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|name| !name.starts_with("host-") && !name.starts_with("cleanup-pending-"))
+        .unwrap()
+}
+
+#[test]
+fn a_tainted_seat_refuses_until_recovery_proves_its_survivors_gone() {
+    let dir = fixture();
+    assert!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .success()
+    );
+    let seat = local_seat(dir.path());
+    let taint = dir.path().join(format!(".ferry/local/taint/{seat}.json"));
+    fs::create_dir_all(taint.parent().unwrap()).unwrap();
+    // The survivor is this test process itself: live, and fatal to the
+    // control if recovery ever killed it. Spawning a long-lived helper here
+    // could inherit other tests' output pipes on macOS and stall them.
+    let pid = std::process::id();
+    let write_taint = |start: serde_json::Value| {
+        fs::write(
+            &taint,
+            serde_json::json!({"id": "earlier", "reason": "descendants survived the session",
+                "pids": [pid], "survivors": [{"pid": pid, "start": start}]})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    // Without a start time, any live process with the pid is the survivor.
+    write_taint(serde_json::Value::Null);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("tainted") && reason.contains("seat recover"),
+        "{reason}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
+    // Recovery refuses while the survivor lives, and never kills it.
+    let out = run(dir.path(), &["seat", "recover", &seat, "--local"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(taint.exists());
+    // A recorded start time that differs means the pid was reused: gone.
+    write_taint(serde_json::json!(1));
+    let out = run(dir.path(), &["seat", "recover", &seat, "--local"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!taint.exists());
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success());
 }
 
 /// Runs of the `hold` recipe that a lease test spawned. Dropping it releases
@@ -1747,10 +1955,12 @@ fn an_unreadable_custody_marker_leaves_the_seat_alone() {
     );
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
     fs::set_permissions(state.join("taint"), fs::Permissions::from_mode(0o755)).unwrap();
+    // The run's own seat cannot be confirmed untainted either, so it refuses
+    // before admission measures or evicts anything.
     assert_eq!(out.status.code(), Some(125));
-    let admission = &receipt(&out)["admission"];
-    assert_eq!(admission["evicted"], serde_json::json!([]), "{admission}");
-    assert_eq!(admission["skipped"]["unknown"], 1, "{admission}");
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused");
+    assert!(record["admission"].is_null(), "{record}");
     assert!(state.join("caches/hidden/cargo-target/deps/blob").exists());
 }
 

@@ -386,7 +386,8 @@ pub fn host_run() -> Result<i32> {
         event(
             &serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit,"seat":request.seat}),
         );
-        let executed = execution::run(&root, &seat, &request, &stop, true);
+        let locks: Vec<&fs::File> = std::iter::once(&lease).chain(host_lease.files()).collect();
+        let executed = execution::run(&root, &seat, &request, &stop, true, &locks);
         result.collection = execution::collection(&root, &request)?;
         let (code, timeout) = executed?;
         result.exit_code = code;
@@ -464,7 +465,8 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     if json {
         event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
     }
-    let executed = execution::run(&state, &seat, request, &stop, json);
+    let locks: Vec<&fs::File> = std::iter::once(&lease).chain(host_lease.files()).collect();
+    let executed = execution::run(&state, &seat, request, &stop, json, &locks);
     record.collection = execution::collection(&state, request)?;
     let (code, timeout) = executed.inspect_err(|_| {
         if execution::attempted(&state, request) {

@@ -252,7 +252,7 @@ fn acquire_as(path: &Path, stop: &AtomicBool, shared: bool) -> Result<fs::File> 
 /// covers sessions under this state root only: not other users, processes
 /// outside Ferry, or other machines sharing the hardware.
 pub struct HostLease {
-    _held: Vec<fs::File>,
+    held: Vec<fs::File>,
     pub record: Lease,
 }
 
@@ -270,6 +270,10 @@ pub struct Lease {
 }
 
 impl HostLease {
+    /// The lock descriptors this lease holds, for a session to inherit.
+    pub fn files(&self) -> impl Iterator<Item = &fs::File> {
+        self.held.iter()
+    }
     /// The lease record, stamped with the release time; the lease itself is
     /// released when this value is dropped.
     pub fn release(self) -> Lease {
@@ -295,7 +299,7 @@ impl HostLease {
             vec![host]
         };
         Ok(Self {
-            _held: held,
+            held,
             record: Lease {
                 mode: if exclusive { "exclusive" } else { "shared" }.into(),
                 wait_ms: started.elapsed().as_millis(),
@@ -316,6 +320,7 @@ pub fn prepare(
     fs::create_dir_all(root.join("locks"))?;
     let lease = acquire(&root.join("locks").join(&request.seat), stop)?;
     crate::seat::check(root, &request.seat, root.ends_with("local"))?;
+    crate::custody::check(root, &request.seat, root.ends_with("local"))?;
     crate::custody::begin(root, &request.seat)?;
     for entry in fs::read_dir(root.join("locks"))? {
         if entry?
@@ -586,14 +591,30 @@ pub fn attempted(root: &Path, request: &Request) -> bool {
         .exists()
 }
 
+/// Sets or clears close-on-exec on a lock descriptor.
+fn close_on_exec(file: &fs::File, close: bool) -> Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    let flags = if close {
+        FdFlag::FD_CLOEXEC
+    } else {
+        FdFlag::empty()
+    };
+    fcntl(file, FcntlArg::F_SETFD(flags))?;
+    Ok(())
+}
+
+/// Runs the recipe session, then the collect hook's. `locks` are the seat
+/// lock and host lease descriptors: each session inherits them, so they stay
+/// held while the session lives even if this supervisor is killed.
 pub fn run(
     root: &Path,
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
     json: bool,
+    locks: &[&fs::File],
 ) -> Result<(i32, bool)> {
-    let outcome = run_session(root, workdir, request, stop, json);
+    let outcome = run_session(root, workdir, request, stop, json, locks);
     if let Some(hook) = &request.hooks.collect {
         let mut collect = request.clone();
         collect.id = receipt::run_id()?;
@@ -618,7 +639,14 @@ pub fn run(
         let result = if crate::seat::path(root, &request.seat).exists() {
             Err("recipe teardown unconfirmed; collection not started".into())
         } else {
-            run_session(root, workdir, &collect, &AtomicBool::new(false), json)
+            run_session(
+                root,
+                workdir,
+                &collect,
+                &AtomicBool::new(false),
+                json,
+                locks,
+            )
         };
         let collection = match result {
             Ok((code, false)) => Collection {
@@ -656,12 +684,39 @@ pub fn collection(root: &Path, request: &Request) -> Result<Option<Collection>> 
     }
 }
 
+/// Spawns the session owner with the locks inherited. Only the session
+/// inherits them: they close on exec again at once, so no other child of
+/// this supervisor (git, for one) can keep them. Returns the spawn, and
+/// whether close-on-exec was restored.
+fn spawn_session(
+    workdir: &Path,
+    spec: &Path,
+    result_path: &Path,
+    locks: &[&fs::File],
+) -> Result<(std::io::Result<std::process::Child>, Result<()>)> {
+    for lock in locks {
+        close_on_exec(lock, false)?;
+    }
+    let spawned = Command::new(std::env::current_exe()?)
+        .arg("execute-session")
+        .arg(spec)
+        .arg(result_path)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let restored = locks.iter().try_for_each(|lock| close_on_exec(lock, true));
+    Ok((spawned, restored))
+}
+
 fn run_session(
     root: &Path,
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
     json: bool,
+    locks: &[&fs::File],
 ) -> Result<(i32, bool)> {
     let run_dir = root.join("runs").join(&request.id);
     fs::create_dir_all(&run_dir)?;
@@ -670,15 +725,8 @@ fn run_session(
     let result_path = run_dir.join("result.json");
     let log = fs::File::create(run_dir.join("output.log"))?;
     crate::seat::reserve(root, request)?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .arg("execute-session")
-        .arg(&spec)
-        .arg(&result_path)
-        .current_dir(workdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks)?;
+    let mut child = spawned?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1024);
     let stdout = child.stdout.take().ok_or("missing stdout")?;
     let stderr = child.stderr.take().ok_or("missing stderr")?;
@@ -690,6 +738,8 @@ fn run_session(
             .join(format!("cleanup-pending-{}", request.id)),
         ownership: crate::seat::path(root, &request.seat),
     };
+    // After the owner exists, so a failure here still tears the session down.
+    restored?;
     for (stream, reader) in [
         ("stdout", Box::new(stdout) as Box<dyn std::io::Read + Send>),
         ("stderr", Box::new(stderr) as Box<dyn std::io::Read + Send>),

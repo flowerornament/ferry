@@ -10,6 +10,12 @@ command = ["sh", "-c", "export PATH=\"$HOME/.cargo/bin:$PATH\"; exec cargo test 
 requires = []
 routable = true
 
+# The same gate as `just check`, for Linux-only code a Mac never compiles.
+[recipe.check]
+command = ["sh", "-c", "export PATH=\"$HOME/.cargo/bin:$PATH\"; cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && exec cargo test --locked"]
+requires = []
+routable = true
+
 [recipe.fail]
 command = ["sh", "-c", "echo recipe-failure; exit 17"]
 requires = []

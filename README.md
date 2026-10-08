@@ -284,15 +284,28 @@ consumer can compare the window it held with its own load observations.
 When a session releases its seat, the receipt's `custody` records what the
 session left behind:
 
-- `census` is one of:
+- `census`, taken after the collect hook, is one of:
   - `empty`: no live descendant of the run's supervisor;
   - `survivors`, with their pids;
+  - `unknown`: the census could not be taken;
   - `unsupported`.
+- `stopped`: the survivors this release stopped, and `after`: the census
+  taken after stopping them.
 - `record` is one of:
-  - `idle`: written only after ran-pass, ran-fail or timeout with an empty
-    census;
-  - `taint`: survivors were found;
+  - `idle`: written only after ran-pass, ran-fail or timeout, when the
+    census, or the census after stopping, is empty;
+  - `taint`: survivors remain after stopping, or the census is unknown;
   - `none`.
+
+**Survivors are stopped.** A run owns what it started, and nothing it
+started outlives it. At release, each survivor the census attributes to this
+run gets SIGTERM, and so does its process group when the survivor leads it.
+For 10 seconds the census is retaken, and descendants adopted meanwhile get
+SIGTERM too. Then whatever remains gets SIGKILL, and the census is taken
+again. Only pids from this supervisor's own census are signalled. They are
+its unreaped children, so none can have been reused by another process.
+A service a run starts and expects to outlive it belongs to the operator's
+service manager, not to the run (PRINCIPLES.md, worked example).
 
 On Linux the supervisor is a child subreaper. A process that leaves the
 recipe's session (`setsid`, double fork, closed descriptors, a scrubbed
@@ -305,11 +318,29 @@ What custody does not see:
   SSH to self, cron);
 - other users;
 - other hosts;
-- a supervisor that dies before release. It records nothing, and its owner
-  marker keeps the seat refused until `ferry seat recover`.
+- a supervisor that dies before release. It records nothing and stops
+  nothing, and its owner marker keeps the seat refused until
+  `ferry seat recover`.
 
-A tainted seat stays tainted. Other platforms report `unsupported` and never
-record idle.
+**A tainted seat refuses** new runs (125) with the run and pids that tainted
+it. The next step is to stop those processes, then run
+`ferry seat recover <seat>`. Recovery never kills. It clears the taint only
+when every recorded survivor is gone, checked by pid and start time. A taint
+that names no survivors, because the census was unknown or attributed no pids,
+cannot be proven clear. That seat stays refused, so use another `--seat`.
+
+**Other platforms** report `unsupported`: there is no census, so nothing is
+stopped at release and the seat is never recorded idle. The session teardown
+still kills every member of the recipe's session. A descendant that leaves
+the session (`setsid`, a double fork) escapes there, and this is reported
+rather than hidden.
+
+**Locks outlive a killed supervisor.** The seat lock and the host lease are
+inherited by the session and the recipe. If the supervisor (`host-run`, or
+the local caller) is killed, they stay held until the recipe's processes
+that kept them exit. A new run waits instead of starting beside a live
+recipe. A survivor that keeps them also keeps them held. That is why
+survivors are stopped at release.
 
 ## Safety and receipts
 
@@ -348,8 +379,9 @@ refusal from a recipe failure. A recipe may itself exit 125.
 
 ## Limits
 
-SIGKILL of `host-run` leaves the recipe's session running. Its durable ownership
-marker keeps that seat refused until recovery; cgroups are the later fix.
+SIGKILL of `host-run` leaves the recipe's session running. It keeps the seat
+lock and host lease it inherited until it exits. Its durable ownership marker
+then keeps that seat refused until recovery; cgroups are the later fix.
 After the recipe and collect hook finish, the session leader exits if its
 supervisor is gone. Background descendants may still require manual cleanup;
 recovery reports their PIDs and never kills them.

@@ -72,6 +72,9 @@ pub fn bind(root: &Path, request: &execution::Request) -> Result<()> {
     Ok(())
 }
 
+/// Clears what keeps a seat refused, only once it is proven safe: an owner
+/// marker when its recorded session is empty, and a taint record when every
+/// recorded survivor is gone. Never kills.
 pub fn recover(root: &Path, seat: &str) -> Result<()> {
     config::identifier(seat)?;
     fs::create_dir_all(root.join("locks"))?;
@@ -83,7 +86,21 @@ pub fn recover(root: &Path, seat: &str) -> Result<()> {
         .open(root.join("locks").join(seat))?;
     fs2::FileExt::try_lock_exclusive(&lease)?;
     let marker = path(root, seat);
-    let owner: Owner = serde_json::from_slice(&fs::read(&marker)?)?;
+    let taint = crate::custody::taint_path(root, seat);
+    if !marker.exists() && !taint.exists() {
+        return Err(format!("seat {seat} has no owner marker or taint to recover").into());
+    }
+    if marker.exists() {
+        recover_owner(root, seat, &marker)?;
+    }
+    if taint.exists() {
+        recover_taint(seat, &taint)?;
+    }
+    Ok(())
+}
+
+fn recover_owner(root: &Path, seat: &str, marker: &Path) -> Result<()> {
+    let owner: Owner = serde_json::from_slice(&fs::read(marker)?)?;
     let (Some(session), Some(start)) = (owner.session, owner.start) else {
         return Err(
             "cleanup_pending: session birth was not recorded; recovery cannot prove absence".into(),
@@ -104,7 +121,7 @@ pub fn recover(root: &Path, seat: &str) -> Result<()> {
     }
     if !held.is_empty() {
         return Err(format!(
-            "cleanup_pending: session {session} still contains {held:?}; recovery never kills"
+            "cleanup_pending: seat {seat} session {session} still contains {held:?}; recovery never kills"
         )
         .into());
     }
@@ -118,14 +135,62 @@ pub fn recover(root: &Path, seat: &str) -> Result<()> {
     Ok(())
 }
 
+/// A survivor is gone when no process has its pid, or the process that has
+/// it started at another time. Without a recorded start time, any live
+/// process with the pid counts as the survivor.
+fn recover_taint(seat: &str, taint: &Path) -> Result<()> {
+    let record: crate::custody::Taint = serde_json::from_slice(&fs::read(taint)?)?;
+    let survivors: Vec<crate::custody::Survivor> = if record.survivors.is_empty() {
+        record
+            .pids
+            .iter()
+            .map(|pid| crate::custody::Survivor {
+                pid: *pid,
+                start: None,
+            })
+            .collect()
+    } else {
+        record.survivors
+    };
+    if survivors.is_empty() {
+        return Err(format!(
+            "seat {seat} is tainted ({}) but names no survivors; recovery cannot prove absence. Use another --seat",
+            record.reason
+        )
+        .into());
+    }
+    let alive: Vec<i32> = survivors
+        .iter()
+        .filter(
+            |survivor| match (start_time(survivor.pid), survivor.start) {
+                (Ok(now), Some(then)) => now == then,
+                (Ok(_), None) => true,
+                (Err(_), _) => {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(survivor.pid), None).is_ok()
+                }
+            },
+        )
+        .map(|survivor| survivor.pid)
+        .collect();
+    if !alive.is_empty() {
+        return Err(format!(
+            "seat {seat} is tainted: survivors {alive:?} of run {} are still alive; stop them first, recovery never kills",
+            record.id
+        )
+        .into());
+    }
+    fs::remove_file(taint)?;
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
-fn start_time(pid: i32) -> Result<u128> {
+pub fn start_time(pid: i32) -> Result<u128> {
     let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0)?;
     Ok(u128::from(info.pbi_start_tvsec) * 1_000_000 + u128::from(info.pbi_start_tvusec))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn start_time(pid: i32) -> Result<u128> {
+pub fn start_time(pid: i32) -> Result<u128> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let (_, fields) = text.rsplit_once(')').ok_or("invalid process stat")?;
     Ok(fields
