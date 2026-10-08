@@ -522,3 +522,157 @@ fn a_malformed_taint_refuses_with_its_path_and_a_next_step() {
     assert_eq!(accepted.status.code(), Some(0), "{}", receipt(&accepted));
     assert!(!taint.exists());
 }
+
+/// The internal key of the probe's seat (not the `other` seat).
+fn seat_key(dir: &Path) -> String {
+    fs::read_dir(dir.join(".ferry/local/locks"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| !n.starts_with("host") && !n.starts_with("cleanup") && !n.contains("other"))
+        .unwrap()
+}
+
+// Round 2, C1: a grandchild of the caller's background job, orphaned while
+// the run is in flight, is not the run's: the supervisor is a fresh
+// host-run, so nothing outside the run can be adopted.
+#[test]
+fn an_orphan_of_the_callers_own_job_is_not_the_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pidfile = tmp.path().join("gc.pid");
+    let owned = Owned {
+        pidfile: pidfile.clone(),
+        marker: "66.1",
+    };
+    let dir = fixture("sleep 4", &[]);
+    let out = Command::new("sh")
+        .current_dir(dir.path())
+        .env_remove("GIT_DIR")
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .arg("-c")
+        .arg(format!(
+            "sh -c 'sleep 66.1 </dev/null >/dev/null 2>&1 & echo $! > {}; sleep 2; true' & exec {} run probe --local --json",
+            pidfile.display(),
+            env!("CARGO_BIN_EXE_ferry")
+        ))
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    let alive = owned.alive();
+    let report = format!(
+        "alive={alive} custody={} outcome={}",
+        record["custody"], record["outcome"]
+    );
+    eprintln!("C1 {report}");
+    assert!(
+        alive,
+        "a grandchild of the caller's job was killed: {report}"
+    );
+    assert_eq!(record["outcome"], "ran-pass", "{report}");
+    assert_eq!(record["custody"]["record"], "idle", "{report}");
+}
+
+// Round 2, C2: an exclusive run's unstoppable survivor may hold the gate and
+// the exclusive lease; a run on another seat refuses instead of waiting.
+#[test]
+fn a_tainted_exclusive_survivor_makes_other_seats_refuse_not_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pidfile = tmp.path().join("ex.pid");
+    let owned = Owned {
+        pidfile: pidfile.clone(),
+        marker: "66.2",
+    };
+    let dir = fixture(&format!("{}exit 0\n", daemon_line(&pidfile, "66.2")), &[]);
+    let out = ferry(dir.path())
+        .env("FERRY_DIAGNOSTIC_PROC", "/nonexistent")
+        .args(["run", "probe", "--local", "--json", "--exclusive"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    let taint: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            dir.path()
+                .join(format!(".ferry/local/taint/{}.json", seat_key(dir.path()))),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (blocked, next) = run_blocks(dir.path(), 5, &["--seat", "other"]);
+    let report = format!(
+        "custody={} taint={taint} alive={} other_seat_blocked_5s={blocked} next={next:?}",
+        record["custody"],
+        owned.alive()
+    );
+    eprintln!("C2 {report}");
+    drop(owned);
+    assert_eq!(taint["locks"]["host"], "exclusive", "{report}");
+    assert_eq!(taint["locks"]["gate"], true, "{report}");
+    assert!(!blocked, "another seat's run waits silently: {report}");
+    let next = next.unwrap();
+    assert_eq!(next["outcome"], "refused", "{report}");
+    assert!(
+        next["reason"]
+            .as_str()
+            .unwrap()
+            .contains("host lease is held"),
+        "{report}"
+    );
+}
+
+// A shared run's unstoppable survivor holds the lease only shared: runs on
+// other seats proceed.
+#[test]
+fn a_tainted_shared_survivor_does_not_hold_up_other_seats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pidfile = tmp.path().join("sh.pid");
+    let owned = Owned {
+        pidfile: pidfile.clone(),
+        marker: "67.2",
+    };
+    let dir = fixture(&format!("{}exit 0\n", daemon_line(&pidfile, "67.2")), &[]);
+    let out = ferry(dir.path())
+        .env("FERRY_DIAGNOSTIC_PROC", "/nonexistent")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(receipt(&out)["custody"]["record"], "taint");
+    let (blocked, next) = run_blocks(dir.path(), 5, &["--seat", "other"]);
+    drop(owned);
+    assert!(!blocked);
+    assert_eq!(next.unwrap()["outcome"], "ran-pass");
+}
+
+// Round 2, C4: the recipe ran and passed, but custody release failed (its
+// idle record cannot be written): the verdict stands, custody records the
+// error, and the seat is tainted.
+#[test]
+fn a_failed_release_never_changes_the_verdict_of_work_that_ran() {
+    let dir = fixture(
+        "d=$PWD; while [ ! -d \"$d/.ferry/local\" ]; do d=$(dirname \"$d\"); done; rm -rf \"$d/.ferry/local/idle\"; : > \"$d/.ferry/local/idle\"; echo ran",
+        &[],
+    );
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    let report = format!(
+        "exit={:?} outcome={} reason={} custody={}",
+        out.status.code(),
+        record["outcome"],
+        record["reason"],
+        record["custody"]
+    );
+    eprintln!("C4 {report}");
+    assert_eq!(out.status.code(), Some(0), "{report}");
+    assert_eq!(record["outcome"], "ran-pass", "{report}");
+    assert!(record["custody"]["error"].is_string(), "{report}");
+    assert_eq!(record["custody"]["record"], "taint", "{report}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("custody release failed"),
+        "{report}"
+    );
+}

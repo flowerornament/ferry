@@ -38,7 +38,12 @@ enum Action {
     Receipt {
         id: String,
     },
-    HostRun,
+    HostRun {
+        /// The state root (default `~/.local/state/ferry`); the local route
+        /// passes the repository's `.ferry/local`.
+        #[arg(long, hide = true)]
+        state: Option<PathBuf>,
+    },
     #[command(hide = true)]
     HostInfo,
     #[command(hide = true)]
@@ -350,7 +355,7 @@ fn execute(cli: Cli) -> Result<i32> {
             );
             Ok(0)
         }
-        Action::HostRun => transport::host_run(),
+        Action::HostRun { state } => transport::host_run(state),
         Action::HostInfo => {
             println!("{}", serde_json::to_string(&transport::host_info()?)?);
             Ok(0)

@@ -311,10 +311,18 @@ collect hook, then the census and stop, then records custody, before the
 locks are dropped. That holds even when a hook, the session or collection
 fails.
 
-Children the supervisor already had when the run began (a wrapper's
-background job, before it `exec`s `ferry run`) are not the run's. The census
-and the stop leave them alone. While one of them lives, emptiness rests on
-`/proc`'s listing rather than on the kernel alone.
+The supervisor is always a freshly spawned `ferry host-run`: over SSH for a
+remote run, and as a child of the caller for `--local`, on the repository's
+`.ferry/local` state, over the same protocol. Having just started, it has no
+children of its own, so nothing outside the run can be adopted and
+attributed to it. A wrapper's background job, or that job's orphans, stays
+the wrapper's. Killing that host-run (its pid is in the `accepted` event)
+is killing the supervisor. Killing the caller instead ends its heartbeats,
+so host-run stops the work and releases.
+
+If release itself fails (a record cannot be written), the work's verdict
+and exit code stand. `custody.error` says why, custody counts as unknown,
+and the seat is tainted if that can still be written.
 A service a run starts and expects to outlive it belongs to the operator's
 service manager, not to the run (PRINCIPLES.md, worked example).
 
@@ -337,9 +345,13 @@ What custody does not see:
 it, before waiting for the seat lock and again while waiting, since a
 survivor may still hold that lock. The next step is to stop those
 processes, then run `ferry seat recover <seat>` on the host that ran it.
-The refusal names the command, the host, and your `--seat`. While any seat
-is tainted, an `--exclusive` run refuses too, because a survivor may still
-hold the host lease.
+The refusal names the command, the host, and your `--seat`. A taint record
+also names the locks its survivors may still hold: the seat, and the host
+lease in the run's mode (an exclusive run also held the gate). While any
+seat is tainted, an `--exclusive` run refuses. A run waiting for the lease
+also refuses, when a taint says its survivors may hold it exclusively or
+hold the gate. Any run that waits more than 3 seconds for a lock prints one
+line saying so.
 
 Recovery never kills. It refuses while the seat lock is held, and clears the
 taint only when every recorded survivor is gone, checked by pid and start
@@ -347,7 +359,9 @@ time. Some taints cannot be proven clear: one that names no survivors
 (because the census was unknown or attributed no pids), or a record that
 cannot be read. For those, the operator confirms nothing is left and runs
 `ferry seat recover <seat> --accept-unknown --reason '<why>'`. That reason
-is kept in the recover receipt.
+is kept in the recover receipt. A free seat lock shows only that no
+process still holds it. A survivor that closed its descriptors may still
+live, so this is the operator's call, not Ferry's.
 
 **Other platforms** report `unsupported`: there is no census, so nothing is
 stopped at release and the seat is never recorded idle. The session teardown
@@ -357,7 +371,7 @@ rather than hidden.
 
 **Locks outlive a killed supervisor, on Linux.** There the seat lock and the
 host lease are inherited by the session and the recipe. If the supervisor
-(`host-run`, or the local caller) is killed, they stay held until the
+(`host-run`, remote or local) is killed, they stay held until the
 recipe's processes that kept them exit, and a new run waits instead of
 starting beside a live recipe. A survivor that kept them also keeps them,
 until it is stopped at release or, if it cannot be, the seat is tainted.
@@ -403,8 +417,9 @@ refusal from a recipe failure. A recipe may itself exit 125.
 
 ## Limits
 
-SIGKILL of `host-run` leaves the recipe's session running. It keeps the seat
-lock and host lease it inherited until it exits. Its durable ownership marker
+SIGKILL of `host-run` leaves the recipe's session running. On Linux it keeps
+the seat lock and host lease it inherited until it exits; elsewhere they are
+freed at once. Its durable ownership marker
 then keeps that seat refused until recovery; cgroups are the later fix.
 After the recipe and collect hook finish, the session leader exits if its
 supervisor is gone. Background descendants may still require manual cleanup;

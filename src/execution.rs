@@ -229,6 +229,8 @@ fn acquire_as(
         .create(true)
         .truncate(false)
         .open(path)?;
+    let started = Instant::now();
+    let mut said = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Err("client lost while waiting for lock".into());
@@ -242,6 +244,11 @@ fn acquire_as(
             Ok(()) => return Ok(file),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 waiting()?;
+                if !said && started.elapsed() >= Duration::from_secs(3) {
+                    said = true;
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    eprintln!("ferry: waiting for lock {name}: another run holds it");
+                }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => return Err(e.into()),
@@ -304,8 +311,10 @@ impl HostLease {
             tainted()?;
             vec![gate, host]
         } else {
-            let gate = acquire_as(&gate, stop, true, &|| Ok(()))?;
-            let host = acquire_as(&host, stop, true, &|| Ok(()))?;
+            // A tainted exclusive run's survivors may hold the gate or lease.
+            let tainted = || crate::custody::check_host(root, local);
+            let gate = acquire_as(&gate, stop, true, &tainted)?;
+            let host = acquire_as(&host, stop, true, &tainted)?;
             drop(gate);
             vec![host]
         };
@@ -629,7 +638,7 @@ fn close_on_exec(file: &fs::File, close: bool) -> Result<()> {
 pub struct Finished {
     pub executed: Result<(i32, bool)>,
     pub collection: Result<Option<Collection>>,
-    pub custody: Result<crate::custody::Release>,
+    pub custody: crate::custody::Release,
 }
 
 /// The lock descriptors a session inherits: the seat lock and the host

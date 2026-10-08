@@ -656,8 +656,17 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     let owner: serde_json::Value = serde_json::from_slice(&fs::read(&ownership).unwrap()).unwrap();
     let group = OwnedGroup(i32::try_from(owner["session"].as_u64().unwrap()).unwrap());
     let seat = ownership.file_stem().unwrap().to_str().unwrap();
+    // Kill the supervisor itself: the host-run the caller spawned, named by
+    // its `accepted` event. The caller then ends without a result.
+    let supervisor = fs::read_to_string(&caller_output)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["event"] == "accepted")
+        .and_then(|event| event["pid"].as_i64())
+        .expect("the accepted event names the supervisor");
     kill(
-        Pid::from_raw(i32::try_from(caller.child.as_ref().unwrap().id()).unwrap()),
+        Pid::from_raw(i32::try_from(supervisor).unwrap()),
         Signal::SIGKILL,
     )
     .unwrap();

@@ -60,6 +60,21 @@ pub struct Release {
     /// The census after stopping, when anything was stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<Census>,
+    /// Why release could not complete. The work's verdict stands; custody is
+    /// then unknown, and the seat is tainted if that could be written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The locks a taint's survivors may still hold through inherited
+/// descriptors: the seat lock, and the host lease in the run's mode (an
+/// exclusive run also held the gate). Waiters on them refuse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeldLocks {
+    pub seat: String,
+    /// `shared` or `exclusive`.
+    pub host: String,
+    pub gate: bool,
 }
 
 /// A survivor named in a taint record: pid and start time, so recovery can
@@ -78,6 +93,9 @@ pub struct Taint {
     pub pids: Vec<i32>,
     #[serde(default)]
     pub survivors: Vec<Survivor>,
+    /// Absent in records from before it was kept: assume the seat lock only.
+    #[serde(default)]
+    pub locks: Option<HeldLocks>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,38 +107,14 @@ struct Idle<'a> {
     stopped: Vec<i32>,
 }
 
-/// Children this process already had when it began supervising (pid and
-/// start time): a wrapper's background job, say. They are not the run's, so
-/// the census and stopping leave them alone.
-#[cfg(target_os = "linux")]
-static PREEXISTING: std::sync::OnceLock<Vec<(i32, Option<u128>)>> = std::sync::OnceLock::new();
-
-/// Makes this process the reaper of its orphaned descendants (Linux), and
-/// notes the children it already has.
+/// Makes this process the reaper of its orphaned descendants (Linux). Only
+/// a freshly spawned `ferry host-run` supervises: it has no children of its
+/// own yet, so everything the census later finds is the run's.
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn supervise() -> Result<()> {
     #[cfg(target_os = "linux")]
-    {
-        let _ = PREEXISTING.set(
-            children()
-                .into_iter()
-                .map(|pid| (pid, crate::seat::start_time(pid).ok()))
-                .collect(),
-        );
-        nix::sys::prctl::set_child_subreaper(true)?;
-    }
+    nix::sys::prctl::set_child_subreaper(true)?;
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-/// Whether `pid` is a child this process had before it began supervising.
-/// Without a recorded start time, the pid alone counts: never signal it.
-fn preexisting(pid: i32) -> bool {
-    PREEXISTING.get().is_some_and(|known| {
-        known.iter().any(|(known, start)| {
-            *known == pid && (start.is_none() || crate::seat::start_time(pid).ok() == *start)
-        })
-    })
 }
 
 /// Reaps adopted descendants that have already exited, so they do not linger
@@ -204,6 +198,39 @@ pub fn check(root: &Path, seat: &str, local: bool) -> Result<()> {
     .into())
 }
 
+/// Refuses a run waiting for the host lease while a taint says its survivors
+/// may hold it exclusively (or its gate): they would keep the wait going.
+pub fn check_host(root: &Path, local: bool) -> Result<()> {
+    let entries = match fs::read_dir(root.join("taint")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("whether any seat is tainted is unknown: {e}").into()),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(seat) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let holds_host = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Taint>(&bytes).ok())
+            // Unreadable: what its survivors hold is unknown.
+            .is_none_or(|taint| {
+                taint
+                    .locks
+                    .is_some_and(|locks| locks.host == "exclusive" || locks.gate)
+            });
+        if holds_host {
+            return Err(format!(
+                "the host lease is held by survivors of tainted seat {seat}; stop them, then run {}",
+                crate::seat::recover_hint(seat, local, "")
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Refuses an exclusive run while any seat under this root is tainted: its
 /// survivors may still hold the host lease, so exclusivity cannot be claimed.
 pub fn check_exclusive(root: &Path, local: bool) -> Result<()> {
@@ -230,7 +257,51 @@ pub fn check_exclusive(root: &Path, local: bool) -> Result<()> {
 /// Called under the seat lock after a session ends. `terminal` is true only
 /// for ran-pass, ran-fail and timeout with confirmed session cleanup. Runs
 /// after the collect hook, so collection still sees what the run left.
-pub fn release(
+/// Never fails: a release that cannot complete is recorded as unknown
+/// custody, with the error, and taints the seat if that can be written.
+pub fn release(root: &Path, request: &crate::execution::Request, terminal: bool) -> Release {
+    match try_release(root, request, terminal) {
+        Ok(release) => release,
+        Err(error) => {
+            let error = error.to_string();
+            let tainted = write(
+                root,
+                "taint",
+                &request.seat,
+                &Taint {
+                    id: request.id.clone(),
+                    reason: format!("custody release failed: {error}"),
+                    pids: vec![],
+                    survivors: vec![],
+                    locks: Some(held_locks(request)),
+                },
+            );
+            Release {
+                census: Census::Unknown(error.clone()),
+                record: if tainted.is_ok() { "taint" } else { "none" }.into(),
+                stopped: vec![],
+                after: None,
+                error: Some(match tainted {
+                    Ok(()) => error,
+                    Err(taint) => {
+                        format!("{error}; the taint could not be written either: {taint}")
+                    }
+                }),
+            }
+        }
+    }
+}
+
+fn held_locks(request: &crate::execution::Request) -> HeldLocks {
+    let exclusive = request.recipe.requires.contains("exclusive");
+    HeldLocks {
+        seat: request.seat.clone(),
+        host: if exclusive { "exclusive" } else { "shared" }.into(),
+        gate: exclusive,
+    }
+}
+
+fn try_release(
     root: &Path,
     request: &crate::execution::Request,
     terminal: bool,
@@ -261,6 +332,7 @@ pub fn release(
                             start: crate::seat::start_time(*pid).ok(),
                         })
                         .collect(),
+                    locks: Some(held_locks(request)),
                 },
             )?;
             "taint"
@@ -275,6 +347,7 @@ pub fn release(
                     reason: format!("custody census could not be taken: {error}"),
                     pids: vec![],
                     survivors: vec![],
+                    locks: Some(held_locks(request)),
                 },
             )?;
             "taint"
@@ -300,6 +373,7 @@ pub fn release(
         record: record.into(),
         stopped,
         after,
+        error: None,
     })
 }
 
@@ -421,14 +495,9 @@ fn write(root: &Path, kind: &str, seat: &str, value: &impl Serialize) -> Result<
 
 /// The kernel decides: after reaping every exited orphan, ECHILD proves no
 /// child remains, and a live child proves a survivor. Because the supervisor
-/// is a subreaper, every surviving descendant is, or sits under, a direct
-/// child. Any other wait error leaves custody unknown.
-///
-/// Children this process had before supervising are not the run's. When one
-/// of them still lives, the kernel cannot tell it from a survivor, so /proc
-/// decides: empty only if every live child it lists is pre-existing. A
-/// listing that shows no live child at all, though the kernel reports one,
-/// is blind: survivors, unattributed.
+/// is a subreaper with no children before the run, every surviving
+/// descendant is, or sits under, a direct child, and all of them are the
+/// run's. Any other wait error leaves custody unknown.
 #[cfg(target_os = "linux")]
 fn census() -> Census {
     use nix::{
@@ -438,21 +507,10 @@ fn census() -> Census {
     loop {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
             Err(Errno::ECHILD) => return Census::Empty,
-            Ok(WaitStatus::StillAlive) => break,
+            Ok(WaitStatus::StillAlive) => return Census::Survivors(children()),
             Ok(_) => {}
             Err(error) => return Census::Unknown(error.to_string()),
         }
-    }
-    let live = children();
-    let ours: Vec<i32> = live
-        .iter()
-        .copied()
-        .filter(|pid| !preexisting(*pid))
-        .collect();
-    if ours.is_empty() && !live.is_empty() {
-        Census::Empty
-    } else {
-        Census::Survivors(ours)
     }
 }
 

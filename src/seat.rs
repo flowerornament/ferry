@@ -169,8 +169,9 @@ fn recover_taint(seat: &str, taint: &Path, accept_unknown: Option<&str>) -> Resu
     let record: crate::custody::Taint = match serde_json::from_slice(&fs::read(taint)?) {
         Ok(record) => record,
         Err(error) if accept_unknown.is_some() => {
-            // The operator vouches for a record Ferry cannot read; the seat
-            // lock was free, so no process kept it.
+            // An explicit operator act, recorded in the recover receipt. The
+            // free seat lock shows only that no process still holds it; a
+            // survivor that closed its descriptors may still live.
             let _ = error;
             fs::remove_file(taint)?;
             return Ok(());
@@ -197,7 +198,9 @@ fn recover_taint(seat: &str, taint: &Path, accept_unknown: Option<&str>) -> Resu
     };
     if survivors.is_empty() {
         if accept_unknown.is_some() {
-            // An explicit operator act, recorded in the recover receipt.
+            // An explicit operator act, recorded in the recover receipt. The
+            // free seat lock shows only that no process still holds it; a
+            // survivor that closed its descriptors may still live.
             fs::remove_file(taint)?;
             return Ok(());
         }

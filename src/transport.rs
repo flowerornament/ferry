@@ -315,7 +315,7 @@ fn event(value: &serde_json::Value) {
     println!();
 }
 /// Reads, validates and reserves a request. Any error here is a refusal.
-fn admit(input: &mut impl BufRead) -> Result<(Request, PathBuf, fs::File)> {
+fn admit(input: &mut impl BufRead, state: Option<PathBuf>) -> Result<(Request, PathBuf, fs::File)> {
     let mut line = String::new();
     input
         .read_line(&mut line)
@@ -323,8 +323,11 @@ fn admit(input: &mut impl BufRead) -> Result<(Request, PathBuf, fs::File)> {
     let request: Request =
         serde_json::from_str(&line).map_err(|e| format!("parsing the request: {e}"))?;
     execution::validate(&request).map_err(|e| format!("validating the request: {e}"))?;
-    let root =
-        PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join(".local/state/ferry");
+    let root = match state {
+        Some(state) => state,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?)
+            .join(".local/state/ferry"),
+    };
     let records = root.join("records");
     fs::create_dir_all(&records).map_err(|e| format!("creating {}: {e}", records.display()))?;
     let record_path = records.join(format!("{}.json", request.id));
@@ -336,11 +339,14 @@ fn admit(input: &mut impl BufRead) -> Result<(Request, PathBuf, fs::File)> {
         .map_err(|e| format!("reserving {}: {e}", record_path.display()))?;
     Ok((request, root, record))
 }
-pub fn host_run() -> Result<i32> {
+/// Runs one request read from stdin, as the run's supervisor. `state` is the
+/// state root: `~/.local/state/ferry` by default, or a repository's
+/// `.ferry/local` for the local route.
+pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
     let mut input = std::io::BufReader::new(std::io::stdin());
     // Everything before `accepted` is a refusal: nothing ran. Say so in the
     // protocol, so the caller records refused 125 rather than a lost run.
-    let admitted = admit(&mut input);
+    let admitted = admit(&mut input, state);
     let (request, root, mut record) = match admitted {
         Ok(admitted) => admitted,
         Err(error) => {
@@ -378,7 +384,10 @@ pub fn host_run() -> Result<i32> {
         lease: None,
         admission: None,
     };
-    event(&serde_json::json!({"protocol":1,"event":"accepted","id":request.id}));
+    // The pid names this supervisor, so an operator can stop exactly it.
+    event(
+        &serde_json::json!({"protocol":1,"event":"accepted","id":request.id,"pid":std::process::id()}),
+    );
     crate::custody::supervise()?;
     let executed: Result<()> = (|| {
         let (seat, lease, host_lease) =
@@ -388,16 +397,23 @@ pub fn host_run() -> Result<i32> {
         );
         let locks = execution::inherited(&lease, &host_lease);
         let finished = execution::run_released(&root, &seat, &request, &stop, true, &locks);
-        // Custody first: it is recorded whatever else failed (S8).
-        let custody = finished
-            .custody
-            .map_err(|e| format!("custody release: {e}"));
-        result.custody = custody.as_ref().ok().cloned();
+        // Custody first: it is recorded whatever else failed (S8). A failed
+        // release or collection is recorded, and never changes the verdict
+        // of work that ran.
+        if let Some(error) = &finished.custody.error {
+            result.reason = Some(format!("custody release failed: {error}"));
+        }
+        result.custody = Some(finished.custody);
         // Stamped while held; the locks drop as this scope ends.
         result.lease = Some(host_lease.stamp());
-        result.collection = finished.collection?;
+        result.collection = match finished.collection {
+            Ok(collection) => collection,
+            Err(error) => Some(execution::Collection {
+                exit_code: None,
+                error: Some(format!("reading the collection result: {error}")),
+            }),
+        };
         let (code, timeout) = finished.executed?;
-        custody?;
         result.exit_code = code;
         result.outcome = if stop.load(Ordering::SeqCst) {
             Outcome::Lost
@@ -434,6 +450,10 @@ pub fn host_run() -> Result<i32> {
     Ok(result.exit_code)
 }
 
+/// Runs a request on this machine through a freshly spawned `ferry host-run`
+/// on the repository's `.ferry/local` state, over the same protocol as the
+/// remote route. That child is the run's supervisor: just spawned, it has no
+/// children of its own, so custody can attribute nothing outside the run.
 pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -> Result<()> {
     let state = root.join(".ferry/local");
     fs::create_dir_all(&state)?;
@@ -459,55 +479,99 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
                 .arg(commit),
         )?;
     }
+    record.outcome = Outcome::Lost;
+    record.exit_code = 255;
     let stop = execution::stopped()?;
+    // The last moment before the host is asked to run anything.
     execution::interrupted()?;
-    crate::custody::supervise()?;
-    let (seat, lease, host_lease) =
-        execution::prepare(&state, request, &stop, &mut record.admission)?;
-    if json {
-        event(&serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit}));
-    }
-    let locks = execution::inherited(&lease, &host_lease);
-    let finished = execution::run_released(&state, &seat, request, &stop, json, &locks);
-    // Custody first: it is recorded whatever else failed (S8).
-    let custody = finished
-        .custody
-        .map_err(|e| format!("custody release: {e}"));
-    record.custody = custody.as_ref().ok().cloned();
-    // Stamped while held; the locks drop as this function returns.
-    record.lease = Some(host_lease.stamp());
-    record.collection = finished.collection?;
-    let (code, timeout) = finished.executed.inspect_err(|_| {
-        if execution::attempted(&state, request) {
+    let child = Command::new(std::env::current_exe()?)
+        .arg("host-run")
+        .arg("--state")
+        .arg(&state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let (stream, status) = converse(child, request, &stop, json)?;
+    if let Some(result) = stream.result {
+        if result.token != request.token
+            || result.commit != request.commit
+            || result.protocol != receipt::PROTOCOL
+        {
+            return Err("host result binding mismatch".into());
+        }
+        record.collection.clone_from(&result.collection);
+        record.outcome = result.outcome;
+        record.exit_code = result.exit_code;
+        record.reason = result.reason;
+        record.host_binary_sha256 = Some(result.binary_sha256);
+        record.host_source_rev = result.source_rev;
+        record.host_exe = result.exe;
+        record.custody = result.custody;
+        record.lease = result.lease;
+        record.admission = result.admission;
+        if record.host_binary_sha256.as_deref() != Some(&record.caller_binary_sha256) {
             record.outcome = Outcome::Lost;
             record.exit_code = 255;
+            return Err("ferry binary changed during run".into());
         }
-    })?;
-    custody?;
-    record.exit_code = code;
-    record.outcome = if stop.load(Ordering::SeqCst) {
-        Outcome::Lost
-    } else if timeout {
-        Outcome::Timeout
-    } else if code == 0 {
-        Outcome::RanPass
-    } else {
-        Outcome::RanFail
-    };
-    record.host_binary_sha256 = Some(record.caller_binary_sha256.clone());
-    record.host_source_rev.clone_from(&record.caller_source_rev);
-    record.host_exe.clone_from(&record.caller_exe);
-    if !request.recipe.artifacts.is_empty() {
-        let output = state.join("runs").join(&request.id).join("artifacts.tar");
-        match crate::artifacts::collect(&seat, &request.recipe.artifacts, &output) {
-            Ok(()) => {
-                crate::artifacts::unpack(&output, &root.join(".ferry/runs").join(&request.id))?;
+        if let Some(error) = result.artifacts_error {
+            record.reason = Some(format!("artifact collection failed: {error}"));
+        }
+        if let Some(expected) = result.artifacts_sha256 {
+            let archive = state.join("runs").join(&request.id).join("artifacts.tar");
+            if receipt::file_digest(&archive)? != expected {
+                return Err("artifact integrity failed".into());
             }
-            Err(e) => record.reason = Some(format!("artifact collection failed: {e}")),
+            crate::artifacts::unpack(&archive, &root.join(".ferry/runs").join(&request.id))?;
         }
+    } else if let Some(reason) = stream.refusal {
+        record.outcome = Outcome::Refused;
+        record.exit_code = 125;
+        record.reason = Some(reason);
+    } else {
+        record.reason = Some(format!("no result from host-run: {status}"));
     }
-    record.lease = Some(host_lease.stamp());
     Ok(())
+}
+
+/// Sends the request to a host-run child, keeps it alive with heartbeats,
+/// and relays its events until it ends. Dropping the conversation early
+/// ends the heartbeats, so the host stops the work and releases.
+fn converse(
+    child: std::process::Child,
+    request: &Request,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    json: bool,
+) -> Result<(HostStream, std::process::ExitStatus)> {
+    let mut connection = Connection {
+        child,
+        stop: stop.clone(),
+    };
+    let child = &mut connection.child;
+    let mut stdin = child.stdin.take().ok_or("missing host stdin")?;
+    serde_json::to_writer(&mut stdin, request)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    let heartbeat_stop = stop.clone();
+    let heartbeat = thread::spawn(move || {
+        while !heartbeat_stop.load(Ordering::SeqCst) {
+            if stdin
+                .write_all(b"heartbeat\n")
+                .and_then(|()| stdin.flush())
+                .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+    let stdout = child.stdout.take().ok_or("missing host stdout")?;
+    let stream = read_stream(stdout, json)?;
+    stop.store(true, Ordering::SeqCst);
+    heartbeat.join().map_err(|_| "heartbeat thread panicked")?;
+    let status = child.wait()?;
+    Ok((stream, status))
 }
 
 pub fn remote(
@@ -574,33 +638,7 @@ pub fn remote(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
-    let mut connection = Connection {
-        child,
-        stop: stop.clone(),
-    };
-    let child = &mut connection.child;
-    let mut stdin = child.stdin.take().ok_or("missing SSH stdin")?;
-    serde_json::to_writer(&mut stdin, request)?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    let heartbeat_stop = stop.clone();
-    let heartbeat = thread::spawn(move || {
-        while !heartbeat_stop.load(Ordering::SeqCst) {
-            if stdin
-                .write_all(b"heartbeat\n")
-                .and_then(|()| stdin.flush())
-                .is_err()
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(200));
-        }
-    });
-    let stdout = child.stdout.take().ok_or("missing SSH stdout")?;
-    let stream = read_stream(stdout, json)?;
-    stop.store(true, Ordering::SeqCst);
-    heartbeat.join().map_err(|_| "heartbeat thread panicked")?;
-    let status = child.wait()?;
+    let (stream, status) = converse(child, request, &stop, json)?;
     if let Some(result) = stream.result {
         accept_result(root, machine, request, record, &info, result)?;
     } else if let Some(reason) = stream.refusal {
@@ -664,7 +702,11 @@ fn read_stream(stdout: impl std::io::Read, json: bool) -> Result<HostStream> {
         if json {
             println!("{line}");
         } else if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
-            println!("{text}");
+            if value.get("stream").and_then(|v| v.as_str()) == Some("stderr") {
+                eprintln!("{text}");
+            } else {
+                println!("{text}");
+            }
         }
     }
     Ok(stream)
