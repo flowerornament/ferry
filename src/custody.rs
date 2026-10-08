@@ -42,10 +42,8 @@ pub enum Census {
     Unsupported,
 }
 
-/// How long stopped survivors get between TERM and KILL.
-pub const STOP_GRACE: Duration = Duration::from_secs(10);
-/// How long survivors sent SIGKILL get to be reaped before the final census.
-pub const KILL_GRACE: Duration = Duration::from_secs(2);
+pub use crate::limits::KILL_GRACE;
+pub use crate::limits::STOP_GRACE;
 
 /// The custody evidence a release leaves in the receipt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

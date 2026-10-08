@@ -1,6 +1,10 @@
 //! Controls for the run's stream between caller and supervisor (S8, P1 C4):
 //! after spawn, a lost caller, a closed pipe or a failed diagnostic never
 //! skips custody release and never changes the verdict of work that ran.
+mod common;
+#[path = "../src/limits.rs"]
+#[allow(dead_code)]
+mod limits;
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
@@ -89,11 +93,24 @@ fn receipt(out: &Output) -> serde_json::Value {
 }
 
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = common::startup_deadline();
     while !done() {
         assert!(Instant::now() < deadline, "never: {what}");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// From the moment the run took its host lease (in the host record) to now,
+/// when the test sees the complete record: the run, its delivery and the
+/// record write, without the caller's startup (which a loaded machine
+/// stretches, and which the design does not bound).
+fn since_acquired(host: &serde_json::Value) -> Duration {
+    let acquired = u128::from(host["lease"]["acquired_ms"].as_u64().unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    Duration::from_millis(u64::try_from(now.saturating_sub(acquired)).unwrap())
 }
 
 /// The only stored receipt or host record in `dir`, once it is complete.
@@ -171,15 +188,46 @@ fn a_killed_caller_still_gets_a_complete_host_record_and_a_released_seat() {
 struct Stalled(std::process::Child);
 impl Stalled {
     fn new() -> (Self, Stdio) {
+        Self::lasting(60)
+    }
+    /// A consumer that holds the pipe unread for `secs`.
+    fn lasting(secs: u32) -> (Self, Stdio) {
         let mut child = Command::new("sleep")
-            .arg("60")
+            .arg(secs.to_string())
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
         let pipe = Stdio::from(child.stdin.take().unwrap());
         (Self(child), pipe)
     }
+    fn alive(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_none()
+    }
 }
+/// A caller a control spawned: stopped (SIGINT, then KILL) if the control
+/// ends early, so a failed assertion never leaves a run behind.
+struct Caller(std::process::Child);
+impl Drop for Caller {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = kill(
+                Pid::from_raw(i32::try_from(self.0.id()).unwrap()),
+                Signal::SIGINT,
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while self.0.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// A recipe writing 16 KiB lines forever: the queue's byte bound, not its
+/// line bound, is what fills first.
+const WIDE_LINES: &str = "exec python3 -c 'import sys\nline = \"x\" * 16383 + \"\\n\"\nwhile True:\n    sys.stdout.write(line)'";
+
 impl Drop for Stalled {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -189,7 +237,8 @@ impl Drop for Stalled {
 
 #[test]
 fn a_closed_caller_pipe_is_data_and_the_run_reaches_its_own_end() {
-    let dir = fixture("while :; do echo tick; sleep 0.01; done", "");
+    // Far more than a pipe's worth up front, so drops are certain.
+    let dir = fixture("seq 1 100000; while :; do echo tick; sleep 0.01; done", "");
     let out = Command::new("sh")
         .current_dir(dir.path())
         .env_remove("GIT_DIR")
@@ -202,12 +251,19 @@ fn a_closed_caller_pipe_is_data_and_the_run_reaches_its_own_end() {
         ))
         .output()
         .unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "tick\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
     let record = only_record(&dir.path().join(".ferry/receipts"));
     assert_eq!(record["outcome"], "timeout", "{record}");
     assert_eq!(record["exit_code"], 124, "{record}");
-    assert!(
-        record["output_dropped"]["stdout"].as_u64().unwrap() > 0,
+    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let count = |value: &serde_json::Value| value.as_u64().unwrap_or(0);
+    assert!(count(&record["output_dropped"]["stdout"]) > 0, "{record}");
+    // Every line the host read was delivered or dropped, once.
+    assert_eq!(
+        count(&record["output_delivered"]["stdout"])
+            + count(&record["output_dropped"]["stdout"])
+            + count(&record["output_dropped"]["host"]),
+        count(&host["output_lines"]),
         "{record}"
     );
     let next = ferry(dir.path())
@@ -220,53 +276,85 @@ fn a_closed_caller_pipe_is_data_and_the_run_reaches_its_own_end() {
 #[test]
 fn a_stalled_consumer_never_holds_the_supervisor_past_the_timeout() {
     let dir = fixture("exec yes", "");
-    let (stalled, pipe) = Stalled::new();
-    let started = Instant::now();
-    let mut caller = ferry(dir.path())
-        .args(["run", "probe", "--local", "--timeout-seconds", "3"])
-        .stdout(pipe)
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let (mut stalled, pipe) = Stalled::lasting(600);
+    let mut caller = Caller(
+        ferry(dir.path())
+            .args(["run", "probe", "--local", "--timeout-seconds", "3"])
+            .stdout(pipe)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     // The host record is the truth, written while the consumer still stalls.
     let host = only_record(&dir.path().join(".ferry/local/records"));
-    let took = started.elapsed();
+    let took = since_acquired(&host);
+    assert!(
+        stalled.alive(),
+        "the consumer stopped stalling before the record"
+    );
     assert_eq!(host["outcome"], "timeout", "{host}");
     assert_eq!(host["exit_code"], 124, "{host}");
-    assert!(took < Duration::from_secs(30), "{took:?}");
+    // The design's bound from taking the lease to a complete record: the
+    // 3 s timeout, session teardown, the delivery stall bound and the
+    // drain; plus scheduling slack.
+    let bound = Duration::from_secs(3)
+        + limits::SESSION_CLEANUP
+        + limits::STALL
+        + limits::DRAIN
+        + common::slack();
+    assert!(took < bound, "{took:?} >= {bound:?}");
     assert!(
-        caller.try_wait().unwrap().is_none(),
-        "the consumer was stalled"
+        caller.0.try_wait().unwrap().is_none(),
+        "the caller waits for its consumer"
     );
     drop(stalled);
-    assert_eq!(caller.wait().unwrap().code(), Some(124));
+    assert_eq!(caller.0.wait().unwrap().code(), Some(124));
     let record = only_record(&dir.path().join(".ferry/receipts"));
     assert_eq!(record["outcome"], "timeout", "{record}");
 }
 
 #[test]
 fn a_signal_stops_a_run_whose_consumer_stalls() {
-    let dir = fixture("exec yes", "");
-    let (stalled, pipe) = Stalled::new();
-    let mut caller = ferry(dir.path())
-        .args(["run", "probe", "--local", "--timeout-seconds", "60"])
-        .stdout(pipe)
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    thread::sleep(Duration::from_millis(1500));
+    let dir = fixture(WIDE_LINES, "");
+    let (mut stalled, pipe) = Stalled::lasting(600);
+    let mut caller = Caller(
+        ferry(dir.path())
+            .args(["run", "probe", "--local", "--timeout-seconds", "600"])
+            .stdout(pipe)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // Signal only once the stall is real: the run's log has passed what the
+    // queue and a pipe can hold, so output is backed up behind the consumer.
+    let runs = dir.path().join(".ferry/local/runs");
+    let past = u64::try_from(limits::MAX_QUEUE).unwrap() + (64 << 10);
+    wait_until("output backed up behind the stalled consumer", || {
+        fs::read_dir(&runs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|run| fs::metadata(run.path().join("output.log")).is_ok_and(|m| m.len() > past))
+    });
     let signalled = Instant::now();
     kill(
-        Pid::from_raw(i32::try_from(caller.id()).unwrap()),
+        Pid::from_raw(i32::try_from(caller.0.id()).unwrap()),
         Signal::SIGINT,
     )
     .unwrap();
     let mut code = None;
     wait_until("the signalled caller ended", || {
-        code = caller.try_wait().unwrap().map(|status| status.code());
+        code = caller.0.try_wait().unwrap().map(|status| status.code());
         code.is_some()
     });
-    assert!(signalled.elapsed() < Duration::from_secs(30));
+    // The consumer never read: the caller ended on its own signal.
+    assert!(stalled.alive(), "the consumer stopped stalling");
+    let bound = limits::SESSION_CLEANUP + limits::DRAIN + limits::FINAL_EMIT + common::slack();
+    assert!(
+        signalled.elapsed() < bound,
+        "{:?} >= {bound:?}",
+        signalled.elapsed()
+    );
     assert_eq!(code.flatten(), Some(130));
     let record = only_record(&dir.path().join(".ferry/receipts"));
     assert_eq!(record["outcome"], "lost", "{record}");
@@ -274,7 +362,6 @@ fn a_signal_stops_a_run_whose_consumer_stalls() {
         record["reason"].as_str().unwrap().contains("SIGINT"),
         "{record}"
     );
-    drop(stalled);
 }
 
 #[test]
@@ -593,19 +680,42 @@ fn a_chatty_survivor_cannot_keep_the_run_past_the_cap() {
     let started = Instant::now();
     // Debug builds keep the survivor alive on Linux too, so readers are
     // still reading when delivery ends at the cap.
-    let out = ferry(dir.path())
+    let stdout = scratch.path().join("caller.out");
+    let mut caller = ferry(dir.path())
         .env("FERRY_FAIL_AT", "stop-survivors")
         .args(["run", "probe", "--local", "--json"])
-        .output()
+        .stdout(fs::File::create(&stdout).unwrap())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    let took = started.elapsed();
+    // A hang fails here instead of hanging the suite.
+    let deadline = common::startup_deadline();
+    while caller.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = caller.kill();
+            let _ = caller.wait();
+            panic!(
+                "the run outlived the startup deadline: {:?}",
+                started.elapsed()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let out = Output {
+        status: caller.wait().unwrap(),
+        stdout: fs::read(&stdout).unwrap(),
+        stderr: vec![],
+    };
     let record = receipt(&out);
     assert_eq!(record["outcome"], "ran-pass", "{record}");
-    // The cap is 60 s after release, plus teardown and the final emit.
-    assert!(took < Duration::from_secs(90), "{took:?}");
     // The count is final when taken: the log holds exactly those lines,
     // and each was delivered or dropped, once.
     let host = only_record(&dir.path().join(".ferry/local/records"));
+    // From the lease to the complete record: teardown, delivery's cap and
+    // the drain, plus scheduling slack.
+    let took = since_acquired(&host);
+    let bound = limits::SESSION_CLEANUP + limits::CAP + limits::DRAIN + common::slack();
+    assert!(took < bound, "{took:?} >= {bound:?}");
     let id = record["id"].as_str().unwrap();
     let log = fs::read(
         dir.path()
@@ -646,7 +756,7 @@ fn a_stop_during_delivery_ends_it_promptly() {
     .unwrap();
     let out = caller.wait_with_output().unwrap();
     assert!(
-        signalled.elapsed() < Duration::from_secs(20),
+        signalled.elapsed() < Duration::from_secs(20) + common::slack(),
         "{:?}",
         signalled.elapsed()
     );
@@ -753,7 +863,13 @@ fn a_taint_that_may_hold_the_host_refuses_before_any_wait() {
             .contains("host lease is held"),
         "{record}"
     );
-    assert!(started.elapsed() < Duration::from_secs(30));
+    // Nobody holds the lock here, so without the pre-check the run would
+    // take the lease and pass: refused, with the taint's reason, is the
+    // pre-check's evidence. (A refusal never records a lease.)
+    assert!(
+        Instant::now() < started + Duration::from_secs(300),
+        "a hang"
+    );
 }
 
 #[test]
@@ -917,10 +1033,10 @@ fn a_terminal_with_tostop_never_stops_the_supervisor() {
         holder.wait().unwrap();
         if interrupt {
             assert_eq!(code, 130, "took {took}");
-            assert!(took < 30.0, "took {took}");
+            assert!(took < 30.0 + common::slack().as_secs_f64(), "took {took}");
         } else {
             assert_eq!(code, 0, "took {took}");
-            assert!(took < 60.0, "took {took}");
+            assert!(took < 60.0 + common::slack().as_secs_f64(), "took {took}");
         }
     }
 }

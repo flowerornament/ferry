@@ -1,4 +1,5 @@
 //! Real CLI contracts exercise committed bytes and durable refusal receipts.
+mod common;
 use nix::{
     sys::signal::{Signal, kill, killpg},
     unistd::{Pid, getsid},
@@ -636,7 +637,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
         child: Some(child),
         owners: dir.path().join(".ferry/local/owners"),
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = common::startup_deadline();
     while !marker.exists() {
         assert!(
             Instant::now() < deadline
@@ -696,7 +697,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
         let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
         assert_eq!(out.status.code(), Some(125));
         fs::write(&release, "finish").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = common::startup_deadline();
         while !run(dir.path(), &["seat", "recover", seat, "--local"])
             .status
             .success()
@@ -743,7 +744,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
             .unwrap()
             .contains("seat recover")
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = common::startup_deadline();
     loop {
         let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
         if out.status.success() {
@@ -1001,7 +1002,7 @@ fn interrupted_caller_kills_children_and_exits_128_plus_signal(
         owners: dir.path().join(".ferry/local/owners"),
     };
     let child = caller.child.as_mut().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = common::startup_deadline();
     while !marker.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -1012,7 +1013,7 @@ fn interrupted_caller_kills_children_and_exits_128_plus_signal(
         signal,
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = common::startup_deadline();
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -1052,7 +1053,7 @@ fn a_signal_before_dispatch_still_writes_a_receipt() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = common::startup_deadline();
     while !marker.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -1062,7 +1063,7 @@ fn a_signal_before_dispatch_still_writes_a_receipt() {
         nix::sys::signal::Signal::SIGTERM,
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = common::startup_deadline();
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -1216,7 +1217,7 @@ fn a_signal_during_the_push_stops_the_run_before_dispatch() {
     .stdout(std::process::Stdio::piped())
     .spawn()
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = common::startup_deadline();
     while !marker.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -1226,7 +1227,7 @@ fn a_signal_during_the_push_stops_the_run_before_dispatch() {
         nix::sys::signal::Signal::SIGTERM,
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = common::startup_deadline();
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -1660,7 +1661,7 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     git(dir.path(), &["commit", "-m", "lease"]);
     let mut runs = HoldRuns { log, pids: vec![] };
     let wait_for = |runs: &HoldRuns, line: &str| {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = common::startup_deadline();
         while !runs.logged().lines().any(|l| l == line) {
             assert!(Instant::now() < deadline, "never logged {line}");
             thread::sleep(Duration::from_millis(20));
@@ -1671,7 +1672,7 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     let alone = runs.spawn(dir.path(), "alone", true);
     // Observe, rather than assume, that the exclusive run now holds the gate.
     let gate = dir.path().join(".ferry/local/locks/host-gate");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = common::startup_deadline();
     loop {
         // The first run already passed the gate, so it must exist. Only a
         // contended lock means the exclusive run holds it; any other error is

@@ -28,14 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long delivery after the run may see no progress before giving up.
-pub const STALL: Duration = Duration::from_secs(15);
-/// The most delivery after the run may take, however bytes move.
-pub const CAP: Duration = Duration::from_secs(60);
-/// The most bytes waiting in the queue.
-pub const MAX_QUEUE: usize = 8 << 20;
-/// The longest line relayed as one: longer lines are split.
-pub const MAX_LINE: usize = 1 << 20;
+pub use crate::limits::CAP;
+pub use crate::limits::MAX_LINE;
+pub use crate::limits::MAX_QUEUE;
+pub use crate::limits::STALL;
 
 enum Message {
     /// A line of recipe output (counted), or one of the host's events.
@@ -68,8 +64,7 @@ static ENDED: AtomicBool = AtomicBool::new(false);
 static CLOSED: std::sync::RwLock<bool> = std::sync::RwLock::new(false);
 /// Lines read whose output-log write failed: counted, not logged.
 static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
-/// How long readers get to drain what was readable when delivery ended.
-pub const DRAIN: Duration = Duration::from_secs(2);
+pub use crate::limits::DRAIN;
 
 fn sender() -> &'static SyncSender<Message> {
     WRITER.get_or_init(|| {

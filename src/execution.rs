@@ -967,10 +967,8 @@ pub enum Ended {
     Stopped,
 }
 
-/// How long the session teardown waits for members to leave before KILL.
-pub const SESSION_CLEANUP: Duration = Duration::from_secs(5);
-/// The collect hook's own bound.
-pub const COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
+pub use crate::limits::COLLECT_TIMEOUT;
+pub use crate::limits::SESSION_CLEANUP;
 
 /// A run's output log: one handle and one lock for every session.
 type RunLog = Arc<std::sync::Mutex<fs::File>>;

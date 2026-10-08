@@ -4,6 +4,7 @@ mod artifacts;
 mod config;
 mod custody;
 mod execution;
+mod limits;
 mod output;
 mod receipt;
 mod repository;

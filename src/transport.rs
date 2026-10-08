@@ -363,11 +363,8 @@ impl HostResult {
     }
 }
 
-/// How long one of the host's own events may wait for room in the output
-/// channel before it is dropped and counted.
-const EVENT_BOUND: Duration = Duration::from_secs(5);
-/// How long host-run waits for its final events to reach the client.
-pub const FINAL_EMIT: Duration = Duration::from_secs(5);
+use crate::limits::EVENT_BOUND;
+pub use crate::limits::FINAL_EMIT;
 
 /// Queues one protocol event for the output writer. Output is data: it never
 /// blocks the supervisor for long and never stops the run.
