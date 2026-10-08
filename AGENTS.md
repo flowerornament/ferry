@@ -75,7 +75,7 @@ there.
 
 ## Design gate
 
-Design questions are decided by `docs/principles.md`. Every freeze description
+Design questions are decided by `PRINCIPLES.md`. Every freeze description
 states:
 
 1. which principles it touches;
@@ -86,15 +86,19 @@ states:
 6. the capability name of any host behaviour it changes;
 7. which environment cells passed (Darwin and Linux Nix check, bench, a Mac host).
 
-A change that needs a principle to bend amends `docs/principles.md` first, in
+A change that needs a principle to bend amends `PRINCIPLES.md` first, in
 its own reviewed change.
 
-## Specs
+## Documents
 
-Designs live in `docs/specs/`, one dated file per decision, each referencing
-its beads, reviews and evidence. The current plan is
-`docs/specs/2026-10-08-coordination-and-dx.md`: amend it rather than drift
-from it.
+- **Living documents** are at the root in capitals and are kept true to the
+  code: README, AGENTS, PRINCIPLES, RELEASE (later REFERENCE and
+  ARCHITECTURE). Change them in the same commit as the behaviour they
+  describe.
+- **Dated design documents** are in `design/` as `YYYY-MM-DD-topic.md`. Each
+  references its beads, reviews and evidence. They are amended or superseded
+  by a later dated document, never silently rewritten to match the code.
+- **Current plan:** `design/2026-10-08-coordination-and-dx.md`.
 
 ## Issues
 
