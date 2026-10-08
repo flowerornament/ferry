@@ -59,6 +59,10 @@ static PROCESSED: AtomicU64 = AtomicU64::new(0);
 static READ: AtomicU64 = AtomicU64::new(0);
 /// Readers that have not reached EOF.
 static OPEN: AtomicUsize = AtomicUsize::new(0);
+/// Closed once delivery has ended: readers then log and count nothing more,
+/// so the count taken after it equals the lines in the output log. Readers
+/// hold it shared while they log and count one line.
+static CLOSED: std::sync::RwLock<bool> = std::sync::RwLock::new(false);
 
 fn sender() -> &'static SyncSender<Message> {
     WRITER.get_or_init(|| {
@@ -110,11 +114,25 @@ pub fn read(bytes: usize) {
     READ.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::SeqCst);
 }
 
-/// Hands one output line from a reader to the writer, waiting while the
-/// channel is full: backpressure reaches the recipe, not the supervisor.
-/// Once the writer has given up, the line is not queued: it is dropped.
-pub fn line(bytes: Vec<u8>) {
+/// Admits one line a reader read: unless delivery has ended, runs `log`
+/// (the output log write) and counts the line, as one step. False once
+/// closed: the reader stops, and nothing more is logged or counted.
+pub fn admit(log: impl FnOnce()) -> bool {
+    let Ok(closed) = CLOSED.read() else {
+        return false;
+    };
+    if *closed {
+        return false;
+    }
+    log();
     OFFERED.fetch_add(1, Ordering::SeqCst);
+    true
+}
+
+/// Hands one admitted output line to the writer, waiting while the channel
+/// is full: backpressure reaches the recipe, not the supervisor. Once the
+/// writer has given up, the line is not queued: it is dropped.
+pub fn line(bytes: Vec<u8>) {
     let size = bytes.len();
     let mut message = Message::Line {
         bytes,
@@ -228,6 +246,11 @@ pub fn settle(stall: Duration, cap: Duration, stop: &AtomicBool) -> bool {
     if !delivered {
         DEAD.store(true, Ordering::SeqCst);
     }
+    // Readers still open (a survivor holds the pipe) stop at their next
+    // line: from here on nothing is logged or counted, so lines() is final.
+    if let Ok(mut closed) = CLOSED.write() {
+        *closed = true;
+    }
     read_all && delivered
 }
 
@@ -244,9 +267,9 @@ pub fn flush(bound: Duration) -> bool {
         .is_ok()
 }
 
-/// Lines of recipe output read, all of them in the output log. The caller
-/// counts what it received, so each line is counted exactly once: what was
-/// not received was dropped.
+/// Lines of recipe output read, exactly the lines in the output log; final
+/// once `settle` has returned. The caller counts what it received, so each
+/// line is counted exactly once: what was not received was dropped.
 pub fn lines() -> u64 {
     OFFERED.load(Ordering::SeqCst)
 }

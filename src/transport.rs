@@ -489,10 +489,22 @@ fn admit(input: &mut impl BufRead, state: Option<PathBuf>) -> Result<(Request, P
         .map_err(|e| format!("reserving {}: {e}", record_path.display()))?;
     Ok((request, root, record))
 }
+/// SIGTTOU and SIGTTIN: blocked in host-run, restored in its sessions.
+pub fn terminal_signals() -> nix::sys::signal::SigSet {
+    let mut set = nix::sys::signal::SigSet::empty();
+    set.add(nix::sys::signal::Signal::SIGTTOU);
+    set.add(nix::sys::signal::Signal::SIGTTIN);
+    set
+}
+
 /// Runs one request read from stdin, as the run's supervisor. `state` is the
 /// state root: `~/.local/state/ferry` by default, or a repository's
 /// `.ferry/local` for the local route.
 pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
+    // A background process group writing to a terminal with `tostop` would
+    // be stopped by SIGTTOU (and a read by SIGTTIN). Blocked, they let the
+    // write go through (and a read fail) instead. Sessions restore them.
+    terminal_signals().thread_block()?;
     let mut input = std::io::BufReader::new(std::io::stdin());
     // Everything before `accepted` is a refusal: nothing ran. Say so in the
     // protocol, so the caller records refused 125 rather than a lost run.
@@ -719,7 +731,11 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         record.exit_code = 125;
         record.reason = Some(reason);
     } else {
-        record.reason = Some(format!("no result from host-run: {status}"));
+        // Keep what the fallback said (e.g. "host record not final").
+        note(
+            &mut record.reason,
+            format!("no result from host-run: {status}"),
+        );
     }
     Ok(())
 }
@@ -739,8 +755,7 @@ fn converse(
         stop: stop.clone(),
         grace,
     };
-    let child = &mut connection.child;
-    let mut stdin = child.stdin.take().ok_or("missing host stdin")?;
+    let mut stdin = connection.child.stdin.take().ok_or("missing host stdin")?;
     serde_json::to_writer(&mut stdin, request)?;
     stdin.write_all(b"\n")?;
     stdin.flush()?;
@@ -757,11 +772,58 @@ fn converse(
             thread::sleep(Duration::from_millis(200));
         }
     });
-    let stdout = child.stdout.take().ok_or("missing host stdout")?;
-    let stream = read_stream(stdout, json, stop)?;
+    let stdout = connection
+        .child
+        .stdout
+        .take()
+        .ok_or("missing host stdout")?;
+    // The stream is read in its own thread, so a signalled caller is never
+    // held by a supervisor that stopped answering: once signalled, it waits
+    // at most the supervisor's worst-case stop.
+    let (sender, received) = std::sync::mpsc::channel();
+    let reader_stop = stop.clone();
+    thread::spawn(move || {
+        let _ = sender.send(read_stream(stdout, json, &reader_stop).map_err(|e| e.to_string()));
+    });
+    let bound = supervisor_grace();
+    let mut signalled: Option<std::time::Instant> = None;
+    let stream = loop {
+        match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(stream) => break stream?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if execution::caught_signal().is_some() {
+                    let at = *signalled.get_or_insert_with(std::time::Instant::now);
+                    if at.elapsed() >= bound {
+                        // Already waited the full grace: no second one.
+                        connection.grace = Duration::ZERO;
+                        return Err(format!(
+                            "the supervisor did not answer within {bound:?} of the caller's signal"
+                        )
+                        .into());
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("the host stream reader ended without a stream".into());
+            }
+        }
+    };
     stop.store(true, Ordering::SeqCst);
     heartbeat.join().map_err(|_| "heartbeat thread panicked")?;
-    let status = child.wait()?;
+    // Bounded too: a supervisor that never exits cannot hold the caller.
+    let deadline = std::time::Instant::now() + bound;
+    let status = loop {
+        if let Some(status) = connection.child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            connection.grace = Duration::ZERO;
+            return Err(
+                format!("host-run did not exit within {bound:?} of its stream ending").into(),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     Ok((stream, status))
 }
 
@@ -865,7 +927,7 @@ pub fn remote(
         record.exit_code = 125;
         record.reason = Some("host refused before acceptance (exit 125; see its stderr)".into());
     } else {
-        record.reason = Some(format!("no host result: {status}"));
+        note(&mut record.reason, format!("no host result: {status}"));
     }
     Ok(())
 }

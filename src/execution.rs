@@ -1005,8 +1005,13 @@ fn run_session(
         thread::spawn(move || {
             let mut reader = std::io::BufReader::new(reader);
             while let Ok(Some(line)) = next_line(&mut reader, crate::output::MAX_LINE) {
-                if let Ok(mut log) = log.lock() {
-                    let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
+                let admitted = crate::output::admit(|| {
+                    if let Ok(mut log) = log.lock() {
+                        let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
+                    }
+                });
+                if !admitted {
+                    break;
                 }
                 relay(stream, &line);
             }
@@ -1079,17 +1084,15 @@ fn next_line(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Option<Ve
 /// escaping would more than double it (NUL and other control bytes) travels
 /// as `base64` alone, which bounds every event near the size of its line.
 fn relay(stream: &str, line: &[u8]) {
-    let text = String::from_utf8_lossy(line);
-    let escaped = serde_json::to_string(&text).unwrap_or_default();
     let mut event = serde_json::json!({
         "protocol": receipt::PROTOCOL,
         "event": "output",
         "stream": stream,
     });
-    if escaped.len() > 2 * line.len() + 2 {
+    if escaped_len(line) > 2 * line.len() {
         event["base64"] = receipt::base64(line).into();
     } else {
-        event["text"] = text.into_owned().into();
+        event["text"] = String::from_utf8_lossy(line).into_owned().into();
         if std::str::from_utf8(line).is_err() {
             event["base64"] = receipt::base64(line).into();
         }
@@ -1097,7 +1100,21 @@ fn relay(stream: &str, line: &[u8]) {
     crate::output::line(event.to_string().into_bytes());
 }
 
+/// The length of a line once escaped as a JSON string, counted without
+/// building it: control bytes take six (`\u0000`), a quote or backslash two.
+fn escaped_len(line: &[u8]) -> usize {
+    line.iter()
+        .map(|byte| match byte {
+            b'"' | b'\\' | b'\t' | b'\r' | 0x08 | 0x0c => 2,
+            0..0x20 => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
 pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
+    // The recipe gets the usual terminal signals back (host-run blocks them).
+    crate::transport::terminal_signals().thread_unblock()?;
     let supervisor = nix::unistd::getppid();
     setsid()?;
     let request: Request = serde_json::from_slice(&fs::read(spec)?)?;
@@ -1282,5 +1299,22 @@ mod lock_tests {
         );
         drop(inherited);
         assert!(fs2::FileExt::try_lock_exclusive(&probe).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    #[test]
+    fn the_escaped_length_matches_json() {
+        for line in [
+            &b"plain"[..],
+            b"q\"b\\t\tr\r",
+            b"\x00\x01\x1f",
+            b"\x08\x0c",
+            "é".as_bytes(),
+        ] {
+            let json = serde_json::to_string(&String::from_utf8_lossy(line)).unwrap();
+            assert_eq!(super::escaped_len(line), json.len() - 2, "{line:?}");
+        }
     }
 }

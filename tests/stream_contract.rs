@@ -574,7 +574,7 @@ fn a_line_longer_than_the_cap_is_split_without_losing_bytes() {
 /// a second; otherwise it is quiet.
 fn pipe_holder(pidfile: &Path, chatty: bool) -> String {
     let body = if chatty {
-        "while True:\n    print(\"chat\", flush=True)\n    time.sleep(1)"
+        "while True:\n    print(\"chat\", flush=True)\n    time.sleep(0.0001)"
     } else {
         "time.sleep(120)"
     };
@@ -591,7 +591,10 @@ fn a_chatty_survivor_cannot_keep_the_run_past_the_cap() {
     let _owned = Owned(pidfile.clone());
     let dir = fixture(&pipe_holder(&pidfile, true), "");
     let started = Instant::now();
+    // Debug builds keep the survivor alive on Linux too, so readers are
+    // still reading when delivery ends at the cap.
     let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "stop-survivors")
         .args(["run", "probe", "--local", "--json"])
         .output()
         .unwrap();
@@ -600,6 +603,25 @@ fn a_chatty_survivor_cannot_keep_the_run_past_the_cap() {
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     // The cap is 60 s after release, plus teardown and the final emit.
     assert!(took < Duration::from_secs(90), "{took:?}");
+    // The count is final when taken: the log holds exactly those lines,
+    // and each was delivered or dropped, once.
+    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let id = record["id"].as_str().unwrap();
+    let log = fs::read(
+        dir.path()
+            .join(format!(".ferry/local/runs/{id}/output.log")),
+    )
+    .unwrap();
+    let logged = u64::try_from(log.split(|b| *b == b'\n').count() - 1).unwrap();
+    let count = |value: &serde_json::Value| value.as_u64().unwrap_or(0);
+    assert_eq!(logged, count(&host["output_lines"]), "{host}");
+    assert_eq!(
+        count(&record["output_delivered"]["stdout"])
+            + count(&record["output_dropped"]["stdout"])
+            + count(&record["output_dropped"]["host"]),
+        logged,
+        "{record}"
+    );
 }
 
 #[test]
@@ -771,4 +793,134 @@ fn a_kill_of_the_callers_group_spares_the_supervisor() {
         .output()
         .unwrap();
     assert_eq!(receipt(&next)["outcome"], "ran-pass");
+}
+
+#[test]
+fn the_count_is_taken_after_the_readers_stop_and_matches_the_log() {
+    let dir = fixture("exec yes", "");
+    let consumer = dir.path().join("sleepy.py");
+    // Reads a little, stalls past the stall bound, then drains.
+    fs::write(
+        &consumer,
+        "import sys,time\nsys.stdin.buffer.read(1 << 20)\ntime.sleep(20)\nwhile sys.stdin.buffer.read(1 << 16):\n    pass\n",
+    )
+    .unwrap();
+    let out = Command::new("sh")
+        .current_dir(dir.path())
+        .env_remove("GIT_DIR")
+        .env_remove("FERRY_ID")
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .arg("-c")
+        .arg(format!(
+            "{} run probe --local --timeout-seconds 3 | python3 {}",
+            env!("CARGO_BIN_EXE_ferry"),
+            consumer.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let id = record["id"].as_str().unwrap();
+    let log = fs::read(
+        dir.path()
+            .join(format!(".ferry/local/runs/{id}/output.log")),
+    )
+    .unwrap();
+    let logged = u64::try_from(log.split(|b| *b == b'\n').count() - 1).unwrap();
+    let count = |value: &serde_json::Value| value.as_u64().unwrap_or(0);
+    let lines = count(&host["output_lines"]);
+    assert_eq!(logged, lines, "{host}");
+    assert_eq!(
+        count(&record["output_delivered"]["stdout"])
+            + count(&record["output_dropped"]["stdout"])
+            + count(&record["output_dropped"]["host"]),
+        lines,
+        "{record}"
+    );
+}
+
+/// Runs `ferry run pass --local` in a pty with `tostop`, its foreground,
+/// while another run holds the host lease exclusively; `interrupt` sends
+/// SIGINT to the caller after 5 s. Returns (exit code, seconds taken).
+fn under_tostop(dir: &Path, interrupt: bool) -> (i32, f64) {
+    let harness = r#"
+import os, pty, select, signal, sys, termios, time
+pid, fd = pty.fork()
+if pid == 0:
+    attrs = termios.tcgetattr(0)
+    attrs[3] |= termios.TOSTOP
+    termios.tcsetattr(0, termios.TCSANOW, attrs)
+    os.execv(sys.argv[2], sys.argv[2:])
+start = time.time()
+sent = False
+while True:
+    if sys.argv[1] == "interrupt" and not sent and time.time() - start > 5:
+        os.kill(pid, signal.SIGINT)
+        sent = True
+    # Read only what is ready, so the signal goes out on time.
+    if select.select([fd], [], [], 0.05)[0]:
+        try:
+            os.read(fd, 65536)
+        except OSError:
+            pass
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        print(os.waitstatus_to_exitcode(status), round(time.time() - start, 1))
+        sys.exit(0)
+    if time.time() - start > 150:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        print(-1, 150)
+        sys.exit(0)
+    time.sleep(0.05)
+"#;
+    let out = Command::new("python3")
+        .current_dir(dir)
+        .env_remove("FERRY_ID")
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .arg("-c")
+        .arg(harness)
+        .arg(if interrupt { "interrupt" } else { "wait" })
+        .arg(env!("CARGO_BIN_EXE_ferry"))
+        .args(["run", "pass", "--local", "--seat", "second"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut fields = text.split_whitespace();
+    let code = fields.next().and_then(|c| c.parse().ok()).unwrap_or(-2);
+    let took = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0.0);
+    (code, took)
+}
+
+#[test]
+fn a_terminal_with_tostop_never_stops_the_supervisor() {
+    for interrupt in [false, true] {
+        let scratch = tempfile::tempdir().unwrap();
+        let holding = scratch.path().join("holding");
+        let dir = fixture(&format!("touch {}; sleep 8", holding.display()), "");
+        // The first run holds the host lease alone for 8 s, so the second
+        // waits more than 3 s and prints its waiting line to the terminal.
+        let holder = ferry(dir.path())
+            .args(["run", "probe", "--local", "--exclusive", "--seat", "first"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_until("the first run holds the lease", || holding.exists());
+        let (code, took) = under_tostop(dir.path(), interrupt);
+        let mut holder = holder;
+        holder.wait().unwrap();
+        if interrupt {
+            assert_eq!(code, 130, "took {took}");
+            assert!(took < 30.0, "took {took}");
+        } else {
+            assert_eq!(code, 0, "took {took}");
+            assert!(took < 60.0, "took {took}");
+        }
+    }
 }

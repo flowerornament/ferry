@@ -211,16 +211,22 @@ pub fn check_host(root: &Path, local: bool) -> Result<()> {
         let Some(seat) = name.strip_suffix(".json") else {
             continue;
         };
-        let holds_host = fs::read(entry.path())
+        let taint = fs::read(entry.path())
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Taint>(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<Taint>(&bytes).ok());
+        let Some(taint) = taint else {
             // Unreadable: what its survivors hold is unknown.
-            .is_none_or(|taint| {
-                taint
-                    .locks
-                    .is_some_and(|locks| locks.host == "exclusive" || locks.gate)
-            });
-        if holds_host {
+            return Err(format!(
+                "seat {seat} is tainted, but its record {} is unreadable, so its survivors may hold the host lease; confirm nothing it ran is alive, then run {}",
+                entry.path().display(),
+                crate::seat::recover_hint(seat, local, " --accept-unknown --reason '<why>'")
+            )
+            .into());
+        };
+        if taint
+            .locks
+            .is_some_and(|locks| locks.host == "exclusive" || locks.gate)
+        {
             return Err(format!(
                 "the host lease is held by survivors of tainted seat {seat}; stop them, then run {}",
                 crate::seat::recover_hint(seat, local, "")
