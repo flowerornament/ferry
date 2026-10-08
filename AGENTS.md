@@ -98,7 +98,7 @@ its own reviewed change.
 - **Dated design documents** are in `design/` as `YYYY-MM-DD-topic.md`. Each
   references its beads, reviews and evidence. They are amended or superseded
   by a later dated document, never silently rewritten to match the code.
-- **Current plan:** `design/2026-10-08-coordination-and-dx.md`.
+- **Current plan:** `design/2026-10-08-core-model-v2.md` (design and roadmap M0–M4). `design/2026-10-08-coordination-and-dx.md` keeps the requirements and evidence.
 
 ## Issues
 
