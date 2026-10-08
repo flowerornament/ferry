@@ -19,8 +19,8 @@ Do not create a forge remote, upload a cache or publish a release without the
 user choosing that destination. Runtime Ferry neither provisions hosts nor
 performs these publication acts.
 
-Packaging should expose a normal Nix package/app and an optional Home Manager
-module for installation and machine configuration. It must not duplicate
+Packaging exposes a normal Nix package/app and an optional Home Manager
+module (`programs.ferry`, with the agent skill) for installation. It must not duplicate
 project recipes or bake Herald/Murail data into the binary. Target declarations
 must agree across packaging, binary releases and the installer; unsupported
 targets are not advertised merely because the source compiles on one machine.
@@ -32,7 +32,16 @@ copied by hand, and nothing reaches a forge.
 
 **Caller.** The machine's Nix configuration takes ferry as a flake input
 pinned by commit, `git+file:///path/to/ferry?rev=<commit>`, and installs
-`packages.<system>.default`. Upgrading means changing that pin through the
+`packages.<system>.default`.
+
+The flake also exports `homeManagerModules.default`, `programs.ferry`:
+
+- `enable` installs the package;
+- `skill.enable` symlinks the agent skill (`skills/ferry`) to each of
+  `skill.targets`, for example
+  `[ ".agents/skills/ferry" ".claude/skills/ferry" ]`.
+
+`skillsDir` points at the same tree for skill syncing. Upgrading means changing that pin through the
 normal configuration workflow. `scripts/ferry-install verify-caller <commit>`
 only checks the result. The first `ferry` on PATH must resolve into the Nix
 store and report `<commit>`. The executable it runs must hash to the SHA-256

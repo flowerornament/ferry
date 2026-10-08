@@ -25,6 +25,13 @@
         default = { type = "app"; program = "${self.packages.${system}.default}/bin/ferry"; };
       });
       checks = eachSystem (system: { package = self.packages.${system}.default; });
+      # programs.ferry: the package, and the skill symlinked where agents look.
+      homeManagerModules.default = import ./nix/home-manager.nix {
+        inherit self;
+        src = ./.;
+      };
+      # Source tree path for skill syncing (nix-config agent-sync.nix).
+      skillsDir = "${self}/skills";
       # Everything `just check` and the contract tests need, on any machine
       # with Nix: the recipes run in it, so no host needs these installed.
       devShells = eachSystem (system:
