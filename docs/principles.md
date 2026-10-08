@@ -1,65 +1,62 @@
 # Ferry design principles
 
-These decide design questions before anyone has to argue them case by case.
-Every freeze says which principles it touches (AGENTS.md, Design gate).
-Amending a principle means amending this file in its own reviewed change.
+Ferry runs a repository's recipe at an exact commit on a machine that can run
+it, serializes what must not overlap, and records exactly what happened.
+These principles keep it that small. Every freeze names the ones it touches
+(AGENTS.md, Design gate). Changing one is its own reviewed change to this
+file.
+
+## Principles
 
 1. **Ownership follows lifetime.** A process belongs to whatever shares its
-   lifetime. Anything a run starts that should end with the run is the run's.
-   Anything meant to outlive a run belongs to an owner with that longer
-   lifetime, never to the run that happened to start it.
-
-2. **Ferry owns nothing longer than a run.** Ferry is not a service manager:
-   no daemons, no keep-alives, no lifecycles beyond an attempt. What persists
-   between runs is files (seats, caches, records), repositories, or host
-   services owned by the operator.
-
-3. **Each layer owns what only it knows** (the end-to-end argument):
-   - the project decides what runs and how (recipes, hooks, gates, rebase and
-     conflict law);
-   - the operator decides host policy, host services and installs;
+   lifetime. A run owns only what should end with it.
+2. **Ferry owns nothing longer than a run.** No daemons, keep-alives or
+   lifecycles beyond an attempt. What persists is files (seats, caches,
+   records), repositories, or the operator's host services.
+3. **Each layer owns what only it knows.**
+   - The project decides what runs and how.
+   - The operator decides host policy, services and installs.
    - Ferry decides exclusion, custody and records.
-
 4. **Host acts belong to the operator.** Ferry never installs services or
-   changes host configuration. When something it needs is missing, it refuses
-   and names the next step.
-
+   changes host configuration. When something is missing, it refuses and
+   names the next step.
 5. **Safety from mechanism, liveness bounded.** Exclusion rests on kernel
-   primitives (flock, process lineage), never on other processes behaving
-   well. Every wait and every hold is bounded or interruptible.
-
-6. **Unknown is not empty.** When Ferry cannot prove something (that
-   processes are gone, that a seat is idle, that a host is current), it keeps
-   holding or refuses, and says so. It never infers absence.
-
-7. **Explicit beats inferred.** No behaviour keyed on process names, paths or
-   heuristics. Exceptions are declared in a contract (the project contract or
-   the host policy) and recorded.
-
-8. **One honest record per attempt.** Every attempt ends in exactly one
-   record. The record says what happened, including what Ferry did to other
+   primitives, never on other processes behaving well. Every wait and hold is
+   bounded or interruptible.
+6. **Unknown is not empty.** What Ferry cannot prove, it keeps holding or
+   refuses, and says so.
+7. **Explicit beats inferred.** No behaviour keyed on names, paths or
+   heuristics. Exceptions are declared in a contract and recorded.
+8. **One honest record per attempt,** including what Ferry did to other
    processes and what it could not prove.
+9. **Portable meaning, honest strength.** The same concepts on macOS and
+   Linux; any weaker guarantee is reported, not hidden.
+10. **A small surface.** A new concept or option must replace one or justify
+    itself in the core model. Most users are agents.
 
-9. **Portable meaning, honest strength.** Every concept means the same on
-   macOS and Linux. Where a guarantee is weaker on one platform, records and
-   capabilities say so.
+## What Ferry is not
 
-10. **A small surface.** Few concepts and few options; most users are agents.
-    A new user-facing concept must replace one or justify itself in the core
-    model (`docs/specs/2026-10-08-core-model.md`).
+Requests in this list go to the layer that owns them, not into Ferry:
 
-## Worked example: a shared service started by a run
+- **a scheduler or queue service:** locks in the tool doing the work, nothing
+  more;
+- **a service manager:** use launchd or systemd (operator);
+- **a CI system or gate runner:** repositories own their gates and land laws;
+- **a cluster or fleet manager:** machines are declared by the user;
+  provisioning is the operator's;
+- **a sandbox or security boundary:** runs execute as the user;
+- **a deployment or publication tool:** it never pushes to forges;
+- **a general cache manager:** only regenerable seat targets, under host
+  policy;
+- **a quiet-host certifier:** exclusive means "no other Ferry run here", plus
+  named observations.
 
-Herald's machine-level development Postgres is shared by every seat on a host,
-but its Linux adapter started it inside whichever run first found it down.
-Ferry's end-of-run survivor stopping (ferry-ljc.22) would have stopped it.
+## Worked example
 
-- **Principles 1 and 2:** it outlives runs, so no run owns it and Ferry cannot
-  keep it alive. That rules out a keep-alive declaration.
-- **Principles 3 and 4:** its owner is the host's service manager (launchd on
-  macOS, systemd on Linux), and setting that up is the operator's act.
-- **Principle 7:** Ferry's survivor policy gets no exemption keyed on its
-  name or path.
-- **Principles 4 and 6, until the service exists:** the project's prepare
-  refuses with a next step (start the service) instead of starting it inside
-  a run.
+Herald's shared development Postgres outlived the run that started it, and
+end-of-run survivor stopping would have stopped it.
+- **1, 2:** no run owns it, and Ferry cannot keep it alive.
+- **3, 4:** it belongs to the host's service manager, set up by the operator.
+- **7:** no exemption keyed on its name.
+- **4, 6, until then:** the project's prepare refuses with a next step instead
+  of starting it.
