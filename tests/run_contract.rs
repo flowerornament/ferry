@@ -1858,6 +1858,8 @@ fn host_run_refuses_a_request_requiring_a_capability_it_lacks() {
     assert!(!dir.path().join(".local/state/ferry/records").exists());
 }
 
+// Only Linux adopts descendants; Apple's ps cannot run in the Darwin Nix sandbox.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_recipe_can_empty_a_process_group_it_killed() {
     // Like a project's own teardown: kill a group whose members were adopted
