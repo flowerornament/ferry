@@ -41,7 +41,10 @@ there.
 - **Publish:** `just land`. It runs `just check` on your change, together
   with any described commits beneath it, and only then moves `main`. It
   refuses undescribed commits in the range, a stale parent, and any edit made
-  while the check ran. With no `origin` remote it pushes nothing: ferry is
+  while the check ran. One land at a time per repository: it holds
+  `.jj/land.lock` (flock, released on exit or crash) from the pin to the
+  publish, so a second land waits instead of gating a stale candidate.
+  With no `origin` remote it pushes nothing: ferry is
   local-only, so never add a remote or run `jj git push`. The implementer
   lands after the coordinator's GO; contract changes also need the consumer
   reviewers' GO (murail-2a, murail-4a), by execution.

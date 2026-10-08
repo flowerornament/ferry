@@ -26,6 +26,15 @@
 #
 # The gate command is LAND_GATE (default `just check`). --dry-run runs the
 # gate and every check, then stops before publishing.
+#
+# Land lock: a land (not a dry run) holds an exclusive flock on
+# <repo>/.jj/land.lock, shared by every workspace of the repository, from
+# before the pin until it publishes or refuses. A second land waits for it
+# (at most LAND_LOCK_WAIT seconds, default 3600) instead of gating a
+# candidate that is about to go stale. The lock is on an open descriptor that
+# this script and its gate inherit, so it is released when they exit, crash
+# included; a gate that leaves a daemon holding it keeps the lock until that
+# daemon exits. flock(1) on Linux, /usr/bin/lockf on macOS.
 set -euo pipefail
 
 bookmark=""
@@ -52,6 +61,30 @@ remote="${LAND_REMOTE:-origin}"
 
 refuse() { echo "land: refused: $*" >&2; exit 1; }
 
+# Takes the land lock on descriptor 9 (see above). The repository's shared
+# store is .jj/repo in the main checkout; a workspace's .jj/repo is a file
+# naming it, relative to that workspace's .jj.
+land_lock() {
+  local jj_dir store lock wait
+  jj_dir="$(jj root)/.jj"
+  store="$jj_dir/repo"
+  if [ -f "$store" ]; then store="$(cd "$jj_dir" && cd "$(cat repo)" && pwd)"; fi
+  lock="$(dirname "$store")/land.lock"
+  wait="${LAND_LOCK_WAIT:-3600}"
+  exec 9>>"$lock"
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 9 && return 0
+    echo "land: another land holds $lock; waiting up to ${wait}s" >&2
+    flock -w "$wait" 9 || refuse "the land lock $lock was still held after ${wait}s"
+  elif [ -x /usr/bin/lockf ]; then
+    /usr/bin/lockf -s -t 0 9 && return 0
+    echo "land: another land holds $lock; waiting up to ${wait}s" >&2
+    /usr/bin/lockf -s -t "$wait" 9 || refuse "the land lock $lock was still held after ${wait}s"
+  else
+    refuse "no flock(1) or /usr/bin/lockf to take the land lock"
+  fi
+}
+
 # One commit id for a revset, or empty when it names none. The first call in
 # an observation snapshots the working copy, so later calls see current files.
 rev() { jj log --no-graph -r "$1" -T 'commit_id ++ "\n"' 2>/dev/null | head -1; }
@@ -67,6 +100,7 @@ observe() {
   remote_tip="$(rev "present($bookmark@$remote)")"
 }
 
+[ "$dry_run" = 1 ] || land_lock
 observe
 [ -n "$candidate" ] || refuse "nothing to publish: @ and @- are empty"
 [ -n "$target" ] || refuse "bookmark $bookmark does not exist"
