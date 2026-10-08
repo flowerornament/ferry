@@ -73,6 +73,13 @@ there.
 1. `jj describe -m "ferry: subject (ferry-xxx)"`, then `just land`.
 2. `bd close <id>`, then `bd dolt push`.
 
+## Specs
+
+Designs live in `docs/specs/`, one dated file per decision, each referencing
+its beads, reviews and evidence. The current plan is
+`docs/specs/2026-10-08-coordination-and-dx.md`: amend it rather than drift
+from it.
+
 ## Issues
 
 Ferry's own work is tracked with bd (`bd ready`, `bd show <id>`,
