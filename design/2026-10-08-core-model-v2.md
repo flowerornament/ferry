@@ -379,6 +379,47 @@ replay against the binary comes with the refactor (§7).
 surviving mutant and no unmodelled reality gap that matters for an invariant.
 Anything accepted as residue is listed here.
 
+### 8.1 Amendment 2026-10-08: model round 2 (decisions)
+
+The first Quint model (scratchpad `quint.SAlG`, not yet in `formal/`) and its two
+adversarial reviews (reality, rigor) did **not** meet the acceptance bar.
+- Reality review: the model is not yet normative. It models the plan, not the
+  code, and its liveness rests on fairness that reality lacks.
+- Rigor review: 10 of 30 new mutants survive, and several checks are vacuous.
+
+The reports are kept with the model's history (ferry-ljc.10). These decisions
+answer the modeller's F1–F15 and both reviews, and they bind the next model
+and the M1 refactor.
+
+| # | Decision | Answers |
+|---|---|---|
+| D1 | Inside a Ferry session, every acquire on the same place is a **try**: if contended, refuse with 125 and a next step. A re-hold of a name already held up the tree refuses. Nesting stays usable when uncontended, and cannot deadlock (checked: no deadlock in the reality review's X4b). "Reuse the parent's lease" still deadlocks (X4a). | F1, R7, F15 |
+| D2 | **Keepers are the kernel or a durable marker, never a lingering process.** The owner marker (while running) and the taint (after survivors or unknown) name every lock the run holds (seat, host mode, gate, user locks). Every acquirer checks markers before its first try and while waiting. The §2.5 sentence "inheritance cannot stall a lock beyond the grace period" is withdrawn. After a supervisor death or survivors, the named locks refuse until `ferry stop` or recovery, an explicit operator act (PRINCIPLES 4, 6). | F2, F3, R2, rigor 2 |
+| D3 | **TaintRespected** is an invariant: no work starts in a seat whose last custody ended in survivors or unknown, until recovered. | F4, rigor 4 |
+| D4 | **Liveness is claimed only under stated assumptions:** the recipe ends, its timeout fires, or it is stopped; the client is up or closed (a silence deadline is S11, ljc.18). An operator's stop may fail on stuck processes. No fairness is assumed on a recipe exiting. | R3, rigor 6 |
+| D5 | **Exclusive arrivals go oldest live intent first.** The intent file names its arrival time, pid and start time, so two exclusive landers cannot starve each other. This is files only, crash-safe, and not a queue service. | rigor 6, R8 |
+| D6 | **Two records, each a state machine.** The caller's receipt and the host record are each reserved before any effect (pid, start time, token) and finalized once, by atomic rename. The caller never takes an outcome from a reserved record. Invariants: RecordsAgree (both final implies the same outcome, or the receipt names the disagreement) and RecordHonest (the outcome matches what happened). | R4, F7, rigor 8 |
+| D7 | **Non-interference:** no step of one run changes another run's client, transport or supervisor. Code: each caller owns its SSH connection (2f7ac8ea), and the local host-run gets its own process group. | R5 |
+| D8 | **The model labels every configuration as-coded or planned.** macOS as coded (no census) is a configuration expected to fail, and the records say `unsupported` (PRINCIPLES 9). Named residues: work operating on inherited descriptors (`LOCK_UN`, lock conversion; release stays `close()`); work delegated to existing daemons; a state root on a network filesystem (refused); a stopped supervisor; an unrecorded escapee after `ferry stop <dead run>`. | R1, R6, R9–R11, F11 |
+| D9 | **Progress properties:** permitted work eventually runs, and shared holders can run concurrently, so a model that refuses or serializes everything fails. | rigor 3 |
+| D10 | S9 refuses; there is no "supervisor alive → wait" (it is unreachable once the quarantine check follows lock acquisition). S5 order: mark, then release, then finalize. Intents are on the host lease and user locks; `--quiesce` writes one. The local route's provides are the caller binary's capabilities. A rank refusal is 125. A refused stop gets a record (kind `stop`). Pinned launch refuses with 125 if the described store path is gone. A nested Ferry supervisor is TERMed first by its parent's stop_survivors and releases on TERM. | F6, F8–F10, F12–F14 |
+
+**Model work for round 3:**
+- **Configurations:**
+  - crash-on liveness (EveryRunSettles, RecordEventuallyFinal);
+  - installer liveness (`cfg_pin_live`, `cfg_quiesce_live`, InstallEventuallyDone), with `cfg_pin` reworked so a `--quiesce` install overlaps a live run;
+  - two shared user-lock holders;
+  - equal-rank plans;
+  - a restart that overlaps an escapee;
+  - exclusive against exclusive.
+- **Tolerances:** no `hidden` on Linux, and `closedfd` only for the slot that closed its own descriptor.
+- **Census:** an imperfect census (it may say unknown) instead of an oracle.
+- **Invariants:**
+  - restate MutualExclusion over the kernel flock table;
+  - drop invariants that only restate a guard, or mark them as such.
+- **Tests and docs:** fix the S4 and S12 tests and the README.
+- **Acceptance:** both reviewers re-run their mutants, and none survives.
+
 ## 9. Review findings → decisions
 
 ### Reality review
