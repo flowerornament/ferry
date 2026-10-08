@@ -822,7 +822,8 @@ pub fn run(
     stop: &AtomicBool,
     locks: &[&fs::File],
 ) -> (Result<Ended>, Option<Collection>) {
-    let outcome = run_session(root, workdir, request, stop, locks);
+    let log_path = root.join("runs").join(&request.id).join("output.log");
+    let outcome = run_session(root, workdir, request, stop, locks, &log_path);
     let collection = request
         .hooks
         .collect
@@ -909,7 +910,15 @@ fn run_collect(
         if crate::seat::path(root, &request.seat).exists() {
             return Err("recipe teardown unconfirmed; collection not started".into());
         }
-        match run_session(root, workdir, &collect, &AtomicBool::new(false), locks)? {
+        let log_path = root.join("runs").join(&request.id).join("output.log");
+        match run_session(
+            root,
+            workdir,
+            &collect,
+            &AtomicBool::new(false),
+            locks,
+            &log_path,
+        )? {
             Ended::Result(code) => Ok((code, false)),
             Ended::Timeout => Ok((124, true)),
             Ended::Stopped => Err("collection stopped".into()),
@@ -969,15 +978,20 @@ fn run_session(
     request: &Request,
     stop: &AtomicBool,
     locks: &[&fs::File],
+    log_path: &Path,
 ) -> Result<Ended> {
     let run_dir = root.join("runs").join(&request.id);
     fs::create_dir_all(&run_dir)?;
     let spec = run_dir.join("request.json");
     fs::write(&spec, serde_json::to_vec(request)?)?;
     let result_path = run_dir.join("result.json");
-    let log = std::sync::Arc::new(std::sync::Mutex::new(fs::File::create(
-        run_dir.join("output.log"),
-    )?));
+    // One log per run: the collect session appends to the recipe's.
+    let log = std::sync::Arc::new(std::sync::Mutex::new(
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?,
+    ));
     crate::seat::reserve(root, request)?;
     let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks)?;
     let mut child = spawned?;
@@ -996,28 +1010,11 @@ fn run_session(
     // Readers log each line and hand it to the output writer, until EOF.
     // They never touch this loop: output is data, and the loop is control.
     // The output log gets every line read; a drop is only about delivery.
-    for (stream, reader) in [
-        ("stdout", Box::new(stdout) as Box<dyn std::io::Read + Send>),
-        ("stderr", Box::new(stderr) as Box<dyn std::io::Read + Send>),
-    ] {
-        let log = log.clone();
-        crate::output::reader_open();
-        thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(reader);
-            while let Ok(Some(line)) = next_line(&mut reader, crate::output::MAX_LINE) {
-                let admitted = crate::output::admit(|| {
-                    if let Ok(mut log) = log.lock() {
-                        let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
-                    }
-                });
-                if !admitted {
-                    break;
-                }
-                relay(stream, &line);
-            }
-            crate::output::reader_done();
-        });
-    }
+    let log_out = log.clone();
+    crate::output::reader_open();
+    thread::spawn(move || read_output("stdout", stdout, &log_out));
+    crate::output::reader_open();
+    thread::spawn(move || read_output("stderr", stderr, &log));
     let start = Instant::now();
     let ended = loop {
         crate::custody::reap_adopted(owner.child.id());
@@ -1047,67 +1044,153 @@ fn run_session(
     Ok(ended)
 }
 
-/// The next line, without its newline, at most `cap` bytes: a longer line
-/// is split. `None` at EOF.
-fn next_line(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
+/// Reads one output stream of a session until EOF, or until delivery has
+/// ended and what was readable then is drained. Reads never block for
+/// long (nonblocking, with a short poll), so a reader always notices the
+/// end. Every line read is logged and counted; it is relayed only while
+/// delivery lasts.
+fn read_output<T: std::io::Read + std::os::fd::AsFd>(
+    stream: &'static str,
+    pipe: T,
+    log: &std::sync::Mutex<fs::File>,
+) {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let nonblocking = fcntl(&pipe, FcntlArg::F_GETFL)
+        .map(OFlag::from_bits_truncate)
+        .and_then(|flags| fcntl(&pipe, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)))
+        .is_ok();
+    let mut reader = std::io::BufReader::new(pipe);
+    let mut lines = LineReader::default();
+    let mut drain: Option<(Instant, usize)> = None;
+    let emit = |line: &[u8]| match crate::output::admit(|| {
+        log.lock().is_ok_and(|mut log| {
+            log.write_all(line)
+                .and_then(|()| log.write_all(b"\n"))
+                .is_ok()
+        })
+    }) {
+        crate::output::Admit::Relay => {
+            relay(stream, line);
+            true
+        }
+        crate::output::Admit::Drained => true,
+        crate::output::Admit::Stop => false,
+    };
     loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            return Ok((!line.is_empty()).then_some(line));
-        }
-        let room = cap - line.len();
-        let take = buffer.len().min(room);
-        if let Some(end) = buffer[..take].iter().position(|b| *b == b'\n') {
-            line.extend_from_slice(&buffer[..end]);
-            reader.consume(end + 1);
-            crate::output::read(end + 1);
-            return Ok(Some(line));
-        }
-        line.extend_from_slice(&buffer[..take]);
-        reader.consume(take);
-        crate::output::read(take);
-        if line.len() == cap {
-            // A newline right at the cap ends this line, not an empty next one.
-            if reader.fill_buf()?.first() == Some(&b'\n') {
-                reader.consume(1);
-                crate::output::read(1);
+        if crate::output::ended() {
+            // Drain only what was readable then: bounded in time and bytes.
+            let (since, bytes) = *drain.get_or_insert((Instant::now(), lines.read));
+            if since.elapsed() >= crate::output::DRAIN / 2
+                || lines.read - bytes > crate::output::MAX_LINE
+            {
+                break;
             }
-            return Ok(Some(line));
         }
+        match lines.next(&mut reader, crate::output::MAX_LINE) {
+            Ok(Some(line)) => {
+                if !emit(&line) {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && nonblocking => {
+                if crate::output::ended() {
+                    break;
+                }
+                let fd = reader.get_ref().as_fd();
+                let _ = poll(
+                    &mut [PollFd::new(fd, PollFlags::POLLIN)],
+                    PollTimeout::from(100u16),
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // A final line without a newline, or one cut short by the drain.
+    if !lines.partial.is_empty() {
+        let line = std::mem::take(&mut lines.partial);
+        emit(&line);
+    }
+    crate::output::reader_done();
+}
+
+/// Splits a stream into lines of at most `cap` bytes, keeping a partial
+/// line across reads that would block.
+#[derive(Default)]
+struct LineReader {
+    partial: Vec<u8>,
+    /// The last line ended at the cap: a newline right after it ends that
+    /// line, not an empty next one.
+    after_cap: bool,
+    /// Bytes read so far.
+    read: usize,
+}
+
+impl LineReader {
+    /// The next whole line, `None` at EOF (a partial line stays in
+    /// `partial`), or the read error, `WouldBlock` included.
+    fn next(&mut self, reader: &mut impl BufRead, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            if std::mem::take(&mut self.after_cap) && buffer[0] == b'\n' {
+                reader.consume(1);
+                self.counted(1);
+                continue;
+            }
+            let room = cap - self.partial.len();
+            let take = buffer.len().min(room);
+            if let Some(end) = buffer[..take].iter().position(|b| *b == b'\n') {
+                self.partial.extend_from_slice(&buffer[..end]);
+                reader.consume(end + 1);
+                self.counted(end + 1);
+                return Ok(Some(std::mem::take(&mut self.partial)));
+            }
+            self.partial.extend_from_slice(&buffer[..take]);
+            reader.consume(take);
+            self.counted(take);
+            if self.partial.len() == cap {
+                self.after_cap = true;
+                return Ok(Some(std::mem::take(&mut self.partial)));
+            }
+        }
+    }
+
+    fn counted(&mut self, bytes: usize) {
+        self.read += bytes;
+        crate::output::read(bytes);
     }
 }
 
-/// Relays one line of recipe output as an event. The line travels as `text`
-/// when it is UTF-8; otherwise also as `base64`, so a caller can write the
-/// exact bytes (older callers read the lossy `text`). A line whose JSON
-/// escaping would more than double it (NUL and other control bytes) travels
-/// as `base64` alone, which bounds every event near the size of its line.
+/// Relays one line of recipe output as an event: as `text` when it is
+/// UTF-8 and its JSON escaping stays within twice its size; otherwise
+/// (invalid UTF-8, or NUL and other control bytes) as `base64` alone, which
+/// is exact and bounds every event near the size of its line. Callers from
+/// before `base64` print nothing for those lines.
 fn relay(stream: &str, line: &[u8]) {
     let mut event = serde_json::json!({
         "protocol": receipt::PROTOCOL,
         "event": "output",
         "stream": stream,
     });
-    if escaped_len(line) > 2 * line.len() {
-        event["base64"] = receipt::base64(line).into();
-    } else {
-        event["text"] = String::from_utf8_lossy(line).into_owned().into();
-        if std::str::from_utf8(line).is_err() {
-            event["base64"] = receipt::base64(line).into();
-        }
+    match std::str::from_utf8(line) {
+        Ok(text) if escaped_len(text) <= 2 * line.len() => event["text"] = text.into(),
+        _ => event["base64"] = receipt::base64(line).into(),
     }
     crate::output::line(event.to_string().into_bytes());
 }
 
-/// The length of a line once escaped as a JSON string, counted without
-/// building it: control bytes take six (`\u0000`), a quote or backslash two.
-fn escaped_len(line: &[u8]) -> usize {
-    line.iter()
-        .map(|byte| match byte {
-            b'"' | b'\\' | b'\t' | b'\r' | 0x08 | 0x0c => 2,
-            0..0x20 => 6,
-            _ => 1,
+/// The length of a string once escaped as a JSON string (without its
+/// quotes), counted without building it, as `serde_json` escapes.
+fn escaped_len(text: &str) -> usize {
+    text.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+            '\0'..='\u{1f}' => 6,
+            c => c.len_utf8(),
         })
         .sum()
 }
@@ -1304,17 +1387,32 @@ mod lock_tests {
 
 #[cfg(test)]
 mod relay_tests {
+    /// Every single byte, and invalid sequences: UTF-8 is measured exactly
+    /// as `serde_json` escapes it; anything not UTF-8 never travels as text.
     #[test]
-    fn the_escaped_length_matches_json() {
-        for line in [
-            &b"plain"[..],
-            b"q\"b\\t\tr\r",
-            b"\x00\x01\x1f",
-            b"\x08\x0c",
-            "é".as_bytes(),
+    fn the_escaped_length_matches_json_for_every_byte() {
+        for byte in 0u8..=255 {
+            let line = [byte];
+            match std::str::from_utf8(&line) {
+                Ok(text) => {
+                    let json = serde_json::to_string(text).unwrap();
+                    assert_eq!(super::escaped_len(text), json.len() - 2, "{byte:#04x}");
+                }
+                Err(_) => assert!(byte >= 0x80, "{byte:#04x}"),
+            }
+        }
+        for text in ["plain", "q\"b\\", "é€😀", "\u{7f}\u{80}\u{ff}"] {
+            let json = serde_json::to_string(text).unwrap();
+            assert_eq!(super::escaped_len(text), json.len() - 2, "{text:?}");
+        }
+        for invalid in [
+            &b"\x80"[..],
+            b"a\xffb",
+            b"\xc3",
+            b"\xe2\x82",
+            b"\xed\xa0\x80",
         ] {
-            let json = serde_json::to_string(&String::from_utf8_lossy(line)).unwrap();
-            assert_eq!(super::escaped_len(line), json.len() - 2, "{line:?}");
+            assert!(std::str::from_utf8(invalid).is_err(), "{invalid:?}");
         }
     }
 }

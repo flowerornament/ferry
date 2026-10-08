@@ -406,8 +406,9 @@ platforms. A remote result is evidence, not automatic publication authority.
 The host also emits `accepted` (with the supervisor's `pid`) and a bound
 `host-result`. Before acceptance it may instead emit `refused` with a
 reason. Output is escaped as data: an `output` event carries the line as
-`text`, and a line that is not UTF-8 also as `base64`. Without `--json`
-the caller writes those exact bytes, so output is byte-exact either way.
+`text`, or as `base64` alone when it is not UTF-8 or would escape to more
+than twice its size. Without `--json` the caller writes those exact
+bytes, so output is byte-exact either way.
 
 After acceptance three rules hold:
 
@@ -420,17 +421,21 @@ After acceptance three rules hold:
     `output_dropped` (`stdout`, `stderr`, or `host` for lines the host could
     not deliver). The run goes on to its own end or its timeout.
   - Live delivery is bounded and counted; the output log is the complete
-    account. Every line the recipe wrote is in the host's output log
-    (`.ferry/local/runs/<id>/output.log` for a local run). Each line is
-    counted once: delivered (`output_delivered`) or dropped
-    (`output_dropped`). The host reports how many lines it read, and lines
-    this caller never received count as `host`.
+    account of everything written before delivery ended. That includes the
+    collect hook's lines and whatever was still in the pipe when delivery
+    ended. The log is on the host (`.ferry/local/runs/<id>/output.log` for a
+    local run). Lines a survivor writes after that are not kept.
+  - Each line is counted once: delivered (`output_delivered`) or dropped
+    (`output_dropped`). The host reports how many lines it read
+    (`output_lines`), and lines this caller never received count as
+    `host`. A line whose log write failed is counted in
+    `output_log_errors`.
   - Lines longer than 1 MiB are split at 1 MiB. A split, and a final line
     without a newline, each arrive with an added newline; the output log
     has the same lines.
-  - A line whose JSON escaping would more than double it (NUL and other
-    control bytes) travels as `base64` only. Callers from before `base64`
-    print nothing for it.
+  - A line that is not UTF-8, or whose JSON escaping would more than double
+    it (NUL and other control bytes), travels as `base64` only. Callers
+    from before `base64` print nothing for it.
   - Only signals, the client's heartbeat ending (stdin EOF: "client lost"),
     and the timeout stop a run.
 - **The verdict is decided once, by the first terminal fact.**
@@ -461,6 +466,10 @@ After acceptance three rules hold:
     host record (locally, or over SSH with connection bounds). It accepts
     only a final record, and the receipt says so.
   - Both queues are bounded at 8 MiB as well as in lines.
+
+A signalled caller waits for its supervisor a bounded time: the
+supervisor's worst-case stop, or until a second signal. Then it kills it,
+and the receipt says "killed host-run …".
 
 If the local caller fails before the run ends, it closes the supervisor's
 input (its heartbeats stop). It then gives the supervisor longer than its

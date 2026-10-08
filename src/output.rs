@@ -59,10 +59,17 @@ static PROCESSED: AtomicU64 = AtomicU64::new(0);
 static READ: AtomicU64 = AtomicU64::new(0);
 /// Readers that have not reached EOF.
 static OPEN: AtomicUsize = AtomicUsize::new(0);
-/// Closed once delivery has ended: readers then log and count nothing more,
-/// so the count taken after it equals the lines in the output log. Readers
-/// hold it shared while they log and count one line.
+/// Set once delivery has ended: readers drain what is already readable,
+/// log and count it without relaying it, and stop.
+static ENDED: AtomicBool = AtomicBool::new(false);
+/// Closed after the drain: readers log and count nothing more, so the count
+/// taken after it is final. Readers hold it shared while they log and
+/// count one line.
 static CLOSED: std::sync::RwLock<bool> = std::sync::RwLock::new(false);
+/// Lines read whose output-log write failed: counted, not logged.
+static LOG_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// How long readers get to drain what was readable when delivery ended.
+pub const DRAIN: Duration = Duration::from_secs(2);
 
 fn sender() -> &'static SyncSender<Message> {
     WRITER.get_or_init(|| {
@@ -114,19 +121,41 @@ pub fn read(bytes: usize) {
     READ.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::SeqCst);
 }
 
-/// Admits one line a reader read: unless delivery has ended, runs `log`
-/// (the output log write) and counts the line, as one step. False once
-/// closed: the reader stops, and nothing more is logged or counted.
-pub fn admit(log: impl FnOnce()) -> bool {
+/// What a reader does with a line it read.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admit {
+    /// Logged and counted; relay it.
+    Relay,
+    /// Logged and counted while draining after delivery ended; not relayed.
+    Drained,
+    /// The count is final: stop, logging nothing more.
+    Stop,
+}
+
+/// Whether delivery has ended (readers drain and stop).
+pub fn ended() -> bool {
+    ENDED.load(Ordering::SeqCst)
+}
+
+/// Admits one line a reader read: runs `log` (the output log write, which
+/// says whether it succeeded) and counts the line, as one step, unless the
+/// count is final. A failed log write is counted in `log_errors`.
+pub fn admit(log: impl FnOnce() -> bool) -> Admit {
     let Ok(closed) = CLOSED.read() else {
-        return false;
+        return Admit::Stop;
     };
     if *closed {
-        return false;
+        return Admit::Stop;
     }
-    log();
+    if !log() {
+        LOG_ERRORS.fetch_add(1, Ordering::SeqCst);
+    }
     OFFERED.fetch_add(1, Ordering::SeqCst);
-    true
+    if ended() {
+        Admit::Drained
+    } else {
+        Admit::Relay
+    }
 }
 
 /// Hands one admitted output line to the writer, waiting while the channel
@@ -246,8 +275,14 @@ pub fn settle(stall: Duration, cap: Duration, stop: &AtomicBool) -> bool {
     if !delivered {
         DEAD.store(true, Ordering::SeqCst);
     }
-    // Readers still open (a survivor holds the pipe) stop at their next
-    // line: from here on nothing is logged or counted, so lines() is final.
+    // Readers still open (a survivor holds the pipe) drain what is already
+    // readable into the log, without relaying it, and stop. Then the gate
+    // closes: nothing more is logged or counted, so lines() is final.
+    ENDED.store(true, Ordering::SeqCst);
+    let drained = Instant::now() + DRAIN;
+    while OPEN.load(Ordering::SeqCst) > 0 && Instant::now() < drained {
+        thread::sleep(Duration::from_millis(10));
+    }
     if let Ok(mut closed) = CLOSED.write() {
         *closed = true;
     }
@@ -267,9 +302,14 @@ pub fn flush(bound: Duration) -> bool {
         .is_ok()
 }
 
-/// Lines of recipe output read, exactly the lines in the output log; final
-/// once `settle` has returned. The caller counts what it received, so each
+/// Lines of recipe output read: the lines in the output log plus
+/// `log_errors`; final once `settle` has returned. The caller counts what it received, so each
 /// line is counted exactly once: what was not received was dropped.
 pub fn lines() -> u64 {
     OFFERED.load(Ordering::SeqCst)
+}
+
+/// Lines read and counted whose output-log write failed.
+pub fn log_errors() -> u64 {
+    LOG_ERRORS.load(Ordering::SeqCst)
 }

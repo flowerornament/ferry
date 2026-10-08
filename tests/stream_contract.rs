@@ -924,3 +924,81 @@ fn a_terminal_with_tostop_never_stops_the_supervisor() {
         }
     }
 }
+
+/// Lines in a file.
+fn lines_in(path: &Path) -> u64 {
+    let bytes = fs::read(path).unwrap_or_default();
+    u64::try_from(bytes.split(|b| *b == b'\n').count() - 1).unwrap()
+}
+
+#[test]
+fn everything_written_before_delivery_ended_is_in_the_log() {
+    let scratch = tempfile::tempdir().unwrap();
+    let side = scratch.path().join("side");
+    let writer = scratch.path().join("writer.py");
+    // Each line goes to the side file once its write to stdout succeeded.
+    fs::write(
+        &writer,
+        format!(
+            "import sys\nside = open('{}', 'a')\nfor i in range(16107):\n    sys.stdout.write('line %d\\n' % i)\n    sys.stdout.flush()\n    side.write('%d\\n' % i)\n    side.flush()\n",
+            side.display()
+        ),
+    )
+    .unwrap();
+    let dir = fixture(&format!("exec python3 {}", writer.display()), "");
+    let (stalled, pipe) = Stalled::new();
+    let mut caller = ferry(dir.path())
+        .args(["run", "probe", "--local", "--timeout-seconds", "3"])
+        .stdout(pipe)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let host = only_record(&dir.path().join(".ferry/local/records"));
+    drop(stalled);
+    caller.wait().unwrap();
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    let id = record["id"].as_str().unwrap();
+    let logged = lines_in(
+        &dir.path()
+            .join(format!(".ferry/local/runs/{id}/output.log")),
+    );
+    let count = |value: &serde_json::Value| value.as_u64().unwrap_or(0);
+    assert_eq!(logged, lines_in(&side), "{host}");
+    assert_eq!(logged, count(&host["output_lines"]), "{host}");
+    assert_eq!(
+        count(&record["output_delivered"]["stdout"])
+            + count(&record["output_dropped"]["stdout"])
+            + count(&record["output_dropped"]["host"]),
+        logged,
+        "{record}"
+    );
+}
+
+#[test]
+fn the_collect_hooks_output_is_in_the_runs_log_and_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    git(d, &["init"]);
+    git(d, &["config", "user.name", "Ferry Test"]);
+    git(d, &["config", "user.email", "ferry@example.invalid"]);
+    fs::write(d.join("collect"), "#!/bin/sh\nseq 1 500\n").unwrap();
+    fs::set_permissions(d.join("collect"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        d.join("ferry.toml"),
+        "version=1\n[hooks]\ncollect='collect'\n[recipe.probe]\ncommand=['sh','-c','seq 1 2']\n",
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-m", "fixture"]);
+    let out = ferry(d)
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let host = only_record(&d.join(".ferry/local/records"));
+    let id = record["id"].as_str().unwrap();
+    let logged = lines_in(&d.join(format!(".ferry/local/runs/{id}/output.log")));
+    assert_eq!(logged, 502, "{host}");
+    assert_eq!(host["output_lines"], 502, "{host}");
+}

@@ -25,7 +25,7 @@ pub fn path(root: &Path, seat: &str) -> PathBuf {
 pub fn recover_hint(seat: &str, local: bool, extra: &str) -> String {
     let name = seat.split_once('-').map_or(seat, |(_, name)| name);
     if local {
-        format!("`ferry seat recover {seat} --local{extra}` (your --seat {name})")
+        format!("`ferry seat recover {seat} --local{extra}` (--seat {name})")
     } else {
         let host = std::process::Command::new("hostname")
             .output()
@@ -34,7 +34,7 @@ pub fn recover_hint(seat: &str, local: bool, extra: &str) -> String {
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "the host".into());
-        format!("`ferry seat recover {seat}{extra}` on {host} (your --seat {name})")
+        format!("`ferry seat recover {seat}{extra}` on {host} (--seat {name})")
     }
 }
 

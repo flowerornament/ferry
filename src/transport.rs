@@ -334,6 +334,9 @@ pub struct HostResult {
     /// The caller counts what it received; the rest was dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_lines: Option<u64>,
+    /// Of those, lines whose output-log write failed (counted, not logged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_log_errors: Option<u64>,
 }
 impl HostResult {
     /// A result that says nothing ran yet: refused 125 until the run says more.
@@ -355,6 +358,7 @@ impl HostResult {
             lease: None,
             admission: None,
             output_lines: None,
+            output_log_errors: None,
         })
     }
 }
@@ -587,6 +591,14 @@ pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
         });
     }
     result.output_lines = Some(crate::output::lines());
+    let log_errors = crate::output::log_errors();
+    if log_errors > 0 {
+        result.output_log_errors = Some(log_errors);
+        note(
+            &mut result.reason,
+            format!("{log_errors} output lines could not be written to output.log"),
+        );
+    }
     // The host record is the truth; a failure to write it is noted in the
     // result the caller still receives.
     let stored = serde_json::to_vec(&result)
@@ -786,18 +798,28 @@ fn converse(
         let _ = sender.send(read_stream(stdout, json, &reader_stop).map_err(|e| e.to_string()));
     });
     let bound = supervisor_grace();
-    let mut signalled: Option<std::time::Instant> = None;
+    let mut signalled: Option<(std::time::Instant, std::sync::Arc<AtomicBool>)> = None;
     let stream = loop {
         match received.recv_timeout(Duration::from_millis(100)) {
             Ok(stream) => break stream?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if execution::caught_signal().is_some() {
-                    let at = *signalled.get_or_insert_with(std::time::Instant::now);
-                    if at.elapsed() >= bound {
-                        // Already waited the full grace: no second one.
+                if signalled.is_none() && execution::caught_signal().is_some() {
+                    // A second signal means it: stop waiting at once.
+                    signalled = Some((std::time::Instant::now(), execution::stopped()?));
+                }
+                if let Some((at, again)) = &signalled {
+                    let insisted = again.load(Ordering::SeqCst);
+                    if insisted || at.elapsed() >= bound {
+                        // Waited enough: no second grace before the kill.
                         connection.grace = Duration::ZERO;
                         return Err(format!(
-                            "the supervisor did not answer within {bound:?} of the caller's signal"
+                            "killed host-run {} after {}",
+                            connection.child.id(),
+                            if insisted {
+                                "a second signal".to_owned()
+                            } else {
+                                format!("it did not answer within {bound:?} of the caller's signal")
+                            }
                         )
                         .into());
                     }
@@ -818,9 +840,11 @@ fn converse(
         }
         if std::time::Instant::now() >= deadline {
             connection.grace = Duration::ZERO;
-            return Err(
-                format!("host-run did not exit within {bound:?} of its stream ending").into(),
-            );
+            return Err(format!(
+                "killed host-run {} after it did not exit within {bound:?} of its stream ending",
+                connection.child.id()
+            )
+            .into());
         }
         thread::sleep(Duration::from_millis(50));
     };
