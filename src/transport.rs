@@ -377,6 +377,31 @@ fn refuse(reason: &str) -> i32 {
     125
 }
 
+/// The host record of a remote run, read over SSH when its host-result did
+/// not arrive. Bounded (P5): a dead link fails within about 25 s.
+fn remote_record(
+    machine: &config::Machine,
+    request: &Request,
+) -> std::result::Result<HostResult, String> {
+    let mut command = ssh().map_err(|e| e.to_string())?;
+    command
+        .args([
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=3",
+        ])
+        .arg(&machine.ssh)
+        .arg(format!(
+            "cat .local/state/ferry/records/{}.json",
+            request.id
+        ));
+    let bytes = repository::output(&mut command).map_err(|e| e.to_string())?;
+    serde_json::from_slice::<HostResult>(&bytes).map_err(|e| e.to_string())
+}
+
 /// Archives the recipe's declared artifacts. A failure, the digest's
 /// included, is recorded in the result and never changes its verdict.
 fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut HostResult) {
@@ -498,6 +523,9 @@ pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
             );
         }
         result.custody = Some(finished.custody);
+        for after in finished.notes {
+            note(&mut result.reason, after);
+        }
         // Stamped while held; the locks drop as this scope ends.
         result.lease = Some(host_lease.stamp());
         result.collection = finished.collection;
@@ -568,6 +596,8 @@ fn supervisor_grace() -> Duration {
         + execution::SESSION_CLEANUP
         + crate::custody::STOP_GRACE
         + crate::custody::KILL_GRACE
+        + crate::output::STALL * 3
+        + EVENT_BOUND * 2
         + FINAL_EMIT
         + Duration::from_secs(10)
 }
@@ -612,6 +642,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         .spawn()?;
     let (mut stream, status) = converse(child, request, &stop, json, supervisor_grace())?;
     record.output_dropped.clone_from(&stream.dropped);
+    record.output_delivered.clone_from(&stream.delivered);
     // The record on disk is the truth when the host-result did not arrive.
     // The record is reserved only after admission and bound by the token
     // checks below, so it can stand in even when no event arrived at all.
@@ -774,17 +805,22 @@ pub fn remote(
         .spawn()?;
     let (mut stream, status) = converse(child, request, &stop, json, Duration::ZERO)?;
     record.output_dropped.clone_from(&stream.dropped);
+    record.output_delivered.clone_from(&stream.delivered);
     // The record on disk is the truth when the host-result did not arrive.
     // The record is reserved only after admission and bound by the token
     // checks below, so it can stand in even when no event arrived at all.
     let from_record = stream.result.is_none() && stream.refusal.is_none();
     if from_record {
-        stream.result = repository::output(ssh()?.arg(&machine.ssh).arg(format!(
-            "cat .local/state/ferry/records/{}.json",
-            request.id
-        )))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<HostResult>(&bytes).ok());
+        let fetched = remote_record(machine, request);
+        match fetched {
+            Ok(result) => stream.result = Some(result),
+            Err(error) => note(
+                &mut record.reason,
+                format!(
+                    "the host-result did not arrive, and reading the host record failed: {error}"
+                ),
+            ),
+        }
     }
     if let Some(result) = stream.result {
         let dropped = result.output_dropped;
@@ -820,8 +856,9 @@ struct HostStream {
     result: Option<HostResult>,
     accepted: bool,
     refusal: Option<String>,
-    /// Lines this caller could not write, per stream.
+    /// Lines this caller could not write, and wrote, per stream.
     dropped: BTreeMap<String, u64>,
+    delivered: BTreeMap<String, u64>,
 }
 
 /// Relays recipe output and collects the host's protocol verdicts.
@@ -838,10 +875,13 @@ fn read_stream(
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<HostStream> {
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(bool, Vec<u8>)>(1024);
-    let dropped = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    // Lines offered to and written by the writer, per stream: every output
+    // line is either written or counted as dropped (Rule D).
+    let offered = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let written = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let done = std::sync::Arc::new(AtomicBool::new(false));
     let writer = {
-        let dropped = dropped.clone();
+        let written = written.clone();
         let done = done.clone();
         thread::spawn(move || {
             use std::io::Write as _;
@@ -849,7 +889,7 @@ fn read_stream(
             for (to_stderr, bytes) in receiver {
                 let index = usize::from(to_stderr);
                 if !dead[index] {
-                    let written = if to_stderr {
+                    let result = if to_stderr {
                         let mut err = std::io::stderr().lock();
                         err.write_all(&bytes).and_then(|()| err.write_all(b"\n"))
                     } else {
@@ -858,10 +898,10 @@ fn read_stream(
                             .and_then(|()| out.write_all(b"\n"))
                             .and_then(|()| out.flush())
                     };
-                    dead[index] = written.is_err();
-                }
-                if dead[index] {
-                    dropped[index].fetch_add(1, Ordering::SeqCst);
+                    dead[index] = result.is_err();
+                    if !dead[index] {
+                        written[index].fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
             done.store(true, Ordering::SeqCst);
@@ -872,6 +912,7 @@ fn read_stream(
         accepted: false,
         refusal: None,
         dropped: BTreeMap::new(),
+        delivered: BTreeMap::new(),
     };
     for line in std::io::BufReader::new(stdout).lines() {
         let line = line?;
@@ -908,7 +949,8 @@ fn read_stream(
             })
         };
         if let Some(message) = message {
-            offer(&sender, message, stop, &dropped);
+            offered[usize::from(message.0)].fetch_add(1, Ordering::SeqCst);
+            offer(&sender, message, stop);
         }
     }
     drop(sender);
@@ -920,9 +962,13 @@ fn read_stream(
         let _ = writer.join();
     }
     for (index, name) in ["stdout", "stderr"].into_iter().enumerate() {
-        let count = dropped[index].load(Ordering::SeqCst);
-        if count > 0 {
-            stream.dropped.insert(name.to_owned(), count);
+        let wrote = written[index].load(Ordering::SeqCst);
+        let lost = offered[index].load(Ordering::SeqCst).saturating_sub(wrote);
+        if lost > 0 {
+            stream.dropped.insert(name.to_owned(), lost);
+        }
+        if wrote > 0 {
+            stream.delivered.insert(name.to_owned(), wrote);
         }
     }
     Ok(stream)
@@ -934,16 +980,13 @@ fn offer(
     sender: &std::sync::mpsc::SyncSender<(bool, Vec<u8>)>,
     message: (bool, Vec<u8>),
     stop: &std::sync::atomic::AtomicBool,
-    dropped: &[AtomicU64; 2],
 ) {
-    let index = usize::from(message.0);
     let mut message = message;
     loop {
         match sender.try_send(message) {
             Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
             Err(std::sync::mpsc::TrySendError::Full(back)) => {
                 if stop.load(Ordering::SeqCst) {
-                    dropped[index].fetch_add(1, Ordering::SeqCst);
                     return;
                 }
                 message = back;

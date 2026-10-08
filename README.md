@@ -415,6 +415,10 @@ After acceptance three rules hold:
     closed stderr, is dropped and its lost lines counted in the receipt's
     `output_dropped` (`stdout`, `stderr`, or `host` for lines the host could
     not deliver). The run goes on to its own end or its timeout.
+  - Every line the recipe wrote is either delivered or counted:
+    `output_delivered` holds the lines this caller wrote, and with
+    `output_dropped` they add up. The output log on the host keeps every line.
+  - Lines longer than 1 MiB are split at 1 MiB, without losing a byte.
   - Only signals, the client's heartbeat ending (stdin EOF: "client lost"),
     and the timeout stop a run.
 - **The verdict is decided once, by the first terminal fact.**
@@ -428,11 +432,15 @@ After acceptance three rules hold:
   - A failed diagnostic is recorded in `reason` and leaves the outcome and
     exit code as they were. This covers writing the collection result, the
     artifact digest, the host record and the output log.
-- **The supervisor never waits on data.** Its loop checks stop, the timeout
-  and the recipe's result every tick. After writing its record it waits at
-  most 5 seconds for the final `host-result` to reach the client. If it
-  does not, the caller reads the verdict from the host record (locally, or
-  over SSH), and the receipt says so.
+- **The supervisor never waits on data.** Its loop checks the recipe's
+  result, stop and the timeout every tick, in that order. After custody
+  release, it reads the output to the end and delivers it for as long as
+  bytes keep moving. It gives up, and counts what was left, only after 5
+  seconds without progress, so a slow client gets everything and a stalled
+  one cannot hold it. Then it writes its record, with the count, and sends
+  `host-result` last. If that does not reach the client within 5 seconds,
+  the caller reads the verdict from the host record (locally, or over SSH
+  with connection bounds), and the receipt says so.
 
 If the local caller fails before the run ends, it closes the supervisor's
 input (its heartbeats stop). It then gives the supervisor longer than its
@@ -440,7 +448,8 @@ worst-case stop: session teardown, the collect hook, stopping survivors and
 the final emit. Only after that does it kill the supervisor, and it says so.
 
 Debug builds take `FERRY_FAIL_AT=<point>[,<point>…]` (`collection-write`,
-`artifact-digest`, `output-write`, `run-panic`) to inject those failures in
+`artifact-digest`, `output-write`, `run-panic`, `session-cleanup`) to
+inject those failures in
 controls. Release builds never read it.
 
 ### Outcomes and exit codes

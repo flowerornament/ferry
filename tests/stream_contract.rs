@@ -398,3 +398,174 @@ fn output_bytes_that_are_not_utf8_arrive_exactly() {
     assert_eq!(out.stdout, b"a\xffb\n");
     assert!(out.stderr.starts_with(b"\xfe\n"), "{:?}", out.stderr);
 }
+
+#[test]
+fn a_slow_consumer_gets_every_line_and_nothing_is_counted_dropped() {
+    let dir = fixture("seq 1 40000", "");
+    let consumer = dir.path().join("consumer.py");
+    fs::write(
+        &consumer,
+        "import sys,time\nn=0\nok=True\nfor i,l in enumerate(sys.stdin):\n    n+=1\n    ok = ok and l == '%d\\n' % (i+1)\n    if i % 100 == 0: time.sleep(0.02)\nprint(n, ok)\n",
+    )
+    .unwrap();
+    let out = Command::new("sh")
+        .current_dir(dir.path())
+        .env_remove("GIT_DIR")
+        .env_remove("FERRY_ID")
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .arg("-c")
+        .arg(format!(
+            "{} run probe --local | python3 {}",
+            env!("CARGO_BIN_EXE_ferry"),
+            consumer.display()
+        ))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "40000 True");
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(record["output_dropped"].is_null(), "{record}");
+    assert_eq!(record["output_delivered"]["stdout"], 40000, "{record}");
+}
+
+#[test]
+fn a_stalled_consumer_accounts_for_every_line() {
+    let dir = fixture("seq 1 40000", "");
+    let (stalled, pipe) = Stalled::new();
+    let mut caller = ferry(dir.path())
+        .args(["run", "probe", "--local"])
+        .stdout(pipe)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Backpressure holds the recipe while the consumer stalls; then the
+    // consumer goes, and every line must be delivered or counted.
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        caller.try_wait().unwrap().is_none(),
+        "the consumer was stalled"
+    );
+    drop(stalled);
+    caller.wait().unwrap();
+    let host = only_record(&dir.path().join(".ferry/local/records"));
+    assert_eq!(host["outcome"], "ran-pass", "{host}");
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let count = |value: &serde_json::Value| value.as_u64().unwrap_or(0);
+    let host_dropped = count(&host["output_dropped"]);
+    assert_eq!(
+        count(&record["output_dropped"]["host"]),
+        host_dropped,
+        "{record}"
+    );
+    assert_eq!(
+        host_dropped
+            + count(&record["output_delivered"]["stdout"])
+            + count(&record["output_dropped"]["stdout"]),
+        40000,
+        "{record}"
+    );
+}
+
+#[test]
+fn a_failed_teardown_after_the_verdict_is_a_note() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo done", "");
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "session-cleanup")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("session teardown"),
+        "{record}"
+    );
+    // The unconfirmed teardown quarantines the host until an operator acts.
+    let next = ferry(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(receipt(&next)["outcome"], "refused");
+    assert!(
+        receipt(&next)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cleanup_pending")
+    );
+}
+
+#[test]
+fn a_callers_signal_after_the_verdict_is_named_and_keeps_it() {
+    let scratch = tempfile::tempdir().unwrap();
+    let collecting = scratch.path().join("collecting");
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    git(d, &["init"]);
+    git(d, &["config", "user.name", "Ferry Test"]);
+    git(d, &["config", "user.email", "ferry@example.invalid"]);
+    fs::write(
+        d.join("collect"),
+        format!("#!/bin/sh\ntouch {}\nsleep 3\n", collecting.display()),
+    )
+    .unwrap();
+    fs::set_permissions(d.join("collect"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        d.join("ferry.toml"),
+        "version=1\n[hooks]\ncollect='collect'\n[recipe.probe]\ncommand=['sh','-c','echo done']\n",
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-m", "fixture"]);
+    let caller = ferry(d)
+        .args(["run", "probe", "--local", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the collect hook started", || collecting.exists());
+    kill(
+        Pid::from_raw(i32::try_from(caller.id()).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+    let out = caller.wait_with_output().unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("after the verdict: caller received SIGINT"),
+        "{record}"
+    );
+}
+
+#[test]
+fn a_line_longer_than_the_cap_is_split_without_losing_bytes() {
+    let dir = fixture(
+        "head -c 3145728 /dev/zero | tr '\\0' a; echo; echo tail",
+        "",
+    );
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let chunk = vec![b'a'; 1 << 20];
+    let mut expected = Vec::new();
+    for _ in 0..3 {
+        expected.extend_from_slice(&chunk);
+        expected.push(b'\n');
+    }
+    expected.extend_from_slice(b"tail\n");
+    assert!(out.stdout == expected, "{} bytes", out.stdout.len());
+}

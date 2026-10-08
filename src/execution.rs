@@ -45,6 +45,9 @@ impl SessionOwner {
     }
 
     fn cleanup_session(&mut self) -> Result<()> {
+        if fail_at("session-cleanup") {
+            return Err("session cleanup failed: injected by FERRY_FAIL_AT".into());
+        }
         let sid = self.child.id();
         signal_session(sid, Signal::SIGTERM)?;
         let deadline = Instant::now() + SESSION_CLEANUP;
@@ -721,12 +724,25 @@ pub fn verdict(
     }
 }
 
+/// Notes on what failed after a run reached its verdict (a session
+/// teardown that could not be confirmed, output cut short). One host-run
+/// supervises one request, so they are kept here and taken once.
+static NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn note_after(note: String) {
+    if let Ok(mut notes) = NOTES.lock() {
+        notes.push(note);
+    }
+}
+
 /// What a supervised run came to. Custody is always present once a session
 /// may have been spawned (S8).
 pub struct Finished {
     pub executed: Result<Ended>,
     pub collection: Option<Collection>,
     pub custody: crate::custody::Release,
+    /// Failures after the verdict: recorded, never changing it.
+    pub notes: Vec<String>,
 }
 
 /// The lock descriptors a session inherits: the seat lock and the host
@@ -769,10 +785,22 @@ pub fn run_released(
     // seat idle.
     let terminal = matches!(executed, Ok(Ended::Result(_) | Ended::Timeout));
     let custody = crate::custody::release(root, request, terminal);
+    // Survivors that held the output pipes are stopped by now: read to EOF
+    // and deliver, for as long as bytes move (Rule D).
+    if !crate::output::settle(crate::output::STALL) {
+        note_after(format!(
+            "output cut short: no progress for {:?}; undelivered lines are counted in output_dropped",
+            crate::output::STALL
+        ));
+    }
     Finished {
         executed,
         collection,
         custody,
+        notes: NOTES
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default(),
     }
 }
 
@@ -926,9 +954,6 @@ pub enum Ended {
 pub const SESSION_CLEANUP: Duration = Duration::from_secs(5);
 /// The collect hook's own bound.
 pub const COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a session's output readers get to finish after teardown, so
-/// its last lines precede the verdict; a stalled client never holds it.
-const READERS_GRACE: Duration = Duration::from_secs(2);
 
 fn run_session(
     root: &Path,
@@ -960,30 +985,33 @@ fn run_session(
     };
     // After the owner exists, so a failure here still tears the session down.
     restored?;
-    // Readers log each line and hand it to the output writer. They never
-    // touch this loop: output is data, and the loop is control.
-    let readers = Arc::new(AtomicUsize::new(2));
+    // Readers log each line and hand it to the output writer, until EOF.
+    // They never touch this loop: output is data, and the loop is control.
+    // The output log gets every line read; a drop is only about delivery.
     for (stream, reader) in [
         ("stdout", Box::new(stdout) as Box<dyn std::io::Read + Send>),
         ("stderr", Box::new(stderr) as Box<dyn std::io::Read + Send>),
     ] {
         let log = log.clone();
-        let readers = readers.clone();
+        crate::output::reader_open();
         thread::spawn(move || {
-            for line in std::io::BufReader::new(reader).split(b'\n') {
-                let Ok(line) = line else { break };
-                // The output log is a diagnostic: a failed write never ends the run.
+            let mut reader = std::io::BufReader::new(reader);
+            while let Ok(Some(line)) = next_line(&mut reader, crate::output::MAX_LINE) {
                 if let Ok(mut log) = log.lock() {
                     let _ = log.write_all(&line).and_then(|()| log.write_all(b"\n"));
                 }
                 relay(stream, &line);
             }
-            readers.fetch_sub(1, Ordering::SeqCst);
+            crate::output::reader_done();
         });
     }
     let start = Instant::now();
     let ended = loop {
         crate::custody::reap_adopted(owner.child.id());
+        // The first terminal fact wins: a result before a stop or timeout.
+        if let Ok(bytes) = fs::read(&result_path) {
+            break Ended::Result(serde_json::from_slice::<i32>(&bytes)?);
+        }
         if stop.load(Ordering::SeqCst) {
             break Ended::Stopped;
         }
@@ -993,20 +1021,48 @@ fn run_session(
         {
             break Ended::Timeout;
         }
-        if let Ok(bytes) = fs::read(&result_path) {
-            break Ended::Result(serde_json::from_slice::<i32>(&bytes)?);
-        }
         if let Some(status) = owner.child.try_wait()? {
             return Err(format!("session owner exited without result: {status}").into());
         }
         thread::sleep(Duration::from_millis(20));
     };
-    owner.cleanup()?;
-    let deadline = Instant::now() + READERS_GRACE;
-    while readers.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
+    // A teardown that cannot be confirmed quarantines the host (cleanup
+    // pending) and taints nothing silently; after the verdict it is a note.
+    if let Err(error) = owner.cleanup() {
+        note_after(format!("session teardown: {error}"));
     }
     Ok(ended)
+}
+
+/// The next line, without its newline, at most `cap` bytes: a longer line
+/// is split. `None` at EOF.
+fn next_line(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let room = cap - line.len();
+        let take = buffer.len().min(room);
+        if let Some(end) = buffer[..take].iter().position(|b| *b == b'\n') {
+            line.extend_from_slice(&buffer[..end]);
+            reader.consume(end + 1);
+            crate::output::read(end + 1);
+            return Ok(Some(line));
+        }
+        line.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        crate::output::read(take);
+        if line.len() == cap {
+            // A newline right at the cap ends this line, not an empty next one.
+            if reader.fill_buf()?.first() == Some(&b'\n') {
+                reader.consume(1);
+                crate::output::read(1);
+            }
+            return Ok(Some(line));
+        }
+    }
 }
 
 /// Relays one line of recipe output as an event. The line travels as `text`

@@ -219,6 +219,23 @@ fn run(options: &Run) -> Result<i32> {
     }
     // An interrupted caller exits 128 plus its signal, unless the recipe had
     // already reached a verdict.
+    // After the verdict, the caller's own signal is named in the note: the
+    // host saw only its client go away.
+    if let Some(signal) = execution::caught_signal()
+        && matches!(
+            record.outcome,
+            receipt::Outcome::RanPass | receipt::Outcome::RanFail | receipt::Outcome::Timeout
+        )
+    {
+        let named = format!("after the verdict: caller received {}", signal_name(signal));
+        record.reason = Some(match record.reason.take() {
+            Some(reason) if reason.contains("after the verdict: client lost: heartbeat EOF") => {
+                reason.replace("after the verdict: client lost: heartbeat EOF", &named)
+            }
+            Some(reason) => format!("{named}; {reason}"),
+            None => named,
+        });
+    }
     if let Some(signal) = execution::caught_signal()
         && !matches!(
             record.outcome,
@@ -292,6 +309,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         admission: None,
         provider_requires: vec![],
         output_dropped: BTreeMap::default(),
+        output_delivered: BTreeMap::default(),
     })
 }
 

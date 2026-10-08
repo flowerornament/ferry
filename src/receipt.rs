@@ -120,6 +120,10 @@ pub struct Receipt {
     /// `stdout`/`stderr` (this caller's), `host` (the host's stream).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub output_dropped: std::collections::BTreeMap<String, u64>,
+    /// Output lines this caller wrote, by stream; with `output_dropped`,
+    /// every relayed line is accounted for.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub output_delivered: std::collections::BTreeMap<String, u64>,
 }
 
 pub fn now_ms() -> u128 {
