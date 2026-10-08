@@ -10,6 +10,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{BufRead, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -329,9 +330,10 @@ pub struct HostResult {
     pub lease: Option<execution::Lease>,
     #[serde(default)]
     pub admission: Option<crate::admission::Admission>,
-    /// Output lines and events the host could not deliver to its client.
+    /// Lines of recipe output the host read, every one in its output log.
+    /// The caller counts what it received; the rest was dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_dropped: Option<u64>,
+    pub output_lines: Option<u64>,
 }
 impl HostResult {
     /// A result that says nothing ran yet: refused 125 until the run says more.
@@ -352,7 +354,7 @@ impl HostResult {
             custody: None,
             lease: None,
             admission: None,
-            output_dropped: None,
+            output_lines: None,
         })
     }
 }
@@ -377,14 +379,25 @@ fn refuse(reason: &str) -> i32 {
     125
 }
 
+/// A host record that stands in for a host-result: only a final one. A
+/// reserved (empty) or unreadable record means the host never finished.
+fn final_record(bytes: &[u8]) -> std::result::Result<HostResult, String> {
+    if bytes.is_empty() {
+        return Err("host record not final".into());
+    }
+    serde_json::from_slice::<HostResult>(bytes).map_err(|e| format!("host record not final: {e}"))
+}
+
 /// The host record of a remote run, read over SSH when its host-result did
 /// not arrive. Bounded (P5): a dead link fails within about 25 s.
 fn remote_record(
     machine: &config::Machine,
     request: &Request,
 ) -> std::result::Result<HostResult, String> {
-    let mut command = ssh().map_err(|e| e.to_string())?;
+    // Options precede the destination, so this is built in full here.
+    let mut command = Command::new("ssh");
     command
+        .args(ssh_options(&machine.ssh).map_err(|e| e.to_string())?)
         .args([
             "-o",
             "ConnectTimeout=10",
@@ -399,7 +412,7 @@ fn remote_record(
             request.id
         ));
     let bytes = repository::output(&mut command).map_err(|e| e.to_string())?;
-    serde_json::from_slice::<HostResult>(&bytes).map_err(|e| e.to_string())
+    final_record(&bytes)
 }
 
 /// Archives the recipe's declared artifacts. A failure, the digest's
@@ -425,11 +438,16 @@ fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut H
     }
 }
 
-/// Records what did not travel over the stream: lines the host could not
-/// deliver, and a verdict read from the host record instead of the stream.
-fn note_delivery(record: &mut Receipt, host_dropped: Option<u64>, from_record: bool) {
-    if let Some(dropped) = host_dropped {
-        record.output_dropped.insert("host".into(), dropped);
+/// Records what did not travel over the stream: lines the host read but
+/// this caller never received (each line counted once, here), and a
+/// verdict read from the host record instead of the stream.
+fn note_delivery(record: &mut Receipt, host_lines: Option<u64>, received: u64, from_record: bool) {
+    if let Some(lines) = host_lines
+        && lines > received
+    {
+        record
+            .output_dropped
+            .insert("host".into(), lines - received);
     }
     if from_record {
         note(
@@ -556,10 +574,7 @@ pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
             None => reason,
         });
     }
-    let dropped = crate::output::dropped();
-    if dropped > 0 {
-        result.output_dropped = Some(dropped);
-    }
+    result.output_lines = Some(crate::output::lines());
     // The host record is the truth; a failure to write it is noted in the
     // result the caller still receives.
     let stored = serde_json::to_vec(&result)
@@ -632,10 +647,14 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     let stop = execution::stopped()?;
     // The last moment before the host is asked to run anything.
     execution::interrupted()?;
+    // Its own process group: a signal or kill aimed at the caller's group
+    // (a harness, a terminal) cannot take the supervisor with it. The
+    // supervisor learns of a lost caller from its heartbeat.
     let child = Command::new(std::env::current_exe()?)
         .arg("host-run")
         .arg("--state")
         .arg(&state)
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -648,9 +667,16 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     // checks below, so it can stand in even when no event arrived at all.
     let from_record = stream.result.is_none() && stream.refusal.is_none();
     if from_record {
-        stream.result = fs::read(state.join("records").join(format!("{}.json", request.id)))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<HostResult>(&bytes).ok());
+        match fs::read(state.join("records").join(format!("{}.json", request.id)))
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| final_record(&bytes))
+        {
+            Ok(result) => stream.result = Some(result),
+            Err(error) => note(
+                &mut record.reason,
+                format!("the host-result did not arrive, and the host record is unusable: {error}"),
+            ),
+        }
     }
     if let Some(result) = stream.result {
         if result.token != request.token
@@ -669,7 +695,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         record.custody = result.custody;
         record.lease = result.lease;
         record.admission = result.admission;
-        note_delivery(record, result.output_dropped, from_record);
+        note_delivery(record, result.output_lines, stream.received, from_record);
         if record.host_binary_sha256.as_deref() != Some(&record.caller_binary_sha256) {
             record.outcome = Outcome::Lost;
             record.exit_code = 255;
@@ -823,9 +849,9 @@ pub fn remote(
         }
     }
     if let Some(result) = stream.result {
-        let dropped = result.output_dropped;
+        let lines = result.output_lines;
         accept_result(root, machine, request, record, &info, result)?;
-        note_delivery(record, dropped, from_record);
+        note_delivery(record, lines, stream.received, from_record);
     } else if let Some(reason) = stream.refusal {
         refused_by(record, &info);
         record.outcome = Outcome::Refused;
@@ -859,6 +885,8 @@ struct HostStream {
     /// Lines this caller could not write, and wrote, per stream.
     dropped: BTreeMap<String, u64>,
     delivered: BTreeMap<String, u64>,
+    /// Output events received from the host.
+    received: u64,
 }
 
 /// Relays recipe output and collects the host's protocol verdicts.
@@ -874,49 +902,34 @@ fn read_stream(
     json: bool,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<HostStream> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<(bool, Vec<u8>)>(1024);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<(bool, bool, Vec<u8>)>(1024);
     // Lines offered to and written by the writer, per stream: every output
     // line is either written or counted as dropped (Rule D).
     let offered = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let written = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let done = std::sync::Arc::new(AtomicBool::new(false));
-    let writer = {
-        let written = written.clone();
-        let done = done.clone();
-        thread::spawn(move || {
-            use std::io::Write as _;
-            let mut dead = [false, false];
-            for (to_stderr, bytes) in receiver {
-                let index = usize::from(to_stderr);
-                if !dead[index] {
-                    let result = if to_stderr {
-                        let mut err = std::io::stderr().lock();
-                        err.write_all(&bytes).and_then(|()| err.write_all(b"\n"))
-                    } else {
-                        let mut out = std::io::stdout().lock();
-                        out.write_all(&bytes)
-                            .and_then(|()| out.write_all(b"\n"))
-                            .and_then(|()| out.flush())
-                    };
-                    dead[index] = result.is_err();
-                    if !dead[index] {
-                        written[index].fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-            }
-            done.store(true, Ordering::SeqCst);
-        })
-    };
+    let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writer = spawn_writer(
+        receiver,
+        written.clone(),
+        done.clone(),
+        queued_bytes.clone(),
+    );
     let mut stream = HostStream {
         result: None,
         accepted: false,
         refusal: None,
         dropped: BTreeMap::new(),
         delivered: BTreeMap::new(),
+        received: 0,
     };
     for line in std::io::BufReader::new(stdout).lines() {
-        let line = line?;
-        let value: serde_json::Value = serde_json::from_str(&line)?;
+        // A truncated or unreadable event line is data, not control: the
+        // stream ends there, and the host record can stand in.
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            break;
+        };
         if value.get("protocol").and_then(serde_json::Value::as_u64) != Some(1) {
             return Err("host protocol mismatch".into());
         }
@@ -925,6 +938,7 @@ fn read_stream(
             Some("refused") if !stream.accepted => {
                 stream.refusal = Some(value["reason"].as_str().unwrap_or("").to_owned());
             }
+            Some("output") => stream.received += 1,
             Some("host-result") => {
                 stream.result = Some(serde_json::from_value::<HostResult>(
                     value["result"].clone(),
@@ -933,24 +947,33 @@ fn read_stream(
             }
             _ => {}
         }
+        let output = value.get("event").and_then(|v| v.as_str()) == Some("output");
         let message = if json {
-            Some((false, line.into_bytes()))
+            Some((false, output, line.into_bytes()))
         } else {
-            value.get("text").and_then(|v| v.as_str()).map(|text| {
-                let bytes = value
-                    .get("base64")
-                    .and_then(|v| v.as_str())
-                    .and_then(receipt::unbase64)
-                    .unwrap_or_else(|| text.as_bytes().to_vec());
-                (
-                    value.get("stream").and_then(|v| v.as_str()) == Some("stderr"),
-                    bytes,
-                )
-            })
+            value
+                .get("base64")
+                .and_then(|v| v.as_str())
+                .and_then(receipt::unbase64)
+                .or_else(|| {
+                    value
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|text| text.as_bytes().to_vec())
+                })
+                .map(|bytes| {
+                    (
+                        value.get("stream").and_then(|v| v.as_str()) == Some("stderr"),
+                        output,
+                        bytes,
+                    )
+                })
         };
         if let Some(message) = message {
-            offered[usize::from(message.0)].fetch_add(1, Ordering::SeqCst);
-            offer(&sender, message, stop);
+            if message.1 {
+                offered[usize::from(message.0)].fetch_add(1, Ordering::SeqCst);
+            }
+            offer(&sender, message, stop, &queued_bytes);
         }
     }
     drop(sender);
@@ -974,21 +997,68 @@ fn read_stream(
     Ok(stream)
 }
 
+/// The caller's output writer: writes each line to its stream, and once a
+/// stream fails stops writing it (its lines then count as dropped).
+fn spawn_writer(
+    receiver: std::sync::mpsc::Receiver<(bool, bool, Vec<u8>)>,
+    written: std::sync::Arc<[AtomicU64; 2]>,
+    done: std::sync::Arc<AtomicBool>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut dead = [false, false];
+        for (to_stderr, counted, bytes) in receiver {
+            queued_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
+            let index = usize::from(to_stderr);
+            if !dead[index] {
+                let result = if to_stderr {
+                    let mut err = std::io::stderr().lock();
+                    err.write_all(&bytes).and_then(|()| err.write_all(b"\n"))
+                } else {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(&bytes)
+                        .and_then(|()| out.write_all(b"\n"))
+                        .and_then(|()| out.flush())
+                };
+                dead[index] = result.is_err();
+                if !dead[index] && counted {
+                    written[index].fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+    })
+}
+
 /// Hands one line to the caller's writer, waiting for room unless the
 /// caller has been signalled; then the line is dropped and counted.
 fn offer(
-    sender: &std::sync::mpsc::SyncSender<(bool, Vec<u8>)>,
-    message: (bool, Vec<u8>),
+    sender: &std::sync::mpsc::SyncSender<(bool, bool, Vec<u8>)>,
+    message: (bool, bool, Vec<u8>),
     stop: &std::sync::atomic::AtomicBool,
+    queued_bytes: &std::sync::atomic::AtomicUsize,
 ) {
+    let size = message.2.len();
     let mut message = message;
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        // Room in bytes as well as lines (always room for one line).
+        let queued = queued_bytes.load(Ordering::SeqCst);
+        if queued > 0 && queued + size > crate::output::MAX_QUEUE {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        queued_bytes.fetch_add(size, Ordering::SeqCst);
         match sender.try_send(message) {
-            Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+            Ok(()) => return,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                queued_bytes.fetch_sub(size, Ordering::SeqCst);
+                return;
+            }
             Err(std::sync::mpsc::TrySendError::Full(back)) => {
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
+                queued_bytes.fetch_sub(size, Ordering::SeqCst);
                 message = back;
                 thread::sleep(Duration::from_millis(5));
             }
@@ -1064,4 +1134,31 @@ fn accept_result(
         crate::artifacts::unpack(&archive, &destination)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{final_record, read_stream};
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn a_truncated_last_event_ends_the_stream_instead_of_failing_it() {
+        let stream = b"{\"protocol\":1,\"event\":\"accepted\",\"id\":\"x\",\"pid\":1}\n\
+{\"protocol\":1,\"event\":\"output\",\"stream\":\"stdout\",\"text\":\"one\"}\n\
+{\"protocol\":1,\"event\":\"host-res";
+        let read = read_stream(&stream[..], false, &AtomicBool::new(false)).unwrap();
+        assert!(read.accepted);
+        assert!(read.result.is_none());
+        assert_eq!(read.received, 1);
+    }
+
+    #[test]
+    fn only_a_final_record_stands_in_for_the_host_result() {
+        assert!(final_record(b"").unwrap_err().contains("not final"));
+        assert!(
+            final_record(b"{\"protocol\":1")
+                .unwrap_err()
+                .contains("not final")
+        );
+    }
 }

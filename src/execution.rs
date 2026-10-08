@@ -291,6 +291,11 @@ fn acquire_as(
 /// cannot extend its wait; before that it competes for the gate, unqueued. The lease
 /// covers sessions under this state root only: not other users, processes
 /// outside Ferry, or other machines sharing the hardware.
+///
+/// Locks are released only by closing their descriptors (dropping the
+/// files), never by `LOCK_UN`: a session may share the open file
+/// description through inherited descriptors, and an explicit unlock would
+/// free it under that session.
 pub struct HostLease {
     held: Vec<fs::File>,
     pub record: Lease,
@@ -341,6 +346,8 @@ impl HostLease {
         } else {
             // A tainted exclusive run's survivors may hold the gate or lease.
             let tainted = || crate::custody::check_host(root, local);
+            // Before the first try too, not only once contended.
+            tainted()?;
             let gate = acquire_as(&gate, stop, true, &tainted)?;
             let host = acquire_as(&host, stop, true, &tainted)?;
             drop(gate);
@@ -787,10 +794,11 @@ pub fn run_released(
     let custody = crate::custody::release(root, request, terminal);
     // Survivors that held the output pipes are stopped by now: read to EOF
     // and deliver, for as long as bytes move (Rule D).
-    if !crate::output::settle(crate::output::STALL) {
+    if !crate::output::settle(crate::output::STALL, crate::output::CAP, stop) {
         note_after(format!(
-            "output cut short: no progress for {:?}; undelivered lines are counted in output_dropped",
-            crate::output::STALL
+            "output cut short (no progress for {:?}, {:?} in all, or a stop); undelivered lines are counted in output_dropped, and output.log has every line",
+            crate::output::STALL,
+            crate::output::CAP
         ));
     }
     Finished {
@@ -1067,16 +1075,24 @@ fn next_line(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Option<Ve
 
 /// Relays one line of recipe output as an event. The line travels as `text`
 /// when it is UTF-8; otherwise also as `base64`, so a caller can write the
-/// exact bytes (older callers read the lossy `text`).
+/// exact bytes (older callers read the lossy `text`). A line whose JSON
+/// escaping would more than double it (NUL and other control bytes) travels
+/// as `base64` alone, which bounds every event near the size of its line.
 fn relay(stream: &str, line: &[u8]) {
+    let text = String::from_utf8_lossy(line);
+    let escaped = serde_json::to_string(&text).unwrap_or_default();
     let mut event = serde_json::json!({
         "protocol": receipt::PROTOCOL,
         "event": "output",
         "stream": stream,
-        "text": String::from_utf8_lossy(line),
     });
-    if std::str::from_utf8(line).is_err() {
+    if escaped.len() > 2 * line.len() + 2 {
         event["base64"] = receipt::base64(line).into();
+    } else {
+        event["text"] = text.into_owned().into();
+        if std::str::from_utf8(line).is_err() {
+            event["base64"] = receipt::base64(line).into();
+        }
     }
     crate::output::line(event.to_string().into_bytes());
 }
@@ -1243,5 +1259,28 @@ mod tests {
                 "{ended:?} {cause:?} {attempted}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    /// Release is by close: while any descriptor of the open file
+    /// description lives (an inherited copy, here a clone), the lock is held,
+    /// which is why Ferry never unlocks explicitly.
+    #[test]
+    fn a_lock_is_released_only_when_every_descriptor_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let held = std::fs::File::create(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        let inherited = held.try_clone().unwrap();
+        drop(held);
+        let probe = std::fs::File::open(&path).unwrap();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&probe).is_err(),
+            "freed while a copy lived"
+        );
+        drop(inherited);
+        assert!(fs2::FileExt::try_lock_exclusive(&probe).is_ok());
     }
 }

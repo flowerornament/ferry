@@ -9,10 +9,14 @@
 //!   makes no progress for a stall bound, it stops writing; every line not
 //!   written is counted as dropped. That never stops the run (client loss
 //!   is learned from stdin, not from stdout);
-//! - waits after the run are bounded by a stall (no progress), not by total
-//!   time, so a slow client still gets everything;
-//! - the supervisor's own events wait a bounded time for room, then are
-//!   dropped. The record on disk is the truth.
+//! - delivery after the run is bounded twice: a stall (no progress) and a
+//!   total cap, and a stop ends it. Termination wins over completeness: a
+//!   consumer slower than the stall bound gets drops, counted, and the
+//!   host's output.log keeps every line;
+//! - the supervisor's own events are always attempted, whatever became of
+//!   the output, within a bounded wait for room. The record on disk is the
+//!   truth;
+//! - the queue is bounded in bytes as well as lines.
 use std::{
     io::Write,
     sync::{
@@ -24,8 +28,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long a wait after the run may see no progress before giving up.
-pub const STALL: Duration = Duration::from_secs(5);
+/// How long delivery after the run may see no progress before giving up.
+pub const STALL: Duration = Duration::from_secs(15);
+/// The most delivery after the run may take, however bytes move.
+pub const CAP: Duration = Duration::from_secs(60);
+/// The most bytes waiting in the queue.
+pub const MAX_QUEUE: usize = 8 << 20;
 /// The longest line relayed as one: longer lines are split.
 pub const MAX_LINE: usize = 1 << 20;
 
@@ -37,12 +45,14 @@ enum Message {
 }
 
 static WRITER: OnceLock<SyncSender<Message>> = OnceLock::new();
-/// Set once the client cannot or will not take more: later lines are dropped.
+/// Set once the client cannot or will not take more output: later output
+/// lines are dropped (events are still attempted).
 static DEAD: AtomicBool = AtomicBool::new(false);
-/// Output lines readers read, queued, and written to the client.
+/// Bytes waiting in the queue.
+static QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Output lines readers read, and messages queued.
 static OFFERED: AtomicU64 = AtomicU64::new(0);
 static QUEUED: AtomicU64 = AtomicU64::new(0);
-static WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Messages the writer has finished with, written or not.
 static PROCESSED: AtomicU64 = AtomicU64::new(0);
 /// Bytes readers have read: progress on the recipe's side.
@@ -65,18 +75,15 @@ fn write_all(receiver: &Receiver<Message>) {
     for message in receiver {
         match message {
             Message::Line { bytes, output } => {
-                if !DEAD.load(Ordering::SeqCst) {
+                QUEUED_BYTES.fetch_sub(bytes.len(), Ordering::SeqCst);
+                if !(output && DEAD.load(Ordering::SeqCst)) {
                     let mut out = std::io::stdout().lock();
                     let written = out
                         .write_all(&bytes)
                         .and_then(|()| out.write_all(b"\n"))
                         .and_then(|()| out.flush());
-                    match written {
-                        Ok(()) if output => {
-                            WRITTEN.fetch_add(1, Ordering::SeqCst);
-                        }
-                        Ok(()) => {}
-                        Err(_) => DEAD.store(true, Ordering::SeqCst),
+                    if written.is_err() {
+                        DEAD.store(true, Ordering::SeqCst);
                     }
                 }
                 PROCESSED.fetch_add(1, Ordering::SeqCst);
@@ -108,6 +115,7 @@ pub fn read(bytes: usize) {
 /// Once the writer has given up, the line is not queued: it is dropped.
 pub fn line(bytes: Vec<u8>) {
     OFFERED.fetch_add(1, Ordering::SeqCst);
+    let size = bytes.len();
     let mut message = Message::Line {
         bytes,
         output: true,
@@ -116,13 +124,24 @@ pub fn line(bytes: Vec<u8>) {
         if DEAD.load(Ordering::SeqCst) {
             return;
         }
+        // Room in bytes as well as lines (always room for one line).
+        let queued = QUEUED_BYTES.load(Ordering::SeqCst);
+        if queued > 0 && queued + size > MAX_QUEUE {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        QUEUED_BYTES.fetch_add(size, Ordering::SeqCst);
         match sender().try_send(message) {
             Ok(()) => {
                 QUEUED.fetch_add(1, Ordering::SeqCst);
                 return;
             }
-            Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Disconnected(_)) => {
+                QUEUED_BYTES.fetch_sub(size, Ordering::SeqCst);
+                return;
+            }
             Err(TrySendError::Full(back)) => {
+                QUEUED_BYTES.fetch_sub(size, Ordering::SeqCst);
                 message = back;
                 thread::sleep(Duration::from_millis(5));
             }
@@ -152,22 +171,36 @@ fn offer(message: Message, bound: Duration) -> bool {
 /// Queues one of the supervisor's own events, waiting at most `bound` for
 /// room; an event that finds none is not sent.
 pub fn event(value: &serde_json::Value, bound: Duration) {
+    let bytes = value.to_string().into_bytes();
+    let size = bytes.len();
+    QUEUED_BYTES.fetch_add(size, Ordering::SeqCst);
     let message = Message::Line {
-        bytes: value.to_string().into_bytes(),
+        bytes,
         output: false,
     };
     if offer(message, bound) {
         QUEUED.fetch_add(1, Ordering::SeqCst);
+    } else {
+        QUEUED_BYTES.fetch_sub(size, Ordering::SeqCst);
     }
 }
 
 /// Waits while `pending` holds and progress (bytes read, messages
-/// processed) keeps moving; false once nothing moved for `stall`.
-fn wait_with_progress(stall: Duration, pending: impl Fn() -> bool) -> bool {
+/// processed) keeps moving; false once nothing moved for `stall`, the
+/// `deadline` passed, or `stop` was set.
+fn wait_with_progress(
+    stall: Duration,
+    deadline: Instant,
+    stop: &AtomicBool,
+    pending: impl Fn() -> bool,
+) -> bool {
     let progress = || READ.load(Ordering::SeqCst) + PROCESSED.load(Ordering::SeqCst);
     let mut last = progress();
     let mut moved = Instant::now();
     while pending() {
+        if stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+            return false;
+        }
         thread::sleep(Duration::from_millis(10));
         let now = progress();
         if now != last {
@@ -181,20 +214,19 @@ fn wait_with_progress(stall: Duration, pending: impl Fn() -> bool) -> bool {
 }
 
 /// Called after custody release: waits for every reader to reach EOF and
-/// the writer to deliver everything they queued, for as long as bytes keep
-/// moving. On a stall the writer gives up, so blocked readers drop the
-/// rest and can still reach EOF. False if output was cut short, with lines
-/// unread (a survivor still holds the pipe) or undelivered.
-pub fn settle(stall: Duration) -> bool {
-    let read_all = wait_with_progress(stall, || OPEN.load(Ordering::SeqCst) > 0);
+/// the writer to deliver what they queued, while bytes move, for at most
+/// `cap` in all, and not past a stop. Then the writer stops taking output
+/// and readers drop the rest. Bytes from a survivor never extend it past
+/// the cap. False if output was cut short.
+pub fn settle(stall: Duration, cap: Duration, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + cap;
+    let read_all = wait_with_progress(stall, deadline, stop, || OPEN.load(Ordering::SeqCst) > 0);
     let delivered = read_all
-        && wait_with_progress(stall, || {
+        && wait_with_progress(stall, deadline, stop, || {
             PROCESSED.load(Ordering::SeqCst) < QUEUED.load(Ordering::SeqCst)
         });
     if !delivered {
         DEAD.store(true, Ordering::SeqCst);
-        // Readers that were waiting for room now drop their lines and go on.
-        wait_with_progress(stall, || OPEN.load(Ordering::SeqCst) > 0);
     }
     read_all && delivered
 }
@@ -212,10 +244,9 @@ pub fn flush(bound: Duration) -> bool {
         .is_ok()
 }
 
-/// Lines of recipe output read but not delivered to the client.
-pub fn dropped() -> u64 {
+/// Lines of recipe output read, all of them in the output log. The caller
+/// counts what it received, so each line is counted exactly once: what was
+/// not received was dropped.
+pub fn lines() -> u64 {
     OFFERED.load(Ordering::SeqCst)
-        - WRITTEN
-            .load(Ordering::SeqCst)
-            .min(OFFERED.load(Ordering::SeqCst))
 }

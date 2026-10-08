@@ -676,3 +676,75 @@ fn a_failed_release_never_changes_the_verdict_of_work_that_ran() {
         "{report}"
     );
 }
+
+// R2b: a taint names the whole signalled subtree, pid and start time, and
+// recovery checks every member.
+#[test]
+fn a_taint_names_the_whole_subtree_and_recovery_checks_every_member() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let leader = tmp.path().join("leader.pid");
+    let child = tmp.path().join("child.pid");
+    let o1 = Owned {
+        pidfile: leader.clone(),
+        marker: "68.1",
+    };
+    let o2 = Owned {
+        pidfile: child.clone(),
+        marker: "68.2",
+    };
+    let dir = fixture(
+        &format!(
+            "setsid sh -c 'echo $$ > {l}; exec </dev/null >/dev/null 2>&1; sleep 68.2 & echo $! > {c}; exec sleep 68.1' & while [ ! -s {c} ]; do sleep 0.05; done; exit 0",
+            l = leader.display(),
+            c = child.display()
+        ),
+        &[],
+    );
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "stop-survivors")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["custody"]["record"], "taint", "{record}");
+    let seat = seat_key(dir.path());
+    let taint: serde_json::Value = serde_json::from_slice(
+        &fs::read(dir.path().join(format!(".ferry/local/taint/{seat}.json"))).unwrap(),
+    )
+    .unwrap();
+    let named: Vec<i64> = taint["survivors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["pid"].as_i64().unwrap())
+        .collect();
+    for owned in [&o1, &o2] {
+        assert!(named.contains(&i64::from(owned.pid().unwrap())), "{taint}");
+    }
+    assert!(
+        taint["survivors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["start"].is_number()),
+        "{taint}"
+    );
+    // The grandchild alone keeps recovery refused.
+    drop(o1);
+    thread::sleep(Duration::from_millis(300));
+    let refused = ferry(dir.path())
+        .args(["seat", "recover", &seat, "--local"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(125), "{}", receipt(&refused));
+    drop(o2);
+    thread::sleep(Duration::from_millis(300));
+    let recovered = ferry(dir.path())
+        .args(["seat", "recover", &seat, "--local"])
+        .output()
+        .unwrap();
+    assert_eq!(recovered.status.code(), Some(0), "{}", receipt(&recovered));
+}

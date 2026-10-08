@@ -316,7 +316,9 @@ remote run, and as a child of the caller for `--local`, on the repository's
 `.ferry/local` state, over the same protocol. Having just started, it has no
 children of its own, so nothing outside the run can be adopted and
 attributed to it. A wrapper's background job, or that job's orphans, stays
-the wrapper's. Killing that host-run (its pid is in the `accepted` event)
+the wrapper's. The local host-run runs in its own process group, so a
+signal or kill aimed at the caller's group (a harness, a terminal) does
+not reach it. It learns of a lost caller from its heartbeat. Killing that host-run (its pid is in the `accepted` event)
 is killing the supervisor. Killing the caller instead ends its heartbeats,
 so host-run stops the work and releases.
 
@@ -346,11 +348,13 @@ it, before waiting for the seat lock and again while waiting, since a
 survivor may still hold that lock. The next step is to stop those
 processes, then run `ferry seat recover <seat>` on the host that ran it.
 The refusal names the command, the host, and your `--seat`. A taint record
-also names the locks its survivors may still hold: the seat, and the host
-lease in the run's mode (an exclusive run also held the gate). While any
-seat is tainted, an `--exclusive` run refuses. A run waiting for the lease
-also refuses, when a taint says its survivors may hold it exclusively or
-hold the gate. Any run that waits more than 3 seconds for a lock prints one
+names every process in the signalled subtree, by pid and start time, so
+recovery checks them all. It also names the locks those processes may still
+hold: the seat, and the host lease in the run's mode (an exclusive run also
+held the gate). While any seat is tainted, an `--exclusive` run refuses. A
+run that needs the lease also refuses, before its first try, when a taint
+says its survivors may hold it exclusively or hold the gate, or when a
+taint cannot be read. Any run that waits more than 3 seconds for a lock prints one
 line saying so.
 
 Recovery never kills. It refuses while the seat lock is held, and clears the
@@ -415,10 +419,18 @@ After acceptance three rules hold:
     closed stderr, is dropped and its lost lines counted in the receipt's
     `output_dropped` (`stdout`, `stderr`, or `host` for lines the host could
     not deliver). The run goes on to its own end or its timeout.
-  - Every line the recipe wrote is either delivered or counted:
-    `output_delivered` holds the lines this caller wrote, and with
-    `output_dropped` they add up. The output log on the host keeps every line.
-  - Lines longer than 1 MiB are split at 1 MiB, without losing a byte.
+  - Live delivery is bounded and counted; the output log is the complete
+    account. Every line the recipe wrote is in the host's output log
+    (`.ferry/local/runs/<id>/output.log` for a local run). Each line is
+    counted once: delivered (`output_delivered`) or dropped
+    (`output_dropped`). The host reports how many lines it read, and lines
+    this caller never received count as `host`.
+  - Lines longer than 1 MiB are split at 1 MiB. A split, and a final line
+    without a newline, each arrive with an added newline; the output log
+    has the same lines.
+  - A line whose JSON escaping would more than double it (NUL and other
+    control bytes) travels as `base64` only. Callers from before `base64`
+    print nothing for it.
   - Only signals, the client's heartbeat ending (stdin EOF: "client lost"),
     and the timeout stop a run.
 - **The verdict is decided once, by the first terminal fact.**
@@ -432,15 +444,23 @@ After acceptance three rules hold:
   - A failed diagnostic is recorded in `reason` and leaves the outcome and
     exit code as they were. This covers writing the collection result, the
     artifact digest, the host record and the output log.
-- **The supervisor never waits on data.** Its loop checks the recipe's
-  result, stop and the timeout every tick, in that order. After custody
-  release, it reads the output to the end and delivers it for as long as
-  bytes keep moving. It gives up, and counts what was left, only after 5
-  seconds without progress, so a slow client gets everything and a stalled
-  one cannot hold it. Then it writes its record, with the count, and sends
-  `host-result` last. If that does not reach the client within 5 seconds,
-  the caller reads the verdict from the host record (locally, or over SSH
-  with connection bounds), and the receipt says so.
+- **The supervisor never waits on data, and termination wins.** Its loop
+  checks the recipe's result, stop and the timeout every tick, in that
+  order.
+  - After custody release it reads the output to the end and delivers it.
+    It stops after 15 seconds without progress, after 60 seconds in all, or
+    on a stop, whichever comes first, and counts what was left.
+  - A consumer slower than that gets drops, counted in `output_dropped`.
+    The output log still has every line.
+  - A survivor that writes to the output cannot keep a run alive past the
+    cap.
+  - Then the supervisor writes its record, with its line count, and sends
+    `host-result` last. Its events are always attempted, even when output
+    was given up. If `host-result` does not reach the client within 5
+    seconds, or arrives truncated, the caller reads the verdict from the
+    host record (locally, or over SSH with connection bounds). It accepts
+    only a final record, and the receipt says so.
+  - Both queues are bounded at 8 MiB as well as in lines.
 
 If the local caller fails before the run ends, it closes the supervisor's
 input (its heartbeats stop). It then gives the supervisor longer than its
@@ -448,8 +468,8 @@ worst-case stop: session teardown, the collect hook, stopping survivors and
 the final emit. Only after that does it kill the supervisor, and it says so.
 
 Debug builds take `FERRY_FAIL_AT=<point>[,<point>…]` (`collection-write`,
-`artifact-digest`, `output-write`, `run-panic`, `session-cleanup`) to
-inject those failures in
+`artifact-digest`, `output-write`, `run-panic`, `session-cleanup`,
+`stop-survivors`) to inject those failures in
 controls. Release builds never read it.
 
 ### Outcomes and exit codes

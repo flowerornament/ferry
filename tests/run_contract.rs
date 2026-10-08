@@ -1762,7 +1762,17 @@ fn synthetic_seat(state: &Path, seat: &str, released_ms: Option<u64>, extra: Opt
     }
     if let Some(kind) = extra {
         fs::create_dir_all(state.join(kind)).unwrap();
-        fs::write(state.join(kind).join(format!("{seat}.json")), "{}").unwrap();
+        // A well-formed record: an unreadable taint is unknown, which any
+        // run waiting for the host lease must refuse.
+        let record = if kind == "taint" {
+            serde_json::json!({"id": "earlier", "reason": "descendants survived the session",
+                "pids": [], "survivors": [],
+                "locks": {"seat": seat, "host": "shared", "gate": false}})
+            .to_string()
+        } else {
+            "{}".to_owned()
+        };
+        fs::write(state.join(kind).join(format!("{seat}.json")), record).unwrap();
     }
 }
 

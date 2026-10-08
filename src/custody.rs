@@ -319,6 +319,7 @@ fn try_release(
     let last = after.as_ref().unwrap_or(&census);
     let record = match (last, terminal) {
         (Census::Survivors(pids), _) => {
+            let subtree = attributed(pids);
             write(
                 root,
                 "taint",
@@ -326,12 +327,14 @@ fn try_release(
                 &Taint {
                     id: request.id.clone(),
                     reason: "descendants survived the session".into(),
-                    pids: pids.clone(),
-                    survivors: pids
+                    // The whole subtree that was signalled, so recovery
+                    // checks every member, not only the direct children.
+                    pids: subtree.iter().map(|(pid, _)| *pid).collect(),
+                    survivors: subtree
                         .iter()
-                        .map(|pid| Survivor {
+                        .map(|(pid, start)| Survivor {
                             pid: *pid,
-                            start: crate::seat::start_time(*pid).ok(),
+                            start: *start,
                         })
                         .collect(),
                     locks: held_locks(request),
@@ -388,6 +391,10 @@ fn try_release(
 /// a deeper descendant is signalled only while its start time still matches.
 fn stop(first: &[i32]) -> (Vec<i32>, Census) {
     use nix::sys::signal::Signal;
+    // Debug builds only: a control can make survivors unstoppable.
+    if crate::execution::fail_at("stop-survivors") {
+        return (vec![], census());
+    }
     let mut stopped: Vec<i32> = vec![];
     let mut current = Census::Survivors(first.to_vec());
     for (signal, grace) in [(Signal::SIGTERM, STOP_GRACE), (Signal::SIGKILL, KILL_GRACE)] {

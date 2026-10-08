@@ -7,7 +7,7 @@ use nix::{
 };
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
@@ -299,7 +299,7 @@ fn a_closed_caller_stderr_is_dropped_and_counted_not_a_stop() {
 }
 
 #[test]
-fn a_host_that_cannot_write_still_delivers_its_verdict_through_the_record() {
+fn a_host_whose_output_is_dead_still_sends_its_events() {
     if !cfg!(debug_assertions) {
         return;
     }
@@ -312,11 +312,11 @@ fn a_host_that_cannot_write_still_delivers_its_verdict_through_the_record() {
     let record = receipt(&out);
     assert_eq!(out.status.code(), Some(0), "{record}");
     assert_eq!(record["outcome"], "ran-pass", "{record}");
-    assert!(
-        record["reason"].as_str().unwrap().contains("host record"),
-        "{record}"
-    );
+    // The output line was not delivered, and is counted once; the
+    // host-result still arrived over the stream, not from the record.
     assert!(!String::from_utf8_lossy(&out.stdout).contains("hidden"));
+    assert_eq!(record["output_dropped"]["host"], 1, "{record}");
+    assert!(record["reason"].is_null(), "{record}");
 }
 
 #[test]
@@ -568,4 +568,207 @@ fn a_line_longer_than_the_cap_is_split_without_losing_bytes() {
     }
     expected.extend_from_slice(b"tail\n");
     assert!(out.stdout == expected, "{} bytes", out.stdout.len());
+}
+
+/// A survivor the recipe leaves holding its stdout: `chatty` writes a line
+/// a second; otherwise it is quiet.
+fn pipe_holder(pidfile: &Path, chatty: bool) -> String {
+    let body = if chatty {
+        "while True:\n    print(\"chat\", flush=True)\n    time.sleep(1)"
+    } else {
+        "time.sleep(120)"
+    };
+    format!(
+        "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\n{body}' & while [ ! -e {p} ]; do sleep 0.05; done; echo done",
+        p = pidfile.display()
+    )
+}
+
+#[test]
+fn a_chatty_survivor_cannot_keep_the_run_past_the_cap() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("chatty.pid");
+    let _owned = Owned(pidfile.clone());
+    let dir = fixture(&pipe_holder(&pidfile, true), "");
+    let started = Instant::now();
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    // The cap is 60 s after release, plus teardown and the final emit.
+    assert!(took < Duration::from_secs(90), "{took:?}");
+}
+
+#[test]
+fn a_stop_during_delivery_ends_it_promptly() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("chatty.pid");
+    let _owned = Owned(pidfile.clone());
+    let dir = fixture(&pipe_holder(&pidfile, true), "");
+    let caller = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the recipe finished", || pidfile.exists());
+    thread::sleep(Duration::from_secs(2));
+    let signalled = Instant::now();
+    kill(
+        Pid::from_raw(i32::try_from(caller.id()).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+    let out = caller.wait_with_output().unwrap();
+    assert!(
+        signalled.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        signalled.elapsed()
+    );
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+}
+
+#[test]
+fn a_quiet_pipe_holder_does_not_suppress_the_host_result() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("quiet.pid");
+    let _owned = Owned(pidfile.clone());
+    let dir = fixture(&pipe_holder(&pidfile, false), "");
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let reason = record["reason"].as_str().unwrap_or("");
+    assert!(!reason.contains("did not arrive"), "{record}");
+}
+
+/// Resident memory of a pid in KiB, from ps.
+fn rss_kib(pid: u32) -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// The pid of the caller's host-run child, from ps.
+fn child_of(parent: u32) -> Option<u32> {
+    let out = Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid: u32 = fields.next()?.parse().ok()?;
+            (fields.next()?.parse::<u32>().ok()? == parent).then_some(pid)
+        })
+}
+
+#[test]
+fn queues_stay_within_their_byte_bound() {
+    // Memory is read with ps, which the Darwin Nix sandbox cannot spawn;
+    // this control runs on a Mac host and on Linux.
+    if Command::new("ps").arg("-p").arg("1").output().is_err() {
+        return;
+    }
+    let dir = fixture("head -c 52428800 /dev/zero", "");
+    let (stalled, pipe) = Stalled::new();
+    let mut caller = ferry(dir.path())
+        .args(["run", "probe", "--local"])
+        .stdout(pipe)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut host = None;
+    wait_until("the host-run started", || {
+        host = child_of(caller.id());
+        host.is_some()
+    });
+    thread::sleep(Duration::from_secs(4));
+    let (caller_kib, host_kib) = (rss_kib(caller.id()), rss_kib(host.unwrap()));
+    drop(stalled);
+    caller.wait().unwrap();
+    // 8 MiB queue + a 1 MiB line in hand + the process itself.
+    assert!(caller_kib < 64 * 1024, "caller {caller_kib} KiB");
+    assert!(host_kib < 64 * 1024, "host-run {host_kib} KiB");
+}
+
+#[test]
+fn a_taint_that_may_hold_the_host_refuses_before_any_wait() {
+    let dir = fixture("echo ran", "");
+    let taint = dir.path().join(".ferry/local/taint");
+    fs::create_dir_all(&taint).unwrap();
+    fs::write(
+        taint.join("abc-held.json"),
+        serde_json::json!({"id": "earlier", "reason": "descendants survived the session",
+            "pids": [], "survivors": [],
+            "locks": {"seat": "abc-held", "host": "exclusive", "gate": true}})
+        .to_string(),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("host lease is held"),
+        "{record}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(30));
+}
+
+#[test]
+fn a_kill_of_the_callers_group_spares_the_supervisor() {
+    let scratch = tempfile::tempdir().unwrap();
+    let started_file = scratch.path().join("started");
+    let dir = fixture(
+        &format!(
+            "touch {}; while :; do sleep 0.1; done",
+            started_file.display()
+        ),
+        "",
+    );
+    let caller = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the recipe started", || started_file.exists());
+    let group = Pid::from_raw(i32::try_from(caller.id()).unwrap());
+    nix::sys::signal::killpg(group, Signal::SIGKILL).unwrap();
+    let mut caller = caller;
+    caller.wait().unwrap();
+    // The supervisor survived in its own group: it saw its client go, stopped
+    // the work, accounted for custody, and wrote a final record.
+    let record = only_record(&dir.path().join(".ferry/local/records"));
+    assert_eq!(record["outcome"], "lost", "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("client lost"),
+        "{record}"
+    );
+    assert!(!record["custody"].is_null(), "{record}");
+    let next = ferry(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(receipt(&next)["outcome"], "ran-pass");
 }
