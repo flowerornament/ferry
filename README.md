@@ -468,8 +468,10 @@ just land            # gate exactly the described change, then move main (one la
 - `PRINCIPLES.md`: what Ferry is and is not, and how design questions are
   decided.
 - `design/`: dated design documents, with their reviews and evidence.
-- **Current plan:** `design/2026-10-08-core-model-v3.md`. A run becomes a
-  bounded, detached job:
+- **Current plan:** `design/2026-10-09-ferry-minimal.md`: Ferry does one
+  thing (an exact commit's recipe on your machine, warm, alone if asked, with
+  an honest record) and pushes containment strength to the OS and scheduling
+  to repositories and CI. A run becomes a bounded, detached job:
   - a dropped connection never ends a run; its mandatory timeout or
     `ferry stop` does;
   - output is written to a file on the machine;

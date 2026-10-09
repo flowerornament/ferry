@@ -1,6 +1,6 @@
 # Ferry core model v3: a run is a bounded, detached job held by the kernel
 
-Status: proposed, 2026-10-08, amended the same day by the adversarial design review (§14 wins where it differs). Owner: the ferry seat.
+Status: superseded in part, 2026-10-09, by `design/2026-10-09-ferry-minimal.md` (its custody machinery is withdrawn; detachment, file output and the record cycle stay). Proposed 2026-10-08, amended the same day by the adversarial design review (§14). Owner: the ferry seat.
 
 - **Supersedes** `design/2026-10-08-core-model-v2.md` wherever the two differ.
   v2 stays the record of the review history: §3's amendment (rules A–C), §8.1

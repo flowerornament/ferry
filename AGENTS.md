@@ -101,7 +101,7 @@ its own reviewed change.
 - **Dated design documents** are in `design/` as `YYYY-MM-DD-topic.md`. Each
   references its beads, reviews and evidence. They are amended or superseded
   by a later dated document, never silently rewritten to match the code.
-- **Current plan:** `design/2026-10-08-core-model-v3.md` (design and roadmap; supersedes v2 where they differ). `design/2026-10-08-core-model-v2.md` keeps the review history (rules A–C, D1–D10). `design/2026-10-08-coordination-and-dx.md` keeps the requirements and evidence.
+- **Current plan:** `design/2026-10-09-ferry-minimal.md` (one thing done well; deletion-first roadmap), which supersedes `design/2026-10-08-core-model-v3.md` where they differ. v3 and v2 keep the review history (rules A–C, D1–D10, E1–E14). `design/2026-10-08-coordination-and-dx.md` keeps the requirements and evidence.
 
 ## Issues
 
