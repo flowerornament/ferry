@@ -1,7 +1,8 @@
 # Ferry design principles
 
-Ferry runs a repository's recipe at an exact commit on a machine that can run
-it, serializes what must not overlap, and records exactly what happened.
+Ferry does one thing: it runs a repository's recipe, at an exact commit (even
+an unpushed one), on a machine you own, in a warm checkout, alone if you ask,
+and gives you an honest record. It serializes only what must not overlap.
 These principles keep it that small. Every freeze names the ones it touches
 (AGENTS.md, Design gate). Changing one is its own reviewed change to this
 file.
@@ -35,8 +36,11 @@ file.
    primitives, never on other processes behaving well. Each guarantee rests
    on one kernel mechanism or one file. Every wait and hold is bounded or
    interruptible.
-6. **Unknown is not empty.** What Ferry cannot prove, it keeps holding or
-   refuses, and says so.
+6. **Report what you cannot prove; refuse only by mechanism.** A held kernel
+   lock is the only "busy"; anything that may have survived a run is named
+   in its record, not chased. Ferry does not grow machinery to prove
+   absence. Stronger containment comes from the operating system (for
+   example a systemd scope), reported as a tier.
 7. **Explicit beats inferred.** No behaviour keyed on names, paths or
    heuristics. Exceptions are declared in a contract and recorded.
 8. **One honest record per attempt,** including what Ferry did to other
@@ -56,12 +60,16 @@ Requests in this list go to the layer that owns them, not into Ferry:
   (flock or lockf; `scripts/jj-land.sh` is the worked example);
 - **a service manager:** use launchd or systemd (operator);
 - **a CI system or gate runner:** repositories own their gates and land laws;
+  queues, schedules, retries, fan-out, dashboards and artifact stores belong
+  to repositories or real CI tools;
+- **a process supervisor or containment tool:** a run's session is stopped at
+  its end; anything stronger is the operating system's;
 - **a cluster or fleet manager:** machines are declared by the user;
   provisioning is the operator's;
 - **a sandbox or security boundary:** runs execute as the user;
 - **a deployment or publication tool:** it never pushes to forges;
-- **a general cache manager:** only regenerable seat targets, under host
-  policy;
+- **a cache manager:** a floor check that refuses; reclaiming disk is the
+  operator's (a script or timer), not logic inside a run;
 - **a quiet-host certifier:** exclusive means "no other Ferry run here", plus
   named observations.
 
