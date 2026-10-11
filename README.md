@@ -336,6 +336,10 @@ or prepares its seat) runs none of them, collect included: nothing ran.
 - **env** prints a JSON object of environment strings, never shell code.
 - **Inputs:** `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, `FERRY_WORKDIR`,
   `FERRY_CACHE_DIR`; collect also gets `FERRY_EXIT_CODE`.
+- **Identity:** the checkout path's basename is not an identity (every
+  seat's is `checkout`). A stable per-seat identity is `FERRY_SEAT`, the
+  same value the pre-M1 slot directory was named after; `FERRY_ID` is per
+  run.
 - **Reserved:** `FERRY_*` and `GIT_CONFIG_GLOBAL`. A hook cannot replace the
   run's identity or the seat-local git configuration that serves shipped
   URLs.

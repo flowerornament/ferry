@@ -84,6 +84,10 @@ operator removes the old runtime state once, by hand, on each place:
 `~/.local/state/ferry/{locks,slots,caches,runs,records,mirrors,companion-refs}`
 (and `.ferry/local/{locks,slots,caches,runs,records,mirrors,companion-refs,repo.git}`
 in each repository). Nothing in `v1/` and no install state is touched.
+A pre-M1 caller may push objects into the old root's store before the new
+place refuses it; this is harmless, since the old root is cleaned by hand
+after the window. The checkout path's basename is not an identity: use
+`FERRY_SEAT` (stable per seat), not the directory name.
 
 **What this guarantees and what it does not.**
 
