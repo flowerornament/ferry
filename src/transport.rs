@@ -145,6 +145,10 @@ pub struct HostInfo {
     pub protocol: u32,
     pub binary_sha256: String,
     pub os_arch: String,
+    /// Not read here; emitted because every caller before slice 7 requires
+    /// it, so it parses this reply and refuses naming the revision (§12.11).
+    #[serde(default)]
+    pub cores: usize,
     #[serde(default)]
     pub source_rev: Option<String>,
     #[serde(default)]
@@ -158,6 +162,7 @@ pub fn host_info() -> Result<HostInfo> {
         protocol: receipt::PROTOCOL,
         binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
         os_arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        cores: std::thread::available_parallelism()?.get(),
         source_rev: Some(receipt::source_rev()),
         exe: receipt::exe_path(),
         capabilities: receipt::capabilities(),

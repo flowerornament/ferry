@@ -97,24 +97,16 @@ impl HostResult {
 
 /// The place's state root under the home directory (SPEC §9). It is `v1`
 /// inside the root binaries before M1 used, which never look inside it, so
-/// old and new never share a root; the local route's is
+/// old and new never share a root (SPEC §6); the local route's is
 /// `<repo>/.ferry/local/v1`, the same rule.
 pub const REMOTE_ROOT: &str = ".local/state/ferry/v1";
 
-/// The state root: `~/` + `REMOTE_ROOT` unless named. On first use, the old
-/// root around it gets `locks/legacy-closed`, for any old binary that
-/// honours it (SPEC §6).
+/// The state root: `~/` + `REMOTE_ROOT` unless named.
 pub fn root(state: Option<PathBuf>) -> Result<PathBuf> {
-    let root = match state {
-        Some(state) => state,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join(REMOTE_ROOT),
-    };
-    if let Some(old) = root.parent().map(|old| old.join("locks"))
-        && old.is_dir()
-    {
-        let _ = fs::write(old.join("legacy-closed"), "closed by the M1 layout (v1)\n");
-    }
-    Ok(root)
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    state
+        .or_else(|| home.map(|home| home.join(REMOTE_ROOT)))
+        .ok_or_else(|| "HOME missing".into())
 }
 
 fn run_dir(root: &Path, id: &str) -> PathBuf {
@@ -126,7 +118,11 @@ fn reply(value: &serde_json::Value) {
     execution::emit(value.to_string().as_bytes());
 }
 
-const SAME_FERRY: &str = "install the same ferry on the caller and the place";
+/// Names this place's revision, so an older caller knows what to install.
+fn same_ferry() -> String {
+    let rev = receipt::source_rev();
+    format!("install the same ferry on both ends (this place runs {rev})")
+}
 const FIX: &str = "fix what it names, then run again";
 
 /// A refusal (SPEC §6): `{refused, why, next}`.
@@ -142,7 +138,7 @@ pub fn submit(root: &Path) -> Result<i32> {
     let mut request: Request = match serde_json::from_str(&line) {
         Ok(request) => request,
         Err(e) => {
-            return Ok(refuse(&format!("parsing the request: {e}"), SAME_FERRY));
+            return Ok(refuse(&format!("parsing the request: {e}"), &same_ferry()));
         }
     };
     let limit = crate::limits::MAX_TIMEOUT.as_secs();

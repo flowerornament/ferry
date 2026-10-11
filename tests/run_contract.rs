@@ -2852,11 +2852,10 @@ fn concurrent_first_runs_shipping_one_object_never_refuse() {
 }
 
 /// M1 keeps its state in `v1` inside the old root, which pre-M1 binaries
-/// never look into, and closes an old root it finds with
-/// `locks/legacy-closed`, touching nothing else there; a repository with no
-/// old root gets no sentinel (SPEC §6, §9, §12.11).
+/// never look into, and touches nothing of an old root it finds: old and
+/// new never share a state root (SPEC §6, §9, §12.11).
 #[test]
-fn an_old_root_is_closed_and_never_shared() {
+fn an_old_root_is_never_shared() {
     let dir = fixture();
     let old = dir.path().join(".ferry/local");
     fs::create_dir_all(old.join("locks")).unwrap();
@@ -2864,11 +2863,40 @@ fn an_old_root_is_closed_and_never_shared() {
     fs::write(old.join("slots/old-seat/kept"), "an old binary's").unwrap();
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert!(out.status.success(), "{}", receipt(&out));
-    assert!(old.join("locks/legacy-closed").exists());
+    assert_eq!(fs::read_dir(old.join("locks")).unwrap().count(), 0);
     assert!(old.join("slots/old-seat/kept").exists());
     assert!(only_checkout(dir.path()).join("ferry.toml").exists());
-    let fresh = fixture();
-    let out = run(fresh.path(), &["run", "pass", "--local", "--json"]);
-    assert!(out.status.success(), "{}", receipt(&out));
-    assert!(!fresh.path().join(".ferry/local/locks").exists());
+}
+
+/// Every caller before slice 7 requires `cores` in host-info: an upgraded
+/// place still emits it, so such a caller parses the reply and refuses
+/// naming the revision, never lost (SPEC §12.11; the critic's m2).
+#[test]
+fn host_info_still_carries_what_older_callers_require() {
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("host-info")
+        .output()
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        info["cores"].as_u64().is_some_and(|cores| cores > 0),
+        "{info}"
+    );
+}
+
+/// A request this place cannot parse (an older caller's shape) is refused
+/// naming this place's revision, so the caller knows what to install
+/// (SPEC §12.11; the critic's m2, run by hand with the real d1b8984f caller).
+#[test]
+fn an_unparsable_request_is_refused_naming_the_places_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = serde_json::json!({
+        "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
+        "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
+        "timeout_seconds": null, "forwarded_env": {}
+    });
+    let (code, reply) = submit(dir.path(), &request);
+    assert_eq!(code, Some(125), "{reply}");
+    assert!(reply.contains("this place runs "), "{reply}");
+    assert!(!dir.path().join("records").exists());
 }

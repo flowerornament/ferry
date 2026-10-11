@@ -289,9 +289,9 @@ Each freeze states the measured running src.
 - **Fresh root, one rule:** the place root is `v1` inside the root binaries
   before M1 used: `~/.local/state/ferry/v1` (`place::REMOTE_ROOT`, the one
   constant; the transport's store path derives from it), and
-  `<repo>/.ferry/local/v1` for the local route. `place::root` writes
-  `locks/legacy-closed` into the parent when an old root (its `locks/`) is
-  there, and nothing else.
+  `<repo>/.ferry/local/v1` for the local route. (A `locks/legacy-closed`
+  sentinel was built and then deleted on review: no binary honours it, and
+  its write could land outside the root. Separation is by root path alone.)
 - **SPEC §9 names inside it:** `seats/<key>/checkout`, `seats/<key>/cache`,
   `seats/<key>/measured` (the hourly stamp), `store/repo.git`, and locks
   `seat.<key>`, `host`, `host.gate`. `retire` deletes `seats/<key>` whole,
@@ -316,3 +316,10 @@ Each freeze states the measured running src.
   control asserts the whole seat directory is gone.
 - **Size:** src 6043 → 5949, below 5950 (measured: the layout +11, the
   deletions −105).
+- **Review of b6d173b5 (critic RETURN, M2):** every caller before slice 7
+  requires `HostInfo.cores`, so an old caller against an upgraded place
+  failed to parse host-info and recorded lost 255 instead of §12.11's 125.
+  The place emits `cores` again (the caller does not read it). Control
+  `host_info_still_carries_what_older_callers_require`; the real d1b8984f
+  caller was run by hand against the new place (see the refreeze).
+
