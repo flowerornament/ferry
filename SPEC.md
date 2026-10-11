@@ -92,7 +92,7 @@ infrastructure loss.
 ```
 caller:  check recipe@commit ─refuse─► 125 receipt
          push objects (idempotent) ─► submit{id,request}
-place:   reserve record (O_EXCL; dup id → follow existing) ─► fork supervisor (setsid, no tty) ─► reply id
+place:   reserve record (O_EXCL; a duplicate id → follow the existing run) ─► fork supervisor (setsid, no tty) ─► reply id
 super:   seat lock (try; held → refuse busy)
          host lease (shared|exclusive; bounded wait; names holder)
          floor check (host.toml) ─► reset checkout (keep preserve) ─► objects
@@ -141,7 +141,8 @@ record:  custody = { tier: "scope" | "session",
 ## 8. Records and receipts
 
 ```
-records/<id>.reserved.json  {id, token, supervisor:{pid,start}, boot_id, submitted_ms}
+records/<id>.reserved.json  {state:reserved, id, token, commit, seat, binary_sha256,
+                            supervisor:{pid,start}, boot_id, submitted_ms}
 records/<id>.json           reserved fields + {outcome, exit_code, reason, commit, seat,
                             recipe, args, place:{source_rev, exe, sha256}, lease:{mode, wait_ms,
                             acquired_ms, released_ms}, admission:{floor, available}, custody,
@@ -153,9 +154,14 @@ records/<id>.json           reserved fields + {outcome, exit_code, reason, commi
 - **Reconcile:** a reservation whose boot id differs, whose pid is dead, or
   whose start time does not match is finalized as `lost` ("supervisor gone"),
   exactly once.
-- **Receipt** (`<repo>/.ferry/receipts/<id>.json`): the caller's facts at
-  submit (args, environment, adapter and contract digests, caller exe), plus a
-  copy of the final record.
+- **Receipt** (`<repo>/.ferry/receipts/<id>.json`): written at submit with
+  the caller's facts (args, environment, adapter and contract digests, caller
+  exe) and `state: submitted` (it reads lost/255, "no verdict yet", until
+  final). It is replaced atomically by `state: final`, which carries the final
+  record's verdict and evidence fields in the receipt's own schema. A
+  receipt with no `state` is final.
+- **Live supervisor:** a pid with no recorded start time is treated as alive;
+  only proof reconciles.
 
 **Why:** reserve-before-effect, final once and reconcile make "zero or two
 records" impossible.
