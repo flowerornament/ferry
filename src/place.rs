@@ -5,7 +5,7 @@
 //! - `supervise` runs the request to its record, detached: no client, no
 //!   terminal, one absolute deadline.
 //! - `follow` writes `runs/<id>/output.log` from an offset until the record
-//!   is final and every byte before it is sent.
+//!   is final and every byte before it is sent, or its reader is gone.
 //! - `stop` stops a live run's supervisor; `record` prints a run's record.
 use crate::{
     execution::{self, Request},
@@ -341,8 +341,8 @@ fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut H
 }
 
 /// Writes the run's output from `offset` until its record is final and
-/// every byte written before that is sent. Exit 0 at the end, 4 for a run
-/// this place never had.
+/// every byte written before that is sent, or until its reader is gone.
+/// Exit 0 at the end, 4 for a run this place never had.
 pub fn follow(root: &Path, id: &str, offset: u64) -> Result<i32> {
     let reserved = root.join("records").join(format!("{id}.reserved.json"));
     if !reserved.exists() && record::reconcile(root, id)?.is_none() {
@@ -375,8 +375,25 @@ pub fn follow(root: &Path, id: &str, offset: u64) -> Result<i32> {
         if done {
             return Ok(0);
         }
+        // A reader that is gone (a killed caller, a dropped ssh) ends this
+        // follow now, not at the run's deadline; the run goes on.
+        if reader_gone(&out) {
+            return Err("follow: its reader is gone".into());
+        }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Whether the other end of `out` has closed: a pipe or socket whose
+/// reader is gone reports POLLHUP or POLLERR. A file never does. macOS
+/// reports it only when POLLOUT is asked for.
+fn reader_gone(out: &impl std::os::fd::AsFd) -> bool {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(out.as_fd(), PollFlags::POLLOUT)];
+    poll(&mut fds, PollTimeout::ZERO).is_ok()
+        && fds[0]
+            .revents()
+            .is_some_and(|r| r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR))
 }
 
 /// Stops a live run with `signal` (its verdict is then 128 plus it). Only

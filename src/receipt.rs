@@ -203,16 +203,22 @@ pub fn load(root: &Path, id: &str) -> Result<Receipt, Box<dyn std::error::Error>
     Ok(serde_json::from_slice(&fs::read(path(root, id))?)?)
 }
 
-/// Stores a receipt, complete or not at all, replacing its earlier copy.
+/// Stores a receipt, complete or not at all (SPEC §8). A submitted receipt
+/// is written once, at submit, and never replaces a stored one, so it can
+/// never undo a final one (verdict once). A final one replaces it; each
+/// writer has its own temporary file, so concurrent `ferry record`s all
+/// complete, and final over final is the same place record.
 pub fn save(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = root.join(".ferry/receipts");
     let path = path(root, &receipt.id);
-    let bytes = serde_json::to_vec_pretty(receipt)?;
+    if receipt.state.as_deref() == Some("submitted") {
+        return submit(root, receipt).or_else(|e| if path.exists() { Ok(()) } else { Err(e) });
+    }
+    let dir = root.join(".ferry/receipts");
     fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".{}.json.tmp", receipt.id));
-    fs::write(&tmp, bytes)?;
-    fs::File::open(&tmp)?.sync_all()?;
-    fs::rename(&tmp, &path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+    std::io::Write::write_all(&mut tmp, &serde_json::to_vec_pretty(receipt)?)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path)?;
     fs::File::open(&dir)?.sync_all()?;
     Ok(())
 }
@@ -235,6 +241,27 @@ mod tests {
             serde_json::to_string(&Outcome::RanFail).unwrap(),
             "\"ran-fail\""
         );
+    }
+    #[test]
+    fn a_submitted_save_never_replaces_a_final_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut receipt: Receipt = serde_json::from_value(serde_json::json!({
+            "protocol": PROTOCOL, "id": run_id().unwrap(), "commit": null,
+            "recipe": "r", "seat": "s", "machine": "m", "outcome": "ran-pass",
+            "exit_code": 0, "reason": null, "caller_binary_sha256": "c",
+            "host_binary_sha256": null, "started_ms": 0, "elapsed_ms": 0,
+            "requirements": [], "machine_features": [], "mirrors": [],
+            "adapter_sha256": null, "contract_sha256": null, "state": "final"
+        }))
+        .unwrap();
+        save(root.path(), &receipt).unwrap();
+        // A caller still holding the submitted receipt saves it late.
+        receipt.state = Some("submitted".into());
+        receipt.outcome = Outcome::Lost;
+        save(root.path(), &receipt).unwrap();
+        let stored = load(root.path(), &receipt.id).unwrap();
+        assert_eq!(stored.state.as_deref(), Some("final"));
+        assert_eq!(stored.outcome, Outcome::RanPass);
     }
     #[test]
     fn ids_are_unique_and_safe() {

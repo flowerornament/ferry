@@ -256,6 +256,57 @@ impl Drop for Caller {
 // --- Client independence (SPEC §12.4) ---
 
 #[test]
+fn concurrent_readers_complete_the_same_submitted_receipt() {
+    let scratch = tempfile::tempdir().unwrap();
+    let started = scratch.path().join("started");
+    let dir = fixture(
+        &format!("touch {}; sleep 2; echo finished", started.display()),
+        "",
+    );
+    let mut caller = Caller(
+        ferry(dir.path())
+            .args(["run", "probe", "--local", "--timeout-seconds", "60"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("the recipe started", || started.exists());
+    caller.0.kill().unwrap();
+    caller.0.wait().unwrap();
+    assert_eq!(
+        only_record(&dir.path().join(".ferry/local/records"))["outcome"],
+        "ran-pass"
+    );
+    let submitted = only_receipt_file(dir.path());
+    let id = submitted["id"].as_str().unwrap();
+    let barrier = std::sync::Barrier::new(32);
+    thread::scope(|scope| {
+        let readers: Vec<_> = (0..32)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    bounded_output(ferry(dir.path()).args(["record", id]))
+                })
+            })
+            .collect();
+        for reader in readers {
+            let out = reader.join().unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(record["state"], "final");
+            assert_eq!(record["outcome"], "ran-pass");
+        }
+    });
+    assert_eq!(only_receipt_file(dir.path())["state"], "final");
+}
+
+#[test]
 fn a_killed_caller_leaves_the_run_to_finish_and_ferry_record_completes_it() {
     let scratch = tempfile::tempdir().unwrap();
     let started = scratch.path().join("started");
@@ -317,6 +368,59 @@ fn a_kill_of_the_callers_group_spares_the_supervisor() {
 }
 
 #[test]
+fn a_killed_callers_place_follow_ends_and_the_run_goes_on() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (started, release) = (
+        scratch.path().join("started"),
+        scratch.path().join("release"),
+    );
+    let dir = fixture(
+        &format!(
+            "touch {}; while [ ! -e {} ]; do sleep 0.1; done; echo finished",
+            started.display(),
+            release.display()
+        ),
+        "",
+    );
+    // Its own group holds the caller and the `place follow` it starts; the
+    // supervisor has its own session.
+    let mut caller = ferry(dir.path())
+        .args(["run", "probe", "--local", "--timeout-seconds", "120"])
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let group = Pid::from_raw(-i32::try_from(caller.id()).unwrap());
+    wait_until("the recipe started", || started.exists());
+    caller.kill().unwrap();
+    caller.wait().unwrap();
+    // The run is quiet and still going: only the closed pipe can end its
+    // follow, and it must, long before the run's own end.
+    let bound = Instant::now() + Duration::from_secs(5) + common::slack();
+    while kill(group, None).is_ok() {
+        assert!(
+            Instant::now() < bound,
+            "the place follow outlived its caller"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let records = dir.path().join(".ferry/local/records");
+    assert!(
+        record_names(dir.path())
+            .iter()
+            .all(|n| n.starts_with('.') || n.ends_with(".reserved.json")),
+        "{:?}",
+        record_names(dir.path())
+    );
+    fs::write(&release, "").unwrap();
+    let host = only_record(&records);
+    assert_eq!(host["outcome"], "ran-pass", "{host}");
+    let id = host["id"].as_str().unwrap();
+    assert_eq!(output_log(dir.path(), id), b"finished\n");
+}
+
+#[test]
 fn a_dropped_follow_reconnects_and_receives_every_byte() {
     if !cfg!(debug_assertions) {
         return;
@@ -371,7 +475,9 @@ fn ferry_follow_reattaches_from_any_terminal() {
 
 #[test]
 fn a_closed_caller_pipe_is_data_and_the_run_reaches_its_own_end() {
-    let dir = fixture("i=1; while :; do echo $i; i=$((i+1)); done", "");
+    // Far more than a pipe's worth, so the caller writes on after `head`
+    // has gone; the recipe ends by itself, so no timer races the machine.
+    let dir = fixture("seq 1 100000", "");
     let out = Command::new("sh")
         .current_dir(dir.path())
         .env_remove("GIT_DIR")
@@ -379,15 +485,17 @@ fn a_closed_caller_pipe_is_data_and_the_run_reaches_its_own_end() {
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .arg("-c")
         .arg(format!(
-            "{} run probe --local --timeout-seconds 3 | head -1",
+            "{} run probe --local | head -1",
             env!("CARGO_BIN_EXE_ferry")
         ))
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
     let record = only_record(&dir.path().join(".ferry/receipts"));
-    assert_eq!(record["outcome"], "timeout", "{record}");
-    assert_eq!(record["exit_code"], 124, "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["exit_code"], 0, "{record}");
+    // Every byte the recipe wrote is in its log.
+    assert_eq!(record["output"]["bytes"], 588_895, "{record}");
 }
 
 #[test]
@@ -510,12 +618,13 @@ fn a_caller_whose_stop_fails_or_that_is_signalled_twice_leaves_the_receipt_submi
         let scratch = tempfile::tempdir().unwrap();
         let started = scratch.path().join("started");
         let dir = fixture(&format!("touch {}; {script}", started.display()), "");
+        let stderr = scratch.path().join("stderr");
         let mut caller = Caller(
             ferry(dir.path())
                 .env("FERRY_FAIL_AT", fail_at)
                 .args(["run", "probe", "--local", "--timeout-seconds", "60"])
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(fs::File::create(&stderr).unwrap())
                 .spawn()
                 .unwrap(),
         );
@@ -543,8 +652,9 @@ fn a_caller_whose_stop_fails_or_that_is_signalled_twice_leaves_the_receipt_submi
         assert_eq!(code.flatten(), Some(255), "{fail_at}");
         let receipt = only_receipt_file(dir.path());
         assert_eq!(receipt["state"], "submitted", "{receipt}");
-        let reason = receipt["reason"].as_str().unwrap();
-        assert!(reason.contains(next) && reason.contains(&id), "{reason}");
+        // The caller names the next step (SPEC §4).
+        let said = fs::read_to_string(&stderr).unwrap();
+        assert!(said.contains(next) && said.contains(&id), "{said}");
         let final_record = dir
             .path()
             .join(".ferry/local/records")
@@ -667,9 +777,11 @@ fn a_callers_signal_after_the_verdict_is_named_and_keeps_it() {
 fn the_deadline_ends_a_run_with_no_client() {
     let scratch = tempfile::tempdir().unwrap();
     let started = scratch.path().join("started");
-    let dir = fixture(&format!("touch {}; sleep 60", started.display()), "");
+    // Long enough to start under load: the deadline must kill a recipe
+    // that is running, not one that never began.
+    let dir = fixture(&format!("touch {}; sleep 600", started.display()), "");
     let mut caller = ferry(dir.path())
-        .args(["run", "probe", "--local", "--timeout-seconds", "2"])
+        .args(["run", "probe", "--local", "--timeout-seconds", "30"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -689,9 +801,19 @@ fn the_deadline_ends_a_run_with_no_client() {
 #[test]
 fn a_host_lease_wait_past_its_bound_refuses_naming_the_holder() {
     let scratch = tempfile::tempdir().unwrap();
-    let holding = scratch.path().join("holding");
-    let dir = fixture(&format!("touch {}; sleep 8", holding.display()), "");
-    let holder = Caller(
+    let (holding, hold) = (scratch.path().join("holding"), scratch.path().join("hold"));
+    // The holder holds until the test lets go, however slow the second
+    // run is to reach its wait.
+    fs::write(&hold, "").unwrap();
+    let dir = fixture(
+        &format!(
+            "touch {}; while [ -e {} ]; do sleep 0.1; done",
+            holding.display(),
+            hold.display()
+        ),
+        "",
+    );
+    let mut holder = Caller(
         ferry(dir.path())
             .args([
                 "run",
@@ -708,19 +830,17 @@ fn a_host_lease_wait_past_its_bound_refuses_naming_the_holder() {
             .unwrap(),
     );
     wait_until("the first run holds the host alone", || holding.exists());
-    let out = ferry(dir.path())
-        .args([
-            "run",
-            "pass",
-            "--local",
-            "--seat",
-            "second",
-            "--wait-seconds",
-            "2",
-            "--json",
-        ])
-        .output()
-        .unwrap();
+    // Bounded: a wait with no bound fails here instead of hanging.
+    let out = bounded_output(ferry(dir.path()).args([
+        "run",
+        "pass",
+        "--local",
+        "--seat",
+        "second",
+        "--wait-seconds",
+        "2",
+        "--json",
+    ]));
     let record = receipt(&out);
     assert_eq!(out.status.code(), Some(125), "{record}");
     assert_eq!(record["outcome"], "refused", "{record}");
@@ -751,7 +871,10 @@ fn a_host_lease_wait_past_its_bound_refuses_naming_the_holder() {
         wait_timeout_ms + u64::try_from(limits::TEARDOWN.as_millis()).unwrap(),
         "{ran}"
     );
-    drop(holder);
+    fs::remove_file(&hold).unwrap();
+    wait_until("the holder ended", || {
+        holder.0.try_wait().unwrap().is_some()
+    });
 }
 
 // --- Output: one capped writer (SPEC §11) ---
@@ -1166,7 +1289,19 @@ fn a_failed_reconcile_leaves_the_receipt_submitted_until_the_next_reader() {
     assert_eq!(first["state"], "submitted", "{first}");
     let id = first["id"].as_str().unwrap().to_owned();
     assert_eq!(record_names(dir.path()), [format!("{id}.reserved.json")]);
-    // The next reader reconciles it, and the receipt becomes final.
+    // Once its supervisor is gone (the caller gave up first, however slow
+    // the machine), the next reader reconciles it and the receipt is final.
+    let reservation: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            dir.path()
+                .join(format!(".ferry/local/records/{id}.reserved.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let supervisor =
+        Pid::from_raw(i32::try_from(reservation["supervisor"]["pid"].as_i64().unwrap()).unwrap());
+    wait_until("the supervisor exited", || kill(supervisor, None).is_err());
     let out = ferry(dir.path()).args(["record", &id]).output().unwrap();
     let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(record["state"], "final", "{record}");

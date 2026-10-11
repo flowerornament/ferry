@@ -33,11 +33,18 @@ ferry run test --on bench --json       # NDJSON events, for tools
 - **One seat per workspace.** `--seat <name>` (default `default`) picks your
   private checkout. Concurrent runs in the same seat take turns; use a
   different seat for parallel work.
-- **Always set a timeout** for anything long (`--timeout-seconds`). Without
-  one, a hung recipe runs until you stop it.
+- **Declare `--timeout-seconds`** for what the recipe needs. Without it, the
+  run gets the machine's maximum, 6 h, and a hung recipe holds its seat that
+  long.
+- **Every run has a deadline:** submit + `--wait-seconds` (30 min by
+  default) + timeout + teardown. It ends the run even with no caller.
+- **Waits are bounded.** A run waits for its seat and the host lease at most
+  `--wait-seconds`, then is refused (125) naming the run that holds it.
 - **Exclusive waits.** An exclusive run waits for in-flight runs on that
-  machine and keeps new ones out. Use it only for measurements. The wait for
-  in-flight runs is not bounded by the timeout.
+  machine and keeps new ones out. Use it only for measurements.
+- **The run is the machine's, not your terminal's.** Closing the terminal or
+  killing `ferry run` does not stop it: it goes on to its end or its
+  deadline. Stop it with Ctrl-C on `ferry run`, or `ferry stop <id>`.
 
 ## Read the result
 
@@ -49,24 +56,30 @@ The exit code and the receipt's `outcome` decide what a red result means:
 | N | `ran-fail` | the recipe failed with code N | your code or test: read the output |
 | 124 | `timeout` | `--timeout-seconds` elapsed | look for a hang, or raise the timeout |
 | 125 | `refused` | **nothing ran** | read `reason`, which names the next step (below) |
-| 128+n | `lost` | a signal stopped it before its result (130 Ctrl-C, 143 TERM, 129 HUP) | rerun if you still want the result |
-| 255 | `lost` | infrastructure, not your code (the reason names it: client lost, supervisor died, transport) | rerun once; if it repeats, report it with the receipt id |
+| 128+n | `stopped` | a stop ended it before its result (130 Ctrl-C, 143 TERM, 129 HUP; `stopped_by` says who) | rerun if you still want the result |
+| 255, receipt `state: submitted` | `lost` | **no verdict yet; the run may still be going** (the place did not answer, the stop was not delivered, or a second Ctrl-C) | `ferry record <id>` or `ferry follow <id>`. **Never rerun:** a rerun starts a second run beside the first. |
+| 255, receipt final | `lost` | infrastructure, not your code (the reason names it, e.g. supervisor gone) | rerun once; if it repeats, report it with the receipt id |
 
 **Exit codes only.** A recipe can itself exit 125, so read `outcome` from the
 receipt, never the printed text.
 
 ```bash
-ferry receipt <id>                     # the full receipt (JSON)
+ferry receipt <id>                     # the stored receipt (JSON)
+ferry record <id>                      # the receipt, completed once the run is final
+ferry follow <id>                      # re-attach: the run's output, then its receipt
+ferry stop <id>                        # stop your run (another's: --other --reason '<why>')
 ```
 
 **Receipt fields that matter:**
+- `state`: `submitted` (no verdict yet) or `final`;
 - `outcome`, `exit_code`, `reason`;
 - `commit`;
 - `host_source_rev`, `caller_source_rev`: which Ferry ran on each end;
 - `custody`: what the run left behind and what was stopped;
 - `lease`: shared or exclusive, and how long it waited;
 - `admission`: host disk policy;
-- `output_dropped` and `output_delivered`.
+- `output`: `{bytes, capped}` (past 1 GiB the rest is dropped);
+- `deadline_ms`, and `stopped_by` for a stopped run.
 
 **A finished verdict stands.** A pass is never turned into `lost` later;
 anything after the verdict is noted in `reason` ("after the verdict: …").
@@ -101,13 +114,13 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 
 `ferry: waiting for lock …: another run holds it` means another run holds
 your seat or the host lease. That is normal while another agent's exclusive
-measurement runs. Wait, or Ctrl-C (the run is then `lost` 130, and nothing is
-left behind).
+measurement runs. Wait (at most `--wait-seconds`), or Ctrl-C (the run is then
+`stopped` 130, and nothing is left behind).
 
 ## Rules
 
-- **Stop runs only through Ferry** (Ctrl-C on your own `ferry run`), or by the
-  exact pid it reports. Never `pkill -f`, `killall` or any pattern kill: build
+- **Stop runs only through Ferry** (Ctrl-C on your own `ferry run`, or
+  `ferry stop <id>`), or by the exact pid it reports. Never `pkill -f`, `killall` or any pattern kill: build
   machines are shared.
 - **Services belong to the operator.** A service your recipe needs to outlive
   it (a shared database) must be an operator service, not started by the
@@ -117,5 +130,5 @@ left behind).
 - **Remote evidence is not landing authority.** A green remote run does not
   certify a repository's own local gate (for example `just land`).
 - **Report Ferry problems** with the receipt id and the exit code, to whoever
-  maintains Ferry. A `lost` 255 that repeats is a Ferry or transport problem,
-  not your code.
+  maintains Ferry. A final `lost` 255 that repeats is a Ferry or transport
+  problem, not your code.
