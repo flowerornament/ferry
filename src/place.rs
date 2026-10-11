@@ -176,7 +176,7 @@ pub fn submit(root: &Path) -> Result<i32> {
                     pid,
                     start: i32::try_from(pid)
                         .ok()
-                        .and_then(|pid| crate::seat::start_time(pid).ok()),
+                        .and_then(|pid| crate::record::start_time(pid).ok()),
                 },
                 boot_id: record::boot_id(),
                 submitted_ms,
@@ -290,7 +290,6 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     // with `held` intact, and the locks still close only after finalize.
     let executed: Result<execution::Ended> = std::panic::catch_unwind(
         std::panic::AssertUnwindSafe(|| -> Result<execution::Ended> {
-            crate::custody::supervise()?;
             let seat = execution::prepare(root, &request, &stop, &mut result.admission, &mut held)?;
             assert!(
                 !execution::fail_at("supervise-panic"),
@@ -494,7 +493,7 @@ pub fn stop(
         ));
     }
     let pid = nix::unistd::Pid::from_raw(i32::try_from(reservation.supervisor.pid)?);
-    let live = match crate::seat::start_time(pid.as_raw()) {
+    let live = match crate::record::start_time(pid.as_raw()) {
         Ok(start) => reservation
             .supervisor
             .start

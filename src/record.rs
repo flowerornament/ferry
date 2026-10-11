@@ -183,7 +183,7 @@ fn gone(reservation: &Reservation, boot: Option<&str>) -> bool {
     let Ok(pid) = i32::try_from(reservation.supervisor.pid) else {
         return false;
     };
-    match crate::seat::start_time(pid) {
+    match start_time(pid) {
         Ok(start) => reservation
             .supervisor
             .start
@@ -362,6 +362,27 @@ pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
     }
 }
 
+/// A process's start time: microseconds since the epoch on macOS, clock
+/// ticks since boot elsewhere. With the pid it identifies a process.
+#[cfg(target_os = "macos")]
+pub fn start_time(pid: i32) -> Result<u128> {
+    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0)?;
+    Ok(u128::from(info.pbi_start_tvsec) * 1_000_000 + u128::from(info.pbi_start_tvusec))
+}
+
+/// A process's start time: microseconds since the epoch on macOS, clock
+/// ticks since boot elsewhere. With the pid it identifies a process.
+#[cfg(not(target_os = "macos"))]
+pub fn start_time(pid: i32) -> Result<u128> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = text.rsplit_once(')').ok_or("invalid process stat")?;
+    Ok(fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or("missing process start time")?
+        .parse()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Reservation, finalize, reconcile_with, reserve};
@@ -471,7 +492,7 @@ mod tests {
 
     fn own(boot: &str) -> Reservation {
         let pid = std::process::id();
-        let start = crate::seat::start_time(i32::try_from(pid).unwrap()).ok();
+        let start = super::start_time(i32::try_from(pid).unwrap()).ok();
         reservation(pid, start, boot)
     }
 

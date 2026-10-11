@@ -1,6 +1,6 @@
 ---
 name: ferry
-description: "Run a repository's recipe at an exact commit on a build machine (or locally in a clean checkout) and read what happened, with Ferry. Use this skill whenever you need to run a project's gate, tests or measurements on another machine (`ferry run … --on <machine>`), when a repository has a ferry.toml or a `just remote …` recipe that wraps ferry, when you must interpret a Ferry receipt, exit code (124, 125, 128+n, 255) or refusal, when a seat is tainted or refuses, when an exclusive/timing run waits for the host lease, or when you must decide whether a red result is your code or the infrastructure."
+description: "Run a repository's recipe at an exact commit on a build machine (or locally in a clean checkout) and read what happened, with Ferry. Use this skill whenever you need to run a project's gate, tests or measurements on another machine (`ferry run … --on <machine>`), when a repository has a ferry.toml or a `just remote …` recipe that wraps ferry, when you must interpret a Ferry receipt, exit code (124, 125, 128+n, 255) or refusal, when a seat is busy or refuses, when an exclusive/timing run waits for the host lease, or when you must decide whether a red result is your code or the infrastructure."
 metadata:
   { "version": "0.1.0", "openclaw": { "emoji": "⛴️", "os": ["darwin", "linux"], "requires": { "bins": ["ferry", "git", "ssh"] } } }
 ---
@@ -111,24 +111,12 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
   recipe allows it.
 - **Provider capability missing:** the machine runs an older Ferry. Tell the
   operator; do not work around it.
-- **Tainted seat:** an earlier run in this seat left processes Ferry could not
-  stop or could not prove gone.
-  - The refusal names the run, the pids and the exact
-    `ferry seat recover <seat>` command, with `--local` for local runs.
-  - Check that those processes are gone, then run that command on that
-    machine. Recovery never kills.
-  - If they are not gone, stop them by exact pid (never `pkill -f`).
-  - `--accept-unknown --reason '<why>'` is an explicit operator act. Use it
-    only after you have confirmed nothing is left.
-- **Owner marker after a supervisor death:** the same procedure,
-  `ferry seat recover <seat>`.
-- **`cleanup_pending`:** an earlier session's teardown could not be confirmed.
-  This is the operator's call: tell the user, and do not delete the marker
-  yourself.
 - **Disk floor (admission):** the machine is below its operator's free-space
   floor. Tell the operator.
-- **Exclusive run refused because a seat is tainted:** recover that seat
-  first.
+- **What a run left behind:** the receipt's `custody.survivors` lists the
+  run's session members still alive after the stop (pid and start). Stop them
+  by exact pid, never by pattern. There is no `ferry seat recover`: a busy
+  seat clears when what holds its lock exits.
 
 ## Waiting lines
 

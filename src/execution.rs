@@ -1,7 +1,7 @@
 //! Locked real checkouts and recipe sessions shared by caller and host.
 use crate::{
     config::{Hooks, Recipe, Refusal, identifier, preserve_path},
-    limits::{COLLECT_TIMEOUT, SESSION_CLEANUP},
+    limits::{COLLECT_TIMEOUT, KILL_GRACE, STOP_GRACE},
     receipt, repository,
 };
 use nix::{
@@ -26,66 +26,71 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// A run's session, by its leader: stopped once, on every path.
 struct SessionOwner {
     child: std::process::Child,
-    cleaned: bool,
-    quarantine: PathBuf,
-    ownership: PathBuf,
+    stopped: bool,
 }
 impl SessionOwner {
-    fn cleanup(&mut self) -> Result<()> {
-        let result = self.cleanup_session();
-        if let Err(error) = &result {
-            // A released OS lock must not make an unconfirmed session reusable.
-            fs::write(&self.quarantine, error.to_string())?;
-        } else if self.quarantine.exists() {
-            fs::remove_file(&self.quarantine)?;
-        }
-        result
-    }
-
-    fn cleanup_session(&mut self) -> Result<()> {
-        if fail_at("session-cleanup") {
-            return Err("session cleanup failed: injected by FERRY_FAIL_AT".into());
-        }
+    /// Stops the session (SPEC §7): TERM to every member, up to
+    /// `STOP_GRACE` for them to leave, KILL, then up to `KILL_GRACE` for them
+    /// to be gone. Returns the members still alive, by pid and start time.
+    fn stop(&mut self) -> Result<Vec<crate::custody::Survivor>> {
+        self.stopped = true;
         let sid = self.child.id();
-        signal_session(sid, Signal::SIGTERM)?;
-        let deadline = Instant::now() + SESSION_CLEANUP;
-        while Instant::now() < deadline {
-            // Do not reap the owner until all other session members are gone.
-            let members = session_members(sid)?;
-            if members
+        let others = || -> Result<bool> {
+            Ok(session_members(sid)?
                 .iter()
-                .all(|pid| u32::try_from(*pid).ok() == Some(sid))
-            {
-                break;
+                .any(|pid| u32::try_from(*pid).ok() != Some(sid)))
+        };
+        let termed = if fail_at("session-term") {
+            Err("session-term: injected by FERRY_FAIL_AT".into())
+        } else {
+            signal_session(sid, Signal::SIGTERM)
+        };
+        match termed {
+            Ok(()) => {
+                let until = Instant::now() + STOP_GRACE;
+                while Instant::now() < until && others()? {
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
-            thread::sleep(Duration::from_millis(20));
+            // KILL still follows; the failed TERM is a note.
+            Err(error) => note_after(format!("session TERM: {error}")),
         }
-        signal_session(sid, Signal::SIGKILL)?;
+        if !fail_at("session-kill") {
+            signal_session(sid, Signal::SIGKILL)?;
+        }
         // Also handles failure before the child called setsid.
         match self.child.kill() {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-            Err(e) => return Err(format!("kill retained session leader {sid}: {e}").into()),
+            Err(e) => return Err(format!("kill session leader {sid}: {e}").into()),
         }
         self.child
             .wait()
-            .map_err(|e| format!("wait for retained session leader {sid}: {e}"))?;
-        if !session_members(sid)?.is_empty() {
-            return Err("session cleanup unconfirmed".into());
+            .map_err(|e| format!("wait for session leader {sid}: {e}"))?;
+        let until = Instant::now() + KILL_GRACE;
+        let mut left = session_members(sid)?;
+        while !left.is_empty() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+            left = session_members(sid)?;
         }
-        self.cleaned = true;
-        fs::remove_file(&self.ownership)?;
-        Ok(())
+        Ok(left
+            .into_iter()
+            .map(|pid| crate::custody::Survivor {
+                pid,
+                start: crate::record::start_time(pid)
+                    .ok()
+                    .and_then(|start| u64::try_from(start).ok()),
+            })
+            .collect())
     }
 }
 impl Drop for SessionOwner {
     fn drop(&mut self) {
-        if !self.cleaned
-            && let Err(e) = self.cleanup()
-        {
-            warn(&format!("ferry: cleanup failed: {e}"));
+        if !self.stopped {
+            crate::custody::note(self.stop().map_err(|e| e.to_string()));
         }
     }
 }
@@ -279,10 +284,6 @@ pub fn prepare(
 ) -> Result<PathBuf> {
     validate(request)?;
     fs::create_dir_all(root.join("locks"))?;
-    let local = root.ends_with("local");
-    // A tainted seat refuses before and after its lock is tried.
-    let tainted = || crate::custody::check(root, &request.seat, local);
-    tainted()?;
     // A busy seat refuses at once, naming the run that holds it (SPEC §5).
     pause_at(
         "seat-try",
@@ -296,18 +297,6 @@ pub fn prepare(
     // Each lock goes to the supervisor as soon as it is taken, so no later
     // refusal here closes it before the record is final.
     held.seat = Some(lease);
-    crate::seat::check(root, &request.seat, local)?;
-    tainted()?;
-    crate::custody::begin(root, &request.seat)?;
-    for entry in fs::read_dir(root.join("locks"))? {
-        if entry?
-            .file_name()
-            .to_string_lossy()
-            .starts_with("cleanup-pending-")
-        {
-            return Err("cleanup_pending: an earlier session has unconfirmed teardown".into());
-        }
-    }
     held.host = Some(crate::lock::HostLease::acquire(
         root,
         request,
@@ -315,11 +304,7 @@ pub fn prepare(
         &mut held.partial,
     )?);
     // Measured after any wait for the lease, under this seat's lock.
-    crate::admission::admit(
-        root,
-        &request.seat,
-        admission.get_or_insert_with(Default::default),
-    )?;
+    crate::admission::admit(root, admission.get_or_insert_with(Default::default))?;
     let bare = root.join("repo.git");
     repository::output(Command::new("git").arg("--git-dir").arg(&bare).args([
         "cat-file",
@@ -656,10 +641,7 @@ pub fn run_released(
                 Output::default(),
             )
         });
-    // Only a recipe that reached its own result (or timed out) may leave the
-    // seat idle.
-    let terminal = matches!(executed, Ok(Ended::Result(_) | Ended::Timeout));
-    let custody = crate::custody::release(root, request, terminal);
+    let custody = crate::custody::take();
     Finished {
         executed,
         collection,
@@ -789,9 +771,6 @@ fn run_collect(
         collect.timeout_seconds = Some(COLLECT_TIMEOUT.as_secs());
         // Collection has its own bounded session after recipe teardown, including
         // timeout or preparation failure. Never reinterpret the recipe verdict.
-        if crate::seat::path(root, &request.seat).exists() {
-            return Err("recipe teardown unconfirmed; collection not started".into());
-        }
         match run_session(
             root,
             workdir,
@@ -884,17 +863,12 @@ fn run_session(
     let spec = run_dir.join("request.json");
     fs::write(&spec, serde_json::to_vec(request)?)?;
     let result_path = run_dir.join("result.json");
-    crate::seat::reserve(root, request)?;
     let (reader, writer) = std::io::pipe()?;
     let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks, writer)?;
     let child = spawned?;
     let mut owner = SessionOwner {
         child,
-        cleaned: false,
-        quarantine: root
-            .join("locks")
-            .join(format!("cleanup-pending-{}", request.id)),
-        ownership: crate::seat::path(root, &request.seat),
+        stopped: false,
     };
     // After the owner exists, so a failure here still tears the session down.
     restored?;
@@ -906,7 +880,6 @@ fn run_session(
     });
     let start = Instant::now();
     let ended = loop {
-        crate::custody::reap_adopted(owner.child.id());
         // The first terminal fact wins: a result before a stop or timeout.
         if let Ok(bytes) = fs::read(&result_path) {
             break Ended::Result(serde_json::from_slice::<i32>(&bytes)?);
@@ -926,11 +899,8 @@ fn run_session(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    // A teardown that cannot be confirmed quarantines the host (cleanup
-    // pending) and taints nothing silently; after the verdict it is a note.
-    if let Err(error) = owner.cleanup() {
-        note_after(format!("session teardown: {error}"));
-    }
+    // What the stop leaves is recorded, never chased (SPEC §7).
+    crate::custody::note(owner.stop().map_err(|e| e.to_string()));
     // A process outside the session may still hold the pipe: its output is
     // not waited for past the drain, and that is reported.
     if done.recv_timeout(crate::limits::DRAIN).is_err() {
@@ -1012,7 +982,6 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         .and_then(Path::parent)
         .and_then(Path::parent)
         .ok_or("invalid request path")?;
-    crate::seat::bind(root, &request)?;
     let workdir = std::env::current_dir()?;
     // A Ferry-owned, per-seat cache directory for regenerable build output.
     let cache = root.join("caches").join(&request.seat);

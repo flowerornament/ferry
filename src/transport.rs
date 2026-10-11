@@ -775,7 +775,9 @@ pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> 
     record.host_binary_sha256 = Some(result.binary_sha256);
     record.host_source_rev = result.source_rev;
     record.host_exe = result.exe;
-    record.custody = result.custody;
+    record.custody = result
+        .custody
+        .and_then(|custody| serde_json::to_value(custody).ok());
     record.lease = result.lease;
     record.admission = result.admission;
     record.output = result.output;

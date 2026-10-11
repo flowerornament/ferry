@@ -23,9 +23,11 @@ impl Drop for OwnedGroup {
         }
     }
 }
+/// A caller, and the session of the recipe whose pid it wrote to `member`:
+/// both stopped if the control ends early.
 struct OwnedCaller {
     child: Option<std::process::Child>,
-    owners: std::path::PathBuf,
+    member: std::path::PathBuf,
 }
 impl Drop for OwnedCaller {
     fn drop(&mut self) {
@@ -34,17 +36,12 @@ impl Drop for OwnedCaller {
             let _ = child.wait();
         }
         // Startup assertions can fail before the session guard is constructed.
-        if let Ok(entries) = fs::read_dir(&self.owners) {
-            for entry in entries.flatten() {
-                let session = fs::read(entry.path())
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|owner| owner["session"].as_i64())
-                    .and_then(|pid| i32::try_from(pid).ok());
-                if let Some(session) = session {
-                    drop(OwnedGroup(session));
-                }
-            }
+        let session = fs::read_to_string(&self.member)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok())
+            .and_then(|pid| getsid(Some(Pid::from_raw(pid))).ok());
+        if let Some(session) = session {
+            drop(OwnedGroup(session.as_raw()));
         }
     }
 }
@@ -564,24 +561,6 @@ fn caller_environment_is_declared_forwarded_and_recorded() {
 }
 
 #[test]
-fn unconfirmed_cleanup_quarantines_the_host_before_dispatch() {
-    let dir = fixture();
-    let locks = dir.path().join(".ferry/local/locks");
-    fs::create_dir_all(&locks).unwrap();
-    fs::write(locks.join("cleanup-pending-earlier-run"), "unconfirmed").unwrap();
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert_eq!(receipt(&out)["outcome"], "refused");
-    assert!(
-        receipt(&out)["reason"]
-            .as_str()
-            .unwrap()
-            .contains("cleanup_pending")
-    );
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
-    assert!(locks.join("cleanup-pending-earlier-run").exists());
-}
-
-#[test]
 #[allow(clippy::too_many_lines)]
 fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     use std::{
@@ -594,8 +573,8 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     fs::write(
         dir.path().join("ferry.toml"),
         format!(
-            "version=1\n[recipe.pass]\ncommand=['sh','-c','echo started > {}; while test ! -e {}; do sleep 0.1; done']\n",
-            marker.display(), release.display()
+            "version=1\n[recipe.pass]\ncommand=['sh','-c','echo $$ > {}.tmp; mv {}.tmp {}; while test ! -e {}; do sleep 0.1; done']\n",
+            marker.display(), marker.display(), marker.display(), release.display()
         ),
     )
     .unwrap();
@@ -613,7 +592,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
         .unwrap();
     let mut caller = OwnedCaller {
         child: Some(child),
-        owners: dir.path().join(".ferry/local/owners"),
+        member: marker.clone(),
     };
     let deadline = common::startup_deadline();
     while !marker.exists() {
@@ -626,15 +605,15 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
         );
         thread::sleep(Duration::from_millis(10));
     }
-    let ownership = fs::read_dir(dir.path().join(".ferry/local/owners"))
+    let recipe: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    let group = OwnedGroup(getsid(Some(Pid::from_raw(recipe))).unwrap().as_raw());
+    let seat_lock = fs::read_dir(dir.path().join(".ferry/local/locks"))
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let owner: serde_json::Value = serde_json::from_slice(&fs::read(&ownership).unwrap()).unwrap();
-    let group = OwnedGroup(i32::try_from(owner["session"].as_u64().unwrap()).unwrap());
-    let seat = ownership.file_stem().unwrap().to_str().unwrap();
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|name| name.ends_with("-default"))
+        .unwrap();
+    let seat = seat_lock.as_str();
     // Kill the supervisor itself: the run's, named by
     // its `submitted` event. Its run reconciles to lost.
     let supervisor = fs::read_to_string(&caller_output)
@@ -683,43 +662,16 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
         reason.contains(&format!("seat busy: held after run {killed} ended (lost)")),
         "{reason}"
     );
-    let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
-    assert_eq!(out.status.code(), Some(125));
-    assert!(receipt(&out)["reason"].as_str().unwrap().contains("in use"));
-    assert!(ownership.exists());
     fs::write(&release, "finish").unwrap();
     let deadline = common::startup_deadline();
     while held(seat) {
         assert!(Instant::now() < deadline, "the recipe kept the seat");
         thread::sleep(Duration::from_millis(10));
     }
-    // Once the session is gone, the next run takes the seat and refuses:
-    // the dead supervisor's owner marker remains until recovery.
+    // Once the session is gone, the seat takes the next run: no marker of
+    // the dead supervisor is left to clear (slice 4b).
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert_eq!(out.status.code(), Some(125));
-    assert!(
-        receipt(&out)["reason"]
-            .as_str()
-            .unwrap()
-            .contains("seat recover")
-    );
-    let deadline = common::startup_deadline();
-    loop {
-        let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
-        if out.status.success() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "session did not exit: {}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!ownership.exists());
-    // A killed supervisor never released: recovery clears the owner marker
-    // but leaves no idle record, so the seat is not eligible for eviction.
-    assert!(seat_record(dir.path(), "idle").is_none());
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
     drop(group);
 }
 #[test]
@@ -958,7 +910,7 @@ fn interrupted_caller_kills_children_and_exits_128_plus_signal(
         .unwrap();
     let mut caller = OwnedCaller {
         child: Some(child),
-        owners: dir.path().join(".ferry/local/owners"),
+        member: marker.clone(),
     };
     let child = caller.child.as_mut().unwrap();
     let deadline = common::startup_deadline();
@@ -1286,274 +1238,6 @@ fn a_place_exiting_125_before_replying_is_refused_not_lost() {
     assert_eq!(record["exit_code"], 125);
 }
 
-fn seat_record(dir: &Path, kind: &str) -> Option<serde_json::Value> {
-    let records = dir.join(".ferry/local").join(kind);
-    let entry = fs::read_dir(records).ok()?.next()?.ok()?;
-    serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()
-}
-
-#[test]
-fn a_normal_release_records_the_seat_idle_where_custody_is_supported() {
-    let dir = fixture();
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert!(out.status.success());
-    let custody = &receipt(&out)["custody"];
-    if cfg!(target_os = "linux") {
-        assert_eq!(custody["census"], "empty");
-        assert_eq!(custody["record"], "idle");
-        assert!(seat_record(dir.path(), "idle").is_some());
-    } else {
-        // No complete census here, so the seat is never claimed idle.
-        assert_eq!(custody["census"], "unsupported");
-        assert_eq!(custody["record"], "none");
-        assert!(seat_record(dir.path(), "idle").is_none());
-    }
-    assert!(seat_record(dir.path(), "taint").is_none());
-}
-
-/// Commits a recipe `escape` running `script` (and an optional collect hook),
-/// runs it locally, and returns its receipt and elapsed time.
-#[cfg(target_os = "linux")]
-fn run_escape(
-    dir: &Path,
-    script: &str,
-    collect: Option<&str>,
-    diagnostic_proc: Option<&str>,
-) -> (Output, std::time::Duration) {
-    let mut config = String::from("version=1\n");
-    if let Some(hook) = collect {
-        fs::write(dir.join("collect"), hook).unwrap();
-        fs::set_permissions(dir.join("collect"), fs::Permissions::from_mode(0o755)).unwrap();
-        git(dir, &["add", "collect"]);
-        config.push_str("[hooks]\ncollect='collect'\n");
-    }
-    let recipe = toml::to_string(
-        &serde_json::json!({"recipe": {"escape": {"command": ["sh", "-c", script]}}}),
-    )
-    .unwrap();
-    config.push_str(&recipe);
-    fs::write(dir.join("ferry.toml"), config).unwrap();
-    git(dir, &["add", "ferry.toml"]);
-    git(dir, &["commit", "-m", "escape"]);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
-    command
-        .current_dir(dir)
-        .env("XDG_CONFIG_HOME", dir.join("config"))
-        .args(["run", "escape", "--local", "--json"]);
-    if let Some(proc_root) = diagnostic_proc {
-        command.env("FERRY_DIAGNOSTIC_PROC", proc_root);
-    }
-    let started = std::time::Instant::now();
-    let out = command.output().unwrap();
-    (out, started.elapsed())
-}
-
-/// A setsid escapee that drops environment, descriptors and directory, then
-/// uses the cache by path after a delay.
-#[cfg(target_os = "linux")]
-const ESCAPEE: &str = "command -v setsid >/dev/null || exit 97; late=\"$FERRY_CACHE_DIR/late\"; nap=$(command -v sleep); mark=$(command -v touch); setsid env -i sh -c \"exec </dev/null >/dev/null 2>&1; cd /; $nap 5; $mark $late\" & exit 0";
-
-#[cfg(target_os = "linux")]
-fn late_mark(dir: &Path) -> bool {
-    let caches = fs::read_dir(dir.join(".ferry/local/caches"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    caches.join("late").exists()
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn an_escaped_descendant_is_stopped_at_release_and_the_seat_is_idle() {
-    use std::{thread, time::Duration};
-    let dir = fixture();
-    let (out, _) = run_escape(dir.path(), ESCAPEE, None, None);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let custody = receipt(&out)["custody"].clone();
-    assert!(
-        !custody["census"]["survivors"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "{custody}"
-    );
-    assert!(
-        !custody["stopped"].as_array().unwrap().is_empty(),
-        "{custody}"
-    );
-    assert_eq!(custody["after"], "empty", "{custody}");
-    assert_eq!(custody["record"], "idle", "{custody}");
-    let idle = seat_record(dir.path(), "idle").unwrap();
-    assert_eq!(idle["stopped"], custody["stopped"]);
-    assert!(seat_record(dir.path(), "taint").is_none());
-    // Stopped before it could use the cache.
-    thread::sleep(Duration::from_secs(7));
-    assert!(!late_mark(dir.path()));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn a_term_ignoring_survivor_is_killed_after_the_grace_period() {
-    let dir = fixture();
-    let script = "command -v setsid >/dev/null || exit 97; setsid sh -c 'trap \"\" TERM; exec </dev/null >/dev/null 2>&1; while :; do sleep 0.1; done' & exit 0";
-    let (out, elapsed) = run_escape(dir.path(), script, None, None);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let custody = receipt(&out)["custody"].clone();
-    assert_eq!(custody["record"], "idle", "{custody}");
-    assert_eq!(custody["after"], "empty", "{custody}");
-    assert!(elapsed >= std::time::Duration::from_secs(10), "{elapsed:?}");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn a_blind_diagnostic_cannot_attribute_survivors_so_the_seat_is_tainted() {
-    use std::{thread, time::Duration};
-    // /proc shows nothing, but the kernel still reports the live child: it
-    // cannot be stopped by pid, so the seat is tainted and refuses.
-    let dir = fixture();
-    let (out, _) = run_escape(dir.path(), ESCAPEE, None, Some("/nonexistent"));
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let custody = receipt(&out)["custody"].clone();
-    assert_eq!(custody["record"], "taint", "{custody}");
-    assert!(custody["stopped"].is_null(), "{custody}");
-    assert!(seat_record(dir.path(), "idle").is_none());
-    let taint = seat_record(dir.path(), "taint").unwrap();
-    let again = run(dir.path(), &["run", "escape", "--local", "--json"]);
-    assert_eq!(again.status.code(), Some(125));
-    assert!(
-        receipt(&again)["reason"]
-            .as_str()
-            .unwrap()
-            .contains("tainted"),
-        "{}",
-        receipt(&again)
-    );
-    // Not stopped: the escapee did use the cache afterwards.
-    thread::sleep(Duration::from_secs(7));
-    assert!(late_mark(dir.path()));
-    assert_eq!(taint["survivors"], serde_json::json!([]));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn collect_runs_before_survivors_are_stopped_and_its_failure_is_recorded() {
-    let dir = fixture();
-    let pidfile = dir.path().join("escapee.pid");
-    let seen = dir.path().join("collect-saw");
-    let script = format!(
-        "command -v setsid >/dev/null || exit 97; setsid sh -c 'echo $$ > {pid}; exec </dev/null >/dev/null 2>&1; while :; do sleep 0.1; done' & while [ ! -s {pid} ]; do sleep 0.05; done; exit 0",
-        pid = pidfile.display()
-    );
-    let hook = format!(
-        "#!/bin/sh\nif kill -0 \"$(cat {pid})\" 2>/dev/null; then echo alive > {seen}; else echo gone > {seen}; fi\nexit 3\n",
-        pid = pidfile.display(),
-        seen = seen.display()
-    );
-    let (out, _) = run_escape(dir.path(), &script, Some(&hook), None);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    assert_eq!(fs::read_to_string(&seen).unwrap().trim(), "alive");
-    let record = receipt(&out);
-    assert_eq!(record["collection"]["exit_code"], 3, "{record}");
-    assert_eq!(record["custody"]["record"], "idle", "{record}");
-    let pid: i32 = fs::read_to_string(&pidfile)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(
-        record["custody"]["stopped"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!(pid)),
-        "{record}"
-    );
-    assert!(
-        kill(Pid::from_raw(pid), None).is_err(),
-        "the escapee survived"
-    );
-}
-
-/// The internal name of the only seat a local run has used.
-fn local_seat(dir: &Path) -> String {
-    fs::read_dir(dir.join(".ferry/local/locks"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|name| !name.starts_with("host-") && !name.starts_with("cleanup-pending-"))
-        .unwrap()
-}
-
-#[test]
-fn a_tainted_seat_refuses_until_recovery_proves_its_survivors_gone() {
-    let dir = fixture();
-    assert!(
-        run(dir.path(), &["run", "pass", "--local", "--json"])
-            .status
-            .success()
-    );
-    let seat = local_seat(dir.path());
-    let taint = dir.path().join(format!(".ferry/local/taint/{seat}.json"));
-    fs::create_dir_all(taint.parent().unwrap()).unwrap();
-    // The survivor is this test process itself: live, and fatal to the
-    // control if recovery ever killed it. Spawning a long-lived helper here
-    // could inherit other tests' output pipes on macOS and stall them.
-    let pid = std::process::id();
-    let write_taint = |start: serde_json::Value| {
-        fs::write(
-            &taint,
-            serde_json::json!({"id": "earlier", "reason": "descendants survived the session",
-                "pids": [pid], "survivors": [{"pid": pid, "start": start}]})
-            .to_string(),
-        )
-        .unwrap();
-    };
-    // Without a start time, any live process with the pid is the survivor.
-    write_taint(serde_json::Value::Null);
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert_eq!(out.status.code(), Some(125));
-    let record = receipt(&out);
-    assert_eq!(record["outcome"], "refused");
-    let reason = record["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("tainted") && reason.contains("seat recover"),
-        "{reason}"
-    );
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
-    // Recovery refuses while the survivor lives, and never kills it.
-    let out = run(dir.path(), &["seat", "recover", &seat, "--local"]);
-    assert_eq!(out.status.code(), Some(125));
-    assert!(taint.exists());
-    // A recorded start time that differs means the pid was reused: gone.
-    write_taint(serde_json::json!(1));
-    let out = run(dir.path(), &["seat", "recover", &seat, "--local"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    assert!(!taint.exists());
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert!(out.status.success());
-}
-
 /// Runs of the `hold` recipe that a lease test spawned. Dropping it releases
 /// every run and then stops exactly the callers it spawned, so a failed
 /// assertion never leaves a run waiting for a lock or a release file.
@@ -1717,47 +1401,6 @@ fn with_host_policy(dir: &Path, policy: &str) {
     fs::write(config.join("host.toml"), policy).unwrap();
 }
 
-/// A seat as an earlier session would have left it: a cache with a target and
-/// a sibling, a lock file, and optionally an idle, taint or owner record.
-fn synthetic_seat(state: &Path, seat: &str, released_ms: Option<u64>, extra: Option<&str>) {
-    fs::create_dir_all(state.join("caches").join(seat).join("cargo-target/deps")).unwrap();
-    fs::write(
-        state
-            .join("caches")
-            .join(seat)
-            .join("cargo-target/deps/blob"),
-        vec![7u8; 4096],
-    )
-    .unwrap();
-    fs::create_dir_all(state.join("caches").join(seat).join("keep")).unwrap();
-    fs::write(state.join("caches").join(seat).join("keep/warm"), "warm").unwrap();
-    fs::create_dir_all(state.join("locks")).unwrap();
-    fs::write(state.join("locks").join(seat), "").unwrap();
-    if let Some(released_ms) = released_ms {
-        fs::create_dir_all(state.join("idle")).unwrap();
-        fs::write(
-            state.join("idle").join(format!("{seat}.json")),
-            serde_json::json!({"released_ms": released_ms, "id": "earlier", "commit": "0"})
-                .to_string(),
-        )
-        .unwrap();
-    }
-    if let Some(kind) = extra {
-        fs::create_dir_all(state.join(kind)).unwrap();
-        // A well-formed record: an unreadable taint is unknown, which any
-        // run waiting for the host lease must refuse.
-        let record = if kind == "taint" {
-            serde_json::json!({"id": "earlier", "reason": "descendants survived the session",
-                "pids": [], "survivors": [],
-                "locks": {"seat": seat, "host": "shared", "gate": false}})
-            .to_string()
-        } else {
-            "{}".to_owned()
-        };
-        fs::write(state.join(kind).join(format!("{seat}.json")), record).unwrap();
-    }
-}
-
 #[test]
 fn admission_without_a_policy_is_not_configured_and_claims_no_floor() {
     let dir = fixture();
@@ -1796,10 +1439,8 @@ fn a_malformed_or_unsupported_policy_refuses_without_measuring() {
 }
 
 #[test]
-fn version_one_guards_the_floor_and_never_evicts() {
+fn version_one_guards_the_floor() {
     let dir = fixture();
-    let state = dir.path().join(".ferry/local");
-    synthetic_seat(&state, "idle-one", Some(1), None);
     with_host_policy(
         dir.path(),
         "version = 1\nmin_free_bytes = 1000000000000000000\n",
@@ -1811,187 +1452,26 @@ fn version_one_guards_the_floor_and_never_evicts() {
     assert_eq!(admission["result"], "refused");
     assert_eq!(admission["policy"]["version"], 1);
     assert_eq!(admission["floor_bytes"], 1_000_000_000_000_000_000u64);
-    assert!(admission["available_before"].as_u64().is_some());
-    assert_eq!(admission["evicted"], serde_json::json!([]));
+    assert!(admission["available"].as_u64().is_some());
     assert!(
         record["reason"]
             .as_str()
             .unwrap()
             .contains("below host floor")
     );
-    assert!(
-        state
-            .join("caches/idle-one/cargo-target/deps/blob")
-            .exists()
-    );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
 }
 
+/// Eviction is retired with the idle records it read: a version 2 policy
+/// refuses, naming what to keep (slice 4b; seats are bounded by slice 5).
 #[test]
-fn version_two_admits_without_eviction_when_the_floor_is_met() {
+fn a_version_two_policy_refuses_naming_version_one() {
     let dir = fixture();
-    let state = dir.path().join(".ferry/local");
-    synthetic_seat(&state, "idle-one", Some(1), None);
-    with_host_policy(
-        dir.path(),
-        "version = 2\nmin_free_bytes = 1\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
-    );
+    with_host_policy(dir.path(), "version = 2\nmin_free_bytes = 1\n");
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert!(out.status.success());
-    let admission = &receipt(&out)["admission"];
-    assert_eq!(admission["result"], "admitted");
-    assert_eq!(admission["evicted"], serde_json::json!([]));
-    assert!(
-        state
-            .join("caches/idle-one/cargo-target/deps/blob")
-            .exists()
-    );
-}
-
-#[test]
-fn version_two_evicts_only_designated_targets_of_eligible_idle_seats_oldest_first() {
-    let dir = fixture();
-    let state = dir.path().join(".ferry/local");
-    synthetic_seat(&state, "older", Some(1), None);
-    synthetic_seat(&state, "newer", Some(2), None);
-    synthetic_seat(&state, "tainted", Some(0), Some("taint"));
-    synthetic_seat(&state, "owned", Some(0), Some("owners"));
-    synthetic_seat(&state, "busy", Some(0), None);
-    synthetic_seat(&state, "unknown", None, None);
-    synthetic_seat(&state, "linked", Some(0), None);
-    let outside = dir.path().join("outside");
-    fs::create_dir_all(&outside).unwrap();
-    fs::write(outside.join("precious"), "keep").unwrap();
-    fs::remove_dir_all(state.join("caches/linked/cargo-target")).unwrap();
-    std::os::unix::fs::symlink(&outside, state.join("caches/linked/cargo-target")).unwrap();
-    let busy = fs::File::open(state.join("locks/busy")).unwrap();
-    fs2::FileExt::lock_exclusive(&busy).unwrap();
-    with_host_policy(
-        dir.path(),
-        "version = 2\nmin_free_bytes = 1000000000000000000\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
-    );
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    drop(busy);
     assert_eq!(out.status.code(), Some(125));
-    let admission = receipt(&out)["admission"].clone();
-    assert_eq!(admission["result"], "refused");
-    let evicted: Vec<&str> = admission["evicted"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["seat"].as_str().unwrap())
-        .collect();
-    assert_eq!(evicted, ["older", "newer"], "{admission}");
-    for entry in admission["evicted"].as_array().unwrap() {
-        assert!(entry["path"].as_str().unwrap().ends_with("/cargo-target"));
-        assert_eq!(entry["logical_bytes"], 4096);
-        assert!(entry["allocated_bytes"].as_u64().is_some());
-        assert!(entry["available_after"].as_u64().is_some());
-    }
-    let skipped = &admission["skipped"];
-    assert_eq!(
-        (
-            &skipped["tainted"],
-            &skipped["owners"],
-            &skipped["locked"],
-            &skipped["unsafe_path"]
-        ),
-        (
-            &serde_json::json!(1),
-            &serde_json::json!(1),
-            &serde_json::json!(1),
-            &serde_json::json!(1)
-        ),
-        "{admission}"
-    );
-    assert!(skipped["no_idle_record"].as_u64().unwrap() >= 1);
-    for seat in ["older", "newer"] {
-        assert!(
-            !state
-                .join("caches")
-                .join(seat)
-                .join("cargo-target")
-                .exists()
-        );
-        assert!(state.join("caches").join(seat).join("keep/warm").exists());
-        assert!(!state.join("idle").join(format!("{seat}.json")).exists());
-    }
-    for seat in ["tainted", "owned", "busy", "unknown"] {
-        assert!(
-            state
-                .join("caches")
-                .join(seat)
-                .join("cargo-target/deps/blob")
-                .exists()
-        );
-    }
-    assert!(outside.join("precious").exists());
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn a_real_idle_release_is_reclaimed_by_a_later_admission() {
-    let dir = fixture();
-    fs::write(
-        dir.path().join("ferry.toml"),
-        "version=1\n[recipe.build]\ncommand=['sh','-c','mkdir -p \"$FERRY_CACHE_DIR/cargo-target\" \"$FERRY_CACHE_DIR/keep\" && head -c 8192 /dev/zero > \"$FERRY_CACHE_DIR/cargo-target/out\" && echo warm > \"$FERRY_CACHE_DIR/keep/warm\"']\n",
-    )
-    .unwrap();
-    git(dir.path(), &["add", "ferry.toml"]);
-    git(dir.path(), &["commit", "-m", "build"]);
-    let out = run(
-        dir.path(),
-        &["run", "build", "--local", "--json", "--seat", "producer"],
-    );
-    assert!(out.status.success());
-    assert_eq!(receipt(&out)["custody"]["record"], "idle");
-    with_host_policy(
-        dir.path(),
-        "version = 2\nmin_free_bytes = 1000000000000000000\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
-    );
-    let out = run(
-        dir.path(),
-        &["run", "build", "--local", "--json", "--seat", "consumer"],
-    );
-    assert_eq!(out.status.code(), Some(125));
-    let admission = &receipt(&out)["admission"];
-    let evicted = admission["evicted"].as_array().unwrap();
-    assert_eq!(evicted.len(), 1, "{admission}");
-    assert!(evicted[0]["seat"].as_str().unwrap().ends_with("-producer"));
-    assert_eq!(evicted[0]["logical_bytes"], 8192);
-    let cache = fs::read_dir(dir.path().join(".ferry/local/caches"))
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.to_string_lossy().ends_with("-producer"))
-        .unwrap();
-    assert!(!cache.join("cargo-target").exists());
-    assert!(cache.join("keep/warm").exists());
-}
-
-#[test]
-fn an_unreadable_custody_marker_leaves_the_seat_alone() {
-    let dir = fixture();
-    let state = dir.path().join(".ferry/local");
-    synthetic_seat(&state, "hidden", Some(1), None);
-    // The taint directory exists but cannot be searched: whether this seat is
-    // tainted is unknown, which must not read as "not tainted".
-    fs::create_dir_all(state.join("taint")).unwrap();
-    fs::set_permissions(state.join("taint"), fs::Permissions::from_mode(0o000)).unwrap();
-    with_host_policy(
-        dir.path(),
-        "version = 2\nmin_free_bytes = 1000000000000000000\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
-    );
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    fs::set_permissions(state.join("taint"), fs::Permissions::from_mode(0o755)).unwrap();
-    // The run's own seat cannot be confirmed untainted either, so it refuses
-    // before admission measures or evicts anything.
-    assert_eq!(out.status.code(), Some(125));
-    let record = receipt(&out);
-    assert_eq!(record["outcome"], "refused");
-    assert!(record["admission"].is_null(), "{record}");
-    assert!(state.join("caches/hidden/cargo-target/deps/blob").exists());
+    let reason = receipt(&out)["reason"].as_str().unwrap().to_owned();
+    assert!(reason.contains("version 2 eviction is retired"), "{reason}");
 }
 
 #[test]
@@ -2123,58 +1603,6 @@ fn a_place_refuses_a_request_requiring_a_capability_it_lacks() {
         .unwrap();
     assert_eq!(old.status.code(), Some(125));
     assert!(String::from_utf8_lossy(&old.stdout).contains("\"event\":\"refused\""));
-}
-
-// Only Linux adopts descendants; Apple's ps cannot run in the Darwin Nix sandbox.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_recipe_can_empty_a_process_group_it_killed() {
-    // Like a project's own teardown: kill a group whose members were adopted
-    // by the supervisor, then require the group to be empty. Adopted zombies
-    // must not linger as members.
-    let dir = fixture();
-    fs::write(
-        dir.path().join("group.sh"),
-        r#"python3 -c 'import os,subprocess; os.setpgid(0,0); subprocess.Popen(["sleep","60"]); subprocess.Popen(["sleep","60"]); os.execvp("sleep",["sleep","61"])' &
-g=$!
-# Ready only once the leader and both members are in the group.
-i=0
-until [ "$(ps -eo pgid= | awk -v g="$g" '$1 == g' | wc -l)" -ge 3 ]; do
-  i=$((i + 1))
-  [ "$i" -lt 300 ] || { echo "group never formed"; exit 3; }
-  sleep 0.1
-done
-kill -s KILL -- "-$g"
-wait "$g" 2>/dev/null
-i=0
-while [ "$i" -lt 20 ]; do
-  [ -z "$(ps -eo pgid=,stat= | awk -v g="$g" '$1 == g')" ] && exit 7
-  sleep 0.1
-  i=$((i + 1))
-done
-ps -eo pid=,ppid=,pgid=,stat= | awk -v g="$g" '$3 == g'
-exit 1
-"#,
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("ferry.toml"),
-        "version=1\n[recipe.group]\ncommand=['sh','group.sh']\n",
-    )
-    .unwrap();
-    git(dir.path(), &["add", "ferry.toml", "group.sh"]);
-    git(dir.path(), &["commit", "-m", "group teardown"]);
-    let out = run(dir.path(), &["run", "group", "--local", "--json"]);
-    // 7 means the group emptied; 3 means it never formed. The recipe's own
-    // exit status is preserved either way.
-    assert_eq!(
-        out.status.code(),
-        Some(7),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    assert_eq!(receipt(&out)["outcome"], "ran-fail");
-    assert_eq!(receipt(&out)["exit_code"], 7);
 }
 
 /// Submits `request` to `ferry place --state <state> submit`; its exit code

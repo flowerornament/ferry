@@ -539,7 +539,7 @@ fn a_signal_stops_a_run_whose_consumer_stalls() {
     });
     // The consumer never read: the record, not the output, ended the wait.
     assert!(stalled.alive(), "the consumer stopped stalling");
-    let bound = limits::SESSION_CLEANUP + limits::DRAIN + Duration::from_secs(2) + common::slack();
+    let bound = limits::STOP_GRACE + limits::DRAIN + Duration::from_secs(2) + common::slack();
     assert!(
         signalled.elapsed() < bound,
         "{:?} >= {bound:?}",
@@ -1155,9 +1155,8 @@ fn a_run_refused_while_the_holder_starts_names_both_possible_holders() {
 
 /// The work inherits its locks on every platform (SPEC §3): what a run
 /// started and left running, still holding them, keeps the seat busy, and
-/// the next run's refusal names the run it outlived. On Linux the census
-/// stops such a process (custody, slice 4b), so this is the Mac's case.
-#[cfg(target_os = "macos")]
+/// the next run's refusal names the run it outlived. Both kernels: with the
+/// census gone (slice 4b), Linux leaves such a process alone too.
 #[test]
 fn a_lock_held_after_its_run_keeps_the_seat_busy() {
     let scratch = tempfile::tempdir().unwrap();
@@ -1190,7 +1189,6 @@ fn a_lock_held_after_its_run_keeps_the_seat_busy() {
 /// (murail-4a's reproduction, 5c27e351): a finished run's leftover holds
 /// it while a contender has reserved but not tried it. A third run's
 /// refusal must name the finished run; the contender only as a possibility.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
     // The pause before the seat is a debug-build point.
@@ -1254,7 +1252,6 @@ fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
 
 /// A recipe line that leaves a setsid python running, holding the run's
 /// inherited lock descriptors, and records its pid.
-#[cfg(target_os = "macos")]
 fn leaving(pidfile: &Path) -> String {
     format!(
         "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
@@ -1265,7 +1262,6 @@ fn leaving(pidfile: &Path) -> String {
 /// Runs refused together behind a leaver each see the others' reservations
 /// (critic L1): every refusal must still name the ended run whose leftover
 /// holds the lock, with the others only as "or" possibilities.
-#[cfg(target_os = "macos")]
 #[test]
 fn runs_refused_together_behind_a_leaver_each_name_the_ended_run() {
     let scratch = tempfile::tempdir().unwrap();
@@ -1307,7 +1303,6 @@ fn runs_refused_together_behind_a_leaver_each_name_the_ended_run() {
 /// An exclusive run's leftover holds the host (critic L2): the holder's
 /// name is never cleared, and the shared probe fails, so a waiter on
 /// another seat refuses naming the ended exclusive run, not "shared runs".
-#[cfg(target_os = "macos")]
 #[test]
 fn a_host_held_after_an_exclusive_run_names_that_run() {
     let scratch = tempfile::tempdir().unwrap();
@@ -1439,7 +1434,6 @@ fn an_exclusive_run_holds_the_host_until_its_record_is_final() {
 /// A dead exclusive run is reconciled before it is named (critic L3): its
 /// finalize failed, its supervisor is gone, and a leaver it started holds
 /// the host. A waiter names it ended (lost), not live.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_dead_exclusive_run_is_reconciled_before_it_is_named() {
     if !cfg!(debug_assertions) {
@@ -2166,7 +2160,7 @@ fn a_survivor_holding_the_output_pipe_cannot_keep_the_run() {
     // Teardown and the drain, from the lease to the record.
     let host = only_record(&dir.path().join(".ferry/local/records"));
     let took = since_acquired(&host);
-    let bound = limits::SESSION_CLEANUP * 2 + limits::DRAIN * 2 + common::slack();
+    let bound = limits::STOP_GRACE * 2 + limits::DRAIN * 2 + common::slack();
     assert!(took < bound, "{took:?} >= {bound:?}");
     // The log was closed before the record: its size is the count.
     let log = output_log(dir.path(), record["id"].as_str().unwrap());
@@ -2262,7 +2256,7 @@ fn a_failed_teardown_after_the_verdict_is_a_note() {
     }
     let dir = fixture("echo done", "");
     let out = ferry(dir.path())
-        .env("FERRY_FAIL_AT", "session-cleanup")
+        .env("FERRY_FAIL_AT", "session-term")
         .args(["run", "probe", "--local", "--json"])
         .output()
         .unwrap();
@@ -2270,52 +2264,176 @@ fn a_failed_teardown_after_the_verdict_is_a_note() {
     assert_eq!(out.status.code(), Some(0), "{record}");
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     assert!(
-        record["reason"]
-            .as_str()
-            .unwrap()
-            .contains("session teardown"),
+        record["reason"].as_str().unwrap().contains("session TERM"),
         "{record}"
     );
-    // The unconfirmed teardown quarantines the host until an operator acts.
+    // KILL still followed, and nothing quarantines the host.
+    assert_eq!(
+        record["custody"]["survivors"],
+        serde_json::json!([]),
+        "{record}"
+    );
     let next = ferry(dir.path())
         .args(["run", "pass", "--local", "--json"])
         .output()
         .unwrap();
-    assert_eq!(receipt(&next)["outcome"], "refused");
-    assert!(
-        receipt(&next)["reason"]
-            .as_str()
+    assert_eq!(receipt(&next)["outcome"], "ran-pass");
+}
+
+/// Locks reach the recipe, never the supervisor's other children: here
+/// git, which the supervisor runs under the held locks to reset the seat
+/// (moved from `custody_contract`, whose census and `ps` witness are gone).
+#[cfg(target_os = "linux")]
+#[test]
+fn locks_reach_the_recipe_but_not_the_supervisors_other_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = tmp.path().join("git-fds");
+    let real_git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
             .unwrap()
-            .contains("cleanup_pending")
+            .stdout,
+    )
+    .unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\nls -l /proc/$$/fd >> {} 2>&1\nexec {} \"$@\"\n",
+            log.display(),
+            real_git.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let recipe_fds = tmp.path().join("recipe-fds");
+    let dir = fixture(&format!("ls -l /proc/$$/fd > {}", recipe_fds.display()), "");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = ferry(dir.path())
+        .env("PATH", path)
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", receipt(&out));
+    let recipe = fs::read_to_string(&recipe_fds).unwrap();
+    let git = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        recipe.contains("/locks/"),
+        "the recipe did not inherit its locks"
+    );
+    assert!(!git.is_empty(), "the git wrapper never ran");
+    assert!(
+        !git.contains("/locks/"),
+        "a supervisor child inherited a lock:\n{git}"
     );
 }
 
+/// A session member that ignores TERM is killed after the grace (SPEC §7,
+/// `STOP_GRACE`), and is not left as a survivor.
 #[test]
-fn a_taint_that_may_hold_the_host_refuses_before_any_wait() {
-    let dir = fixture("echo ran", "");
-    let taint = dir.path().join(".ferry/local/taint");
-    fs::create_dir_all(&taint).unwrap();
-    fs::write(
-        taint.join("abc-held.json"),
-        serde_json::json!({"id": "earlier", "reason": "descendants survived the session",
-            "pids": [], "survivors": [],
-            "locks": {"seat": "abc-held", "host": "exclusive", "gate": true}})
-        .to_string(),
-    )
-    .unwrap();
+fn a_session_member_that_ignores_term_is_killed_after_the_grace() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("member.pid");
+    let dir = fixture(
+        &format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {p}.tmp; mv {p}.tmp {p}; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let _member = Owned(pidfile.clone());
+    let started = Instant::now();
     let out = ferry(dir.path())
         .args(["run", "probe", "--local", "--json"])
         .output()
         .unwrap();
     let record = receipt(&out);
-    assert_eq!(record["outcome"], "refused", "{record}");
-    assert!(
-        record["reason"]
-            .as_str()
-            .unwrap()
-            .contains("host lease is held"),
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["custody"]["tier"], "session", "{record}");
+    assert_eq!(
+        record["custody"]["survivors"],
+        serde_json::json!([]),
         "{record}"
     );
+    assert!(
+        started.elapsed() >= limits::STOP_GRACE,
+        "{:?}",
+        started.elapsed()
+    );
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        kill(Pid::from_raw(pid), None).is_err(),
+        "the member survived"
+    );
+}
+
+/// A survivor holding a lock (SPEC §12.9): a session member that ignores
+/// TERM, with the KILL skipped, outlives the stop. The record names it, by
+/// pid and start; it keeps the seat busy, and the next run's refusal names
+/// the run it outlived. Once it is stopped, the seat takes runs again.
+#[test]
+fn a_survivor_holding_its_lock_is_named_and_keeps_the_seat_busy() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("survivor.pid");
+    let dir = fixture(
+        &format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {p}.tmp; mv {p}.tmp {p}; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let _survivor = Owned(pidfile.clone());
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "session-kill")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let first = receipt(&out);
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
+    let pid: i64 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let survivors = first["custody"]["survivors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        survivors
+            .iter()
+            .any(|s| s["pid"] == pid && s["start"].is_number()),
+        "{first}"
+    );
+    let out = ferry(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains(&format!(
+            "held after run {} ended (ran-pass)",
+            first["id"].as_str().unwrap()
+        )),
+        "{record}"
+    );
+    kill(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGKILL).unwrap();
+    wait_until("the seat is free", || !seat_held(dir.path()));
+    let out = ferry(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
 }
 
 /// Runs `ferry run pass --local` in a pty with `tostop`, its foreground,

@@ -79,8 +79,6 @@ ferry record <id>                   the receipt, completed once the run is final
 ferry recipes                       the recipes at this commit
 ferry machines                      the configured machines
 ferry receipt <id>                  print a receipt
-ferry seat recover <seat> [--local] [--accept-unknown --reason '<why>']
-                                    clear a seat once its processes are proven gone
 ```
 
 `ferry place`, `host-info` and `execute-session` are internal: the caller
@@ -103,7 +101,7 @@ so a program decides by the `--json` receipt: `state` first, then
 | `ran-pass` | 0 | The recipe ran and exited 0. |
 | `ran-fail` | the recipe's code | The recipe ran and failed. |
 | `timeout` | 124 | `--timeout-seconds` (or the run's absolute deadline) elapsed; the recipe's session was ended. |
-| `refused` | 125 | Nothing ran: unknown recipe or machine, unmet requirement, dirty or unknown commit, tainted seat, host policy, or a host that refused before acceptance. |
+| `refused` | 125 | Nothing ran: unknown recipe or machine, unmet requirement, dirty or unknown commit, busy seat, host policy, or a host that refused before acceptance. |
 | `stopped` | 128+signal | `ferry stop`, a signal to the caller, or one to the supervisor came before the recipe's result: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. `stopped_by` names who and why. |
 | `lost` | 255 | The run ended without a verdict of its own: its supervisor is gone (reconciled), or something failed after the recipe started. |
 
@@ -249,42 +247,17 @@ before checkout and hooks.
 # Version 1: a guard. Below the floor, refuse (125).
 version = 1
 min_free_bytes = 42949672960
-
-# Version 2: below the floor, first reclaim named targets of idle seats.
-version = 2
-min_free_bytes = 42949672960
-evict = { mode = "idle-seat-targets", targets = ["cargo-target"] }
 ```
 
 - **No file:** the run proceeds, and the receipt records `not-configured`.
-- **A malformed policy refuses** before anything is measured. That covers an
-  unknown version or key, `evict` in version 1, and a target that is not a
-  plain name.
-- **Version 2** removes only `caches/<seat>/<target>` for the listed targets,
-  oldest release first, until the floor is met.
-- **Which seats are eligible:** a seat whose last release was recorded idle,
-  that has no taint or owner marker (an unreadable marker means unknown, and
-  the seat is skipped), whose lock can be taken without waiting, and whose idle
-  record is unchanged under that lock.
-- **Path safety:** every directory down to the target must be a real
-  directory on the state root's filesystem, owned by its owner. Removal never
-  follows symlinks.
-- **Never removed:** checkouts, receipts, records, logs and anything outside
-  `<state>/caches`.
+- **A malformed policy refuses** before anything is measured: an unknown
+  version or key. Version 2 (eviction of idle seats' targets) is retired with
+  the idle records it read. Slice 5 bounds seats instead, with `ferry seats
+  prune` and a per-seat cap (SPEC §9).
 
-If eligible seats run out while still below the floor, the run refuses (125).
-The receipt's `admission` records:
-- the policy read;
-- the floor;
-- the filesystem;
-- availability before and after;
-- each eviction, with its bytes;
-- the seats skipped, and why;
-- the result.
-
-Availability can change for reasons outside Ferry, so the measured difference
-is an observation. There is no collector or timer: reclamation happens only
-inside an admitting run.
+The receipt's `admission` records the policy read, the floor, the filesystem,
+the bytes available, and the result. Availability can change for reasons
+outside Ferry, so it is an observation.
 
 ## Hooks and environment
 
@@ -300,8 +273,7 @@ or prepares its seat) runs none of them, collect included: nothing ran.
   run's identity or the seat-local mirror configuration.
 - **`FERRY_CACHE_DIR`** is a per-seat directory Ferry owns
   (`<state>/caches/<seat>`, mode 0700). Put regenerable build output there,
-  for example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`. Host policy may
-  reclaim named subdirectories of it from idle seats, and nothing else.
+  for example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`.
 - **The `environment` declaration** has three lists:
   - `forwards`: caller variables sent to the recipe, recorded in the receipt,
     so never put secrets there;
@@ -383,57 +355,31 @@ lock it names, and a free lock's last holder is always already final.
 A place's refusal carries `why` and `next` apart (SPEC §6); the receipt's
 reason is `<why>; <next>`.
 
-### Custody: nothing a run starts outlives it
+### Custody: the session stop (SPEC §7)
 
 The supervisor is always a freshly spawned `ferry place supervise`, started
-by `place submit` in its own session. Having just started, it has no children
-of its own, so everything it later finds is the run's.
+by `place submit` in its own session, and the run's work has a session of
+its own.
 
-**At release.** After the collect hook, the receipt's `custody` records a
-census of what the run left:
-- **`empty`:** no live descendant, so the seat is recorded **idle**;
-- **`survivors`:** live descendants remain. Each one, its descendants, and
-  any process group one of them leads get SIGTERM, then SIGKILL after 10 s,
-  then a second census. If that census is empty, the seat is idle, with
-  `custody.stopped` listing what was stopped;
-- **still alive, or the census is `unknown`:** the seat is **tainted**;
-- **`unsupported`:** see macOS below.
+**At the end of a run,** the run's session (and then the collect hook's) is
+stopped: SIGTERM to every member, up to 10 s for them to leave, SIGKILL, and
+up to 2 s for them to be gone. The receipt's `custody` records:
+- `tier`: `session`;
+- `survivors`: the members still alive after that, by pid and start time, or
+  `"unknown"` if the session could not be listed;
+- `error`, if the stop could not complete. The verdict stands.
 
-**Release always happens.** Once the session is spawned, every path collects,
-censuses, stops and records before the locks drop. If release itself fails,
-the verdict stands and `custody.error` says why.
-
-**A tainted seat refuses** new runs (125), naming:
-- the run and its survivors (pid and start time);
-- the locks they may still hold;
-- the command to run: `ferry seat recover <seat>` on that machine (`--local`
-  for local runs).
-
-While any seat is tainted, an `--exclusive` run refuses. Any run that needs
-the host lease also refuses before its first try in two cases: a taint says
-its survivors may hold the lease exclusively or hold the gate, or a taint
-cannot be read.
-
-**Recovery never kills.** It clears a taint only when every recorded survivor
-is gone, checked by pid and start time. A taint that cannot be proven clear
-(no survivors named, or an unreadable record) needs the operator's explicit
-`--accept-unknown --reason '<why>'`, which the recover receipt keeps.
+Ferry proves nothing beyond the session. A process that left it (`setsid`,
+a double fork) is not chased. If it keeps the run's locks, the seat stays
+busy until it exits, and the next run's refusal names the run it outlived
+("held after run <id> ended"): stop it by its exact pid. There is no taint,
+owner marker, idle record, quarantine or `seat recover`.
 
 **Locks outlive a killed supervisor.** The seat lock and host lease are
 inherited by the recipe's processes, on every platform. A killed supervisor
 therefore frees them only when the processes that kept them exit, so a new
 run on the seat is refused busy instead of starting beside live work.
 Release closes descriptors, never `LOCK_UN`.
-
-**Linux and macOS differ:**
-- **Linux:** the supervisor is a child subreaper. A process that leaves the
-  recipe's session (`setsid`, double fork) is reparented to it, so it is still
-  counted and stopped.
-- **macOS:** there is no census yet (`unsupported`). Session teardown kills
-  the recipe's session, but a descendant that leaves the session escapes.
-  If it keeps the inherited locks, the seat stays busy until it exits, and
-  the next run's refusal names the run it outlived. The seat is never
-  recorded idle. The receipt says so.
 
 ### Detached runs, output and the verdict
 
@@ -488,16 +434,12 @@ supervisor's pid), then `receipt`.
 ## Limits
 
 - **Not a sandbox.** Runs execute as you, with your permissions.
-- **Outside custody:** processes a run did not start, other users and other
-  hosts. On macOS, also descendants that leave the session.
+- **Outside custody:** processes a run did not start, other users, other
+  hosts, and descendants that leave the run's session.
 - **A supervisor killed outright** stops nothing. Its run is reconciled to
   `lost`/255 by its caller or the next run on the seat.
-  - Its owner marker keeps that seat refused until `ferry seat recover`.
   - The inherited locks keep other runs out while its work lives, on every
     platform.
-- **Unconfirmed session cleanup** writes a `cleanup-pending-*` marker. Further
-  runs under that state root refuse until an operator confirms the session is
-  gone and removes the marker; Ferry never clears it by age.
 - **Remote evidence is not publication authority.** A remote result does not
   certify a repository's own local gate.
 - **Timings:** never pool machine timings across platforms.

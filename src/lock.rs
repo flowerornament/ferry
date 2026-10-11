@@ -46,15 +46,14 @@ pub struct Held {
     pub host: Option<HostLease>,
 }
 
-/// Polls for a lock until it is granted, `stop` is set, `waiting` (run on
-/// every contended attempt) refuses, or the run's one wait budget ends
-/// (`waits_end_ms`, else `wait` from now); then it refuses naming the holder. An exclusive holder writes its run id into
-/// the lock file for that.
+/// Polls for a lock until it is granted, `stop` is set, or the run's one
+/// wait budget ends (`waits_end_ms`, else `wait` from now); then it refuses
+/// naming the holder. An exclusive holder writes its run id into the lock
+/// file for that.
 pub(crate) fn acquire_as(
     path: &Path,
     stop: &AtomicBool,
     shared: bool,
-    waiting: &dyn Fn() -> Result<()>,
     request: &Request,
 ) -> Result<fs::File> {
     let file = fs::OpenOptions::new()
@@ -86,7 +85,6 @@ pub(crate) fn acquire_as(
                 return Ok(file);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                waiting()?;
                 if crate::receipt::now_ms() >= ends_ms {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     // The holder's name is never cleared: the work inherits
@@ -177,22 +175,13 @@ impl HostLease {
         // a new exclusive run on one state root still exclude each other.
         let host = root.join("locks/host-exclusive");
         let exclusive = request.recipe.requires.contains("exclusive");
-        let local = root.ends_with("local");
         let held = if exclusive {
-            // A tainted seat's survivors may hold the lease: no exclusive claim.
-            let tainted = || crate::custody::check_exclusive(root, local);
-            tainted()?;
-            partial.push(acquire_as(&gate, stop, false, &tainted, request)?);
-            partial.push(acquire_as(&host, stop, false, &tainted, request)?);
-            tainted()?;
+            partial.push(acquire_as(&gate, stop, false, request)?);
+            partial.push(acquire_as(&host, stop, false, request)?);
             std::mem::take(partial)
         } else {
-            // A tainted exclusive run's survivors may hold the gate or lease.
-            let tainted = || crate::custody::check_host(root, local);
-            // Before the first try too, not only once contended.
-            tainted()?;
-            partial.push(acquire_as(&gate, stop, true, &tainted, request)?);
-            let host = acquire_as(&host, stop, true, &tainted, request)?;
+            partial.push(acquire_as(&gate, stop, true, request)?);
+            let host = acquire_as(&host, stop, true, request)?;
             // A shared run passes the gate: it closes once the lease is held.
             partial.clear();
             vec![host]
