@@ -244,3 +244,42 @@ Each freeze states the measured running src.
   the dependency commit, which the receipt JSON always contains; the
   recipe's output is on stderr with `--json`. Its replacement checks
   stderr for the served ref.
+
+## 9. Review of 77eeb634 (herald-1b amendment; critic RETURN)
+
+- **The `ship` capability** (herald-1b, and the critic's L3, reproduced
+  against the real d1b8984f place): the predecessor advertises `detach` and
+  `retire` but cannot read `ship`, so a new caller pushed objects and was
+  refused only at deserialization (§12.11). `ship` is now a capability,
+  required with `detach` for every request before any push; the refusal
+  names the place's revision. Control
+  `a_place_without_ship_is_refused_before_any_push`, with b2756526's exact
+  set (`detach`, `retire`); the real predecessor binary is not built in the
+  harness.
+- **Isolation of the recipe's view** (the critic's L1, correcting the Q3
+  ruling: the issue is the exact-commit guarantee, not trust): shipped
+  objects were heads in the one store, so every seat clone copied every
+  project's ship branches, and every URL served the whole store. Now:
+  - the store keeps each object as `refs/ferry/ship/<commit>`, outside
+    `refs/heads`, so a seat clone copies none;
+  - each run serves its `url` entries from its own bare repository in the
+    checkout (`.ferry/ship.git`, removed by the next checkout reset), whose
+    `objects/info/alternates` points at the store and which holds only this
+    run's declared commits as `refs/heads/ferry/ship/<commit>`;
+  - declared `ref` entries come from the store's objects by `update-ref`,
+    as before.
+  Control `a_recipe_sees_only_its_own_ship_entries` (the critic's l1): two
+  seats ship different dependencies; seat two's `git branch -r`,
+  `for-each-ref` and `ls-remote` show only its own entry.
+- **Concurrent first runs** (the critic's L2, pre-existing): the store's
+  `git init` is retried (re-init is harmless; only the config lock races),
+  and a local fetch that loses the ref lock to the same commit counts as
+  shipped, as a remote push already did. Control
+  `concurrent_first_runs_shipping_one_object_never_refuse` (the critic's
+  l2, four rounds).
+- **Noted, no change:** store ship refs accumulate (P2 growth; a prune of
+  unreferenced `refs/ferry/ship/*` belongs to slice 7 or later).
+- **Size:** src 5965 → 6043 (+78): the per-run served repository, the race
+  handling, and the local route of `ship` extracted (clippy's function
+  length). Isolation beats the ceiling (the coordinator); slice 7 closes it.
+

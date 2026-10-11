@@ -199,12 +199,15 @@ commit = 'abc123…'
   keeps the caller's revision syntax. Ferry does not fetch or fall back, and
   the ref must name a commit directly (not a tag object).
 - **One store:** every object goes to the place's one store with the run's
-  commit, only after the place's capabilities are checked, and is kept as
-  `refs/heads/ferry/ship/<commit>`.
+  commit, only after the place's capabilities are checked (`ship`, besides
+  `detach`), and is kept as `refs/ferry/ship/<commit>`, outside the heads a
+  seat's clone copies.
 - **In the checkout:** a `ref` entry is made in the seat's clone (and a ref
-  a later run no longer ships is removed); a `url` entry is served from the
-  store through the checkout's git configuration (`GIT_CONFIG_GLOBAL`), so
-  the recipe fetches it at its URL.
+  a later run no longer ships is removed); a `url` entry is served from a
+  bare repository of the run's own (it borrows the store's objects and holds
+  only this run's declared commits) through the checkout's git configuration
+  (`GIT_CONFIG_GLOBAL`), so the recipe fetches it at its URL. A recipe sees
+  its commit and its own declared entries, never another project's.
 - **In the receipt:** `ship`, one `{ref | url, commit, from}` per entry.
 - **Retired:** `[companion_refs]` and `[[mirror]]` (and the adapter's
   `mirror` key) refuse, naming `[[ship]]`.
@@ -227,6 +230,8 @@ requires = ["admission"]
 | `lease` | the shared/exclusive host lease |
 | `admission` | host policy admission (`host.toml`), even when not configured |
 | `detach` | detached runs (`ferry place` submit, follow, stop, record); a caller refuses a place without it (125, naming the place's `source_rev`) |
+| `retire` | the place's `retire` verb for `ferry seats prune`; prune refuses a place without it (125, naming its `source_rev`) |
+| `ship` | `[[ship]]` requests and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
 
 A run is refused (125) before any hook runs if:
 - the caller does not know a required capability;

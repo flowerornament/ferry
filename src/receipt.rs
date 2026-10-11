@@ -18,6 +18,7 @@ pub const CAPABILITIES: &[&str] = &[
     "admission",
     "detach",
     "retire",
+    "ship",
 ];
 
 /// Refuses requirements this binary does not provide.

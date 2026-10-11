@@ -272,9 +272,10 @@ impl Place<'_> {
 /// Ships the commit and its `[[ship]]` objects (`(repository, commit)`) to
 /// the place's one store, only after checking that the place can run the
 /// request: a refused place receives nothing. Each object is kept as
-/// `refs/heads/ferry/ship/<commit>`: a head, which a dependency clone
-/// fetches, and a name no dependency's own can resolve to. A place without
-/// `detach` is refused: callers are never installed before their places.
+/// `refs/ferry/ship/<commit>`, outside `refs/heads`, so a seat cloned from
+/// the store copies no project's ship entries (the place serves each run
+/// its own, `execution::present_ship`). A place without `detach` and `ship`
+/// is refused: callers are never installed before their places.
 pub fn ship(
     root: &Path,
     place: &Place,
@@ -282,30 +283,8 @@ pub fn ship(
     objects: &[(PathBuf, String)],
     record: &mut Receipt,
 ) -> Result<()> {
-    let kept = |commit: &str| format!("{commit}:refs/heads/ferry/ship/{commit}");
     match place {
-        Place::Local(state) => {
-            fs::create_dir_all(state)?;
-            let bare = state.join("repo.git");
-            if !bare.exists() {
-                repository::output(Command::new("git").args(["init", "--bare"]).arg(&bare))?;
-            }
-            let fetch = |repo: &Path, refspec: &str| {
-                repository::output(
-                    Command::new("git")
-                        .arg("--git-dir")
-                        .arg(&bare)
-                        .arg("fetch")
-                        .arg(repository::git_dir(repo)?)
-                        .arg(refspec),
-                )
-            };
-            fetch(root, &request.commit)?;
-            for (repo, commit) in objects {
-                fetch(repo, &kept(commit))?;
-            }
-            Ok(())
-        }
+        Place::Local(state) => ship_local(root, state, request, objects),
         Place::Remote(machine) => {
             config::identifier(&machine.ssh)?;
             config::relative_path(&machine.binary)?;
@@ -324,11 +303,17 @@ pub fn ship(
                 record.exit_code = 125;
                 Err(why.into())
             };
-            if !info.capabilities.iter().any(|c| c == "detach") {
+            // Every M1 request ships (at least its commit), so `ship` is a
+            // protocol gate, checked with `detach` before any push: the
+            // predecessor that has detach but not ship gets nothing.
+            let lacks = ["detach", "ship"]
+                .into_iter()
+                .find(|needed| !info.capabilities.iter().any(|c| c == needed));
+            if let Some(lacks) = lacks {
                 return refused(
                     record,
                     format!(
-                        "place {} runs ferry {}, which lacks detach: install this caller's ferry ({}) there",
+                        "place {} runs ferry {}, which lacks {lacks}: install this caller's ferry ({}) there",
                         machine.ssh,
                         info.source_rev.as_deref().unwrap_or("of unknown revision"),
                         receipt::source_rev()
@@ -351,7 +336,9 @@ pub fn ship(
                     "reported host architecture does not meet requirements".into(),
                 );
             }
-            repository::output(ssh(&machine.ssh)?.arg("mkdir -p .local/state/ferry; test -d .local/state/ferry/repo.git || git init --bare .local/state/ferry/repo.git"))?;
+            init_store(ssh(&machine.ssh)?.arg(
+                "mkdir -p .local/state/ferry && git init -q --bare .local/state/ferry/repo.git",
+            ))?;
             push(
                 root,
                 &machine.ssh,
@@ -371,6 +358,76 @@ pub fn ship(
             }
             Ok(())
         }
+    }
+}
+
+/// The local route of `ship`: fetches into the repository's own store.
+fn ship_local(
+    root: &Path,
+    state: &Path,
+    request: &Request,
+    objects: &[(PathBuf, String)],
+) -> Result<()> {
+    fs::create_dir_all(state)?;
+    let bare = state.join("repo.git");
+    init_store(
+        Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&bare),
+    )?;
+    // Two runs may fetch the same object at once: a fetch that loses
+    // the ref's lock to the same commit has shipped it.
+    let fetch = |repo: &Path, refspec: &str| {
+        let fetched = repository::output(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .arg("fetch")
+                .arg(repository::git_dir(repo)?)
+                .arg(refspec),
+        );
+        let Some((commit, reference)) = refspec.split_once(':') else {
+            return fetched;
+        };
+        let mut check = Command::new("git");
+        check
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["rev-parse", "--verify", reference]);
+        match fetched {
+            Err(_)
+                if repository::output(&mut check)
+                    .is_ok_and(|held| held.trim_ascii() == commit.as_bytes()) =>
+            {
+                Ok(vec![])
+            }
+            fetched => fetched,
+        }
+    };
+    fetch(root, &request.commit)?;
+    for (repo, commit) in objects {
+        fetch(repo, &kept(commit))?;
+    }
+    Ok(())
+}
+
+/// The refspec keeping a shipped object in the store, outside `refs/heads`.
+fn kept(commit: &str) -> String {
+    format!("{commit}:refs/ferry/ship/{commit}")
+}
+
+/// Initializes the place's store, again if it exists (harmless). Two first
+/// runs may race on its config lock, so a failure is retried a few times
+/// (the critic's L2 on slice 6).
+fn init_store(command: &mut Command) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match repository::output(command) {
+            Ok(_) => return Ok(()),
+            Err(_) if tries < 10 => tries += 1,
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

@@ -802,7 +802,15 @@ fn a_shipped_url_is_served_from_the_store_at_its_exact_commit() {
         said.contains(&format!("refs/heads/ferry/ship/{sha}")),
         "{said}"
     );
-    let store = dir.path().join(".ferry/local/repo.git");
+    // The run's own served repository: an ordinary clone of it fetches the
+    // commit, borrowing the store's objects.
+    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let store = slot.join(".ferry/ship.git");
     let clone = dir.path().join("ordinary-clone");
     git(
         dir.path(),
@@ -1653,10 +1661,10 @@ fn a_host_without_a_required_capability_is_refused_before_acceptance() {
     git(dir.path(), &["commit", "-m", "requires admission"]);
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
-    // A host that can detach, without the required capability.
+    // A host that can detach and ship, without the required capability.
     fs::write(
         bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\"]/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\",\"ship\"]/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
     )
     .unwrap();
     fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -2776,4 +2784,121 @@ fn an_old_place_receives_no_objects_before_its_refusal() {
         !dir.path().join("host/.local/state").exists(),
         "the refused place received state"
     );
+}
+
+/// The immediate predecessor (b2756526) advertises detach and retire but
+/// cannot read `ship`: it is refused before anything is pushed, naming its
+/// revision (SPEC §12.11; herald-1b's amendment to slice 6).
+#[test]
+fn a_place_without_ship_is_refused_before_any_push() {
+    let dir = fixture();
+    let bin = dir.path().join("host/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("old-ferry"),
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\",\"retire\"]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = remote_run(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    );
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("lacks ship") && reason.contains("0ld-place-rev"),
+        "{reason}"
+    );
+    assert!(
+        !dir.path().join("host/.local/state").exists(),
+        "the refused place received state"
+    );
+}
+
+/// A dependency repository at `dir/<name>` with one commit; its hash.
+fn dependency(dir: &Path, name: &str) -> String {
+    let path = dir.join(name);
+    fs::create_dir_all(&path).unwrap();
+    git(&path, &["init", "-q"]);
+    git(&path, &["config", "user.name", "Ferry Test"]);
+    git(&path, &["config", "user.email", "ferry@example.invalid"]);
+    fs::write(path.join("value"), name).unwrap();
+    git(&path, &["add", "value"]);
+    git(&path, &["commit", "-qm", name]);
+    let out = Command::new("git")
+        .current_dir(&path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// A recipe sees its commit and its own declared ship entries, nothing else:
+/// another seat's shipped dependency is in none of its branches, refs or
+/// served URLs (the critic's l1 on slice 6).
+#[test]
+fn a_recipe_sees_only_its_own_ship_entries() {
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "deps/\nconfig/\nstate/\n").unwrap();
+    let a = dependency(dir.path(), "deps/a");
+    let b = dependency(dir.path(), "deps/b");
+    let probe = "git branch -r; git for-each-ref --format=\"%(refname)\"; git ls-remote https://example.invalid/org/b";
+    for (seat, name, sha) in [("one", "a", &a), ("two", "b", &b)] {
+        fs::write(dir.path().join("ferry.toml"), format!("version=1\n[[ship]]\nurl='https://example.invalid/org/{name}'\npath='deps/{name}'\ncommit='{sha}'\n[recipe.probe]\ncommand=['sh','-c','{probe}']\n")).unwrap();
+        git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+        git(dir.path(), &["commit", "-qm", &format!("ship {name}")]);
+        let out = run(
+            dir.path(),
+            &["run", "probe", "--local", "--seat", seat, "--json"],
+        );
+        let seen = String::from_utf8_lossy(&out.stderr).into_owned();
+        if seat == "two" {
+            assert!(out.status.success(), "{seen}");
+            assert!(
+                seen.contains(&format!("refs/heads/ferry/ship/{b}")),
+                "{seen}"
+            );
+            assert!(
+                !seen.contains(&a),
+                "seat two sees seat one's dependency: {seen}"
+            );
+        }
+        assert!(
+            !seen.contains("origin/ferry/ship"),
+            "a ship entry was cloned: {seen}"
+        );
+    }
+}
+
+/// Two first runs on a fresh root, shipping the same object, never refuse:
+/// the store's init and the object's ref may race, and both are benign
+/// (the critic's l2 on slice 6).
+#[test]
+fn concurrent_first_runs_shipping_one_object_never_refuse() {
+    for round in 0..4 {
+        let dir = fixture();
+        fs::write(dir.path().join("ferry.toml"), format!("version=1\n[[ship]]\nref='refs/heads/dep'\nfrom='HEAD'\n[recipe.probe]\ncommand=['git','rev-parse','refs/heads/dep']\n# {round}\n")).unwrap();
+        git(dir.path(), &["add", "ferry.toml"]);
+        git(dir.path(), &["commit", "-qm", "ship a ref"]);
+        let spawn = |seat: &str| {
+            Command::new(env!("CARGO_BIN_EXE_ferry"))
+                .current_dir(dir.path())
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_STATE_HOME", dir.path().join("state"))
+                .args(["run", "probe", "--local", "--seat", seat, "--json"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let (one, two) = (spawn("one"), spawn("two"));
+        for child in [one, two] {
+            let out = child.wait_with_output().unwrap();
+            let record = receipt(&out);
+            assert_eq!(record["outcome"], "ran-pass", "round {round}: {record}");
+        }
+    }
 }

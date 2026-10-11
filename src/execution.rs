@@ -412,12 +412,32 @@ fn present_ship(bare: &Path, seat: &Path, request: &Request) -> Result<()> {
             git(&["config", "--local", "--add", "ferry.ref", name])?;
         }
         if let Some(url) = &shipped.url {
-            fs::create_dir_all(seat.join(".ferry"))?;
+            // Served from a bare repository of this run's own (the checkout
+            // reset removes it): it borrows the store's objects and holds
+            // only this run's declared commits as branches, so a recipe sees
+            // no other project's entries (the critic's L1 on slice 6).
+            let served = seat.join(".ferry/ship.git");
+            if !served.exists() {
+                repository::output(
+                    Command::new("git")
+                        .args(["init", "-q", "--bare"])
+                        .arg(&served),
+                )?;
+                let alternates = format!("{}\n", bare.join("objects").display());
+                fs::write(served.join("objects/info/alternates"), alternates)?;
+            }
+            let branch = format!("refs/heads/ferry/ship/{}", shipped.commit);
+            let mut serve = Command::new("git");
+            serve
+                .arg("--git-dir")
+                .arg(&served)
+                .args(["update-ref", &branch, &shipped.commit]);
+            repository::output(&mut serve)?;
             repository::output(
                 Command::new("git")
                     .args(["config", "--add", "--file"])
                     .arg(seat.join(".ferry/gitconfig"))
-                    .arg(format!("url.file://{}/.insteadOf", bare.display()))
+                    .arg(format!("url.file://{}/.insteadOf", served.display()))
                     .arg(url),
             )?;
         }
