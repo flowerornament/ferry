@@ -1127,7 +1127,11 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     let tools = dir.join("transport-tools");
     fs::create_dir_all(host.join(".local/bin")).unwrap();
     fs::create_dir_all(&tools).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
+    // By rename, never in place: macOS kills a process whose signed binary is
+    // rewritten under it (seen as `signal: 9` on a later verb; ferry-xtx.15).
+    let staged = host.join(".local/bin/.ferry.new");
+    fs::copy(env!("CARGO_BIN_EXE_ferry"), &staged).unwrap();
+    fs::rename(&staged, host.join(".local/bin/ferry")).unwrap();
     // FERRY_TEST_SLOW_PUSH names a marker: a git push touches it, then stalls.
     // A file `unreachable` on the host fails every follow, as a dead link;
     // a file `fail-record-once` fails the next `place record`, once.
