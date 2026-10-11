@@ -2518,3 +2518,50 @@ fn a_link_swapped_in_during_a_wipe_is_never_followed() {
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     assert_eq!(record["pruned"]["cap"], 1000, "{record}");
 }
+
+/// A wipe fails closed: a subdirectory it cannot inspect stops the delete
+/// with a note, and nothing in the preserve tree is wiped (ferry-xtx.23).
+#[test]
+fn a_wipe_that_cannot_inspect_its_tree_deletes_nothing() {
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "big/\nconfig/\nstate/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['big']\n[recipe.pass]\ncommand=['sh','-c','mkdir -p big/locked big/other; head -c 4096 /dev/zero > big/other/blob']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "a preserved tree"]);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
+    );
+    run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let state = dir.path().join(".ferry/local");
+    let slot = fs::read_dir(state.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
+    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
+    fs::write(slot.join("big/other/keep"), "keep").unwrap();
+    let locked = slot.join("big/locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(slot.join("big/other/keep").exists(), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not deleted"),
+        "{record}"
+    );
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("could not be inspected"),
+        "{record}"
+    );
+}

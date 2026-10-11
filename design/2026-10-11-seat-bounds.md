@@ -265,7 +265,10 @@ deploy window.
    between a directory's `lstat` and its listing deleted the link's target,
    so that walk was replaced (control
    `a_link_swapped_in_during_a_wipe_is_never_followed`, made deterministic
-   by the `remove-walk` debug pause). Making a mount needs privileges, so the
+   by the `remove-walk` debug pause). The pre-walk fails closed: anything
+   it cannot inspect (other than an entry gone meanwhile) refuses the delete,
+   "could not be inspected: … not deleted" (control
+   `a_wipe_that_cannot_inspect_its_tree_deletes_nothing`). Making a mount needs privileges, so the
    device check before the delete is not a practical race. A test cannot
    mount, so the device control is a unit test with another device id.
 2. **The check is repeated at the delete.** `admission::remove` proves

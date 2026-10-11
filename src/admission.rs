@@ -225,7 +225,9 @@ pub fn remove(root: &Path, rel: &Path) -> Result<()> {
         return Err(format!("{why}: not deleted").into());
     }
     let path = root.join(rel);
-    if let Some(mount) = foreign(&path, fs::metadata(root)?.dev()) {
+    let found =
+        foreign(&path, fs::metadata(root)?.dev()).map_err(|why| format!("{why}: not deleted"))?;
+    if let Some(mount) = found {
         return Err(format!("{} is on another device: not deleted", mount.display()).into());
     }
     crate::execution::pause_at("remove-walk", &path);
@@ -235,19 +237,32 @@ pub fn remove(root: &Path, rel: &Path) -> Result<()> {
     }
 }
 
-/// The first path under `path` on another device than `dev` (no link followed).
-fn foreign(path: &Path, dev: u64) -> Option<std::path::PathBuf> {
-    let meta = fs::symlink_metadata(path).ok()?;
+/// The first path under `path` on another device than `dev` (no link
+/// followed). What cannot be inspected is an error: fail closed. An entry
+/// gone meanwhile is skipped.
+fn foreign(path: &Path, dev: u64) -> std::result::Result<Option<PathBuf>, String> {
+    let unseen = |e: std::io::Error| format!("{} could not be inspected: {e}", path.display());
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let meta = match fs::symlink_metadata(path) {
+        Err(e) if gone(&e) => return Ok(None),
+        meta => meta.map_err(unseen)?,
+    };
     if meta.dev() != dev {
-        return Some(path.to_path_buf());
+        return Ok(Some(path.to_path_buf()));
     }
     if !meta.is_dir() {
-        return None;
+        return Ok(None);
     }
-    let entries = fs::read_dir(path).ok()?;
-    entries
-        .flatten()
-        .find_map(|entry| foreign(&entry.path(), dev))
+    let entries = match fs::read_dir(path) {
+        Err(e) if gone(&e) => return Ok(None),
+        entries => entries.map_err(unseen)?,
+    };
+    for entry in entries {
+        if let Some(found) = foreign(&entry.map_err(unseen)?.path(), dev)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// Under the run's seat lock, before the checkout: when the seat was last
@@ -373,9 +388,9 @@ mod tests {
         assert_eq!(size_until(&root.join("slots"), None, other), Some(0));
         assert_eq!(
             foreign(&root.join("slots"), other),
-            Some(root.join("slots"))
+            Ok(Some(root.join("slots")))
         );
-        assert_eq!(foreign(&root.join("slots"), dev), None);
+        assert_eq!(foreign(&root.join("slots"), dev), Ok(None));
     }
 
     /// A delete proves containment again at its own moment: a directory
