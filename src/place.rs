@@ -36,7 +36,7 @@ pub struct HostResult {
     pub artifacts_sha256: Option<String>,
     pub artifacts_error: Option<String>,
     #[serde(default)]
-    pub collection: Option<execution::Collection>,
+    pub collection: Option<crate::run::Collection>,
     #[serde(default)]
     pub source_rev: Option<String>,
     #[serde(default)]
@@ -49,7 +49,7 @@ pub struct HostResult {
     pub admission: Option<crate::admission::Admission>,
     /// What reached `output.log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<execution::Output>,
+    pub output: Option<crate::run::Output>,
     /// When the run had to end by, whatever happened (ms since the epoch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u128>,
@@ -288,8 +288,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     let mut held = crate::lock::Held::default();
     // A panic anywhere in here is caught, so the verdict is still recorded
     // with `held` intact, and the locks still close only after finalize.
-    let executed: Result<execution::Ended> = std::panic::catch_unwind(
-        std::panic::AssertUnwindSafe(|| -> Result<execution::Ended> {
+    let executed: Result<crate::run::Ended> = std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| -> Result<crate::run::Ended> {
             let seat = execution::prepare(root, &request, &stop, &mut result.admission, &mut held)?;
             assert!(
                 !execution::fail_at("supervise-panic"),
@@ -300,7 +300,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             };
             // The work inherits both, on every platform (SPEC §3).
             let locks: Vec<_> = std::iter::once(lease).chain(host_lease.files()).collect();
-            let finished = execution::run_released(root, &seat, &request, &stop, &locks, deadline);
+            let finished = crate::run::run_released(root, &seat, &request, &stop, &locks, deadline);
             if let Some(error) = &finished.custody.error {
                 note(
                     &mut result.reason,
@@ -319,7 +319,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             let ended = finished.executed?;
             if matches!(
                 ended,
-                execution::Ended::Result(_) | execution::Ended::Timeout
+                crate::run::Ended::Result(_) | crate::run::Ended::Timeout
             ) {
                 collect_artifacts(root, &seat, &request, &mut result);
             }
@@ -331,10 +331,10 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     // One verdict, from the first terminal fact (Rule B). A stop's signal is
     // the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
-    let (outcome, exit_code, reason) = execution::verdict(
+    let (outcome, exit_code, reason) = crate::run::verdict(
         &executed.map_err(|error| error.to_string()),
         signal,
-        execution::attempted(root, &request),
+        crate::run::attempted(root, &request),
     );
     result.outcome = outcome;
     result.exit_code = exit_code;

@@ -96,7 +96,7 @@ pub struct Receipt {
     #[serde(default)]
     pub preserve: Vec<String>,
     #[serde(default)]
-    pub collection: Option<crate::execution::Collection>,
+    pub collection: Option<crate::run::Collection>,
     /// Recipe arguments given after `--`; older receipts default to none.
     #[serde(default)]
     pub args: Vec<String>,
@@ -129,7 +129,7 @@ pub struct Receipt {
     pub provider_requires: Vec<String>,
     /// What reached the place's output log (`bytes`, `capped`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<crate::execution::Output>,
+    pub output: Option<crate::run::Output>,
     /// When the run had to end by (ms since the epoch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u128>,

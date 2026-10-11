@@ -198,3 +198,40 @@ custody: { tier: "session",
   murail-4a, who activated eviction, is told.
 - **Q4:** the one-window install is enough, so no capability name. The
   receipt's custody shape change goes to the consumers at the 4b freeze.
+
+## 10. As built (2026-10-11)
+
+- **Custody record:** `custody: {tier: "session", survivors: [{pid,
+  start}] | "unknown", error?}`. `start` is a `u64`, because serde cannot
+  buffer a `u128` through an untagged enum. The new §12.9 control caught
+  this as a parse failure on the first run. The receipt keeps custody as
+  JSON, so stored receipts of the old shape still load.
+- **Session stop** (`run::SessionOwner::stop`): TERM to every member, up to
+  `STOP_GRACE` (10 s), KILL, then up to `KILL_GRACE` (2 s). The members left
+  are the survivors. Debug points:
+  - `session-term`: the TERM fails; it becomes a note, and KILL still runs;
+  - `session-kill`: the KILL is skipped, so a TERM-ignoring member survives.
+  `SESSION_CLEANUP` is gone; `TEARDOWN` is recomputed from the two stops.
+- **Deleted:**
+  - the census, subreaper and `reap_adopted`;
+  - taint, owner and idle records, and cleanup-pending;
+  - `seat.rs` (its `start_time` moved to `record.rs`) and `ferry seat
+    recover`;
+  - the taint hooks in `lock.rs` (`acquire_as` lost its `waiting`);
+  - admission eviction. A version 2 policy refuses with "keep
+    `min_free_bytes` as version 1", and the receipt's `admission` is now
+    `{policy, floor_bytes, filesystem, available, result}`;
+  - `custody_contract.rs`. Its lock-inheritance test moved to
+    `stream_contract`, witnessed by a `git` wrapper (Linux), since the
+    census's `ps` is gone.
+- **Only runs take seat locks** (besides the probes, which close at once).
+  4a's interim reclaim and `seat recover` residue is gone with them.
+- **`src/run.rs`** (a separate commit, no behaviour change; +24 lines of
+  header and imports): the session owner and stop, session listing and
+  signals, the run and collect sessions with the deadline, the copier, the
+  verdict, and `execute_session`.
+- **4a's leaver controls run on both kernels now:** Linux no longer stops a
+  setsid leaver either.
+- **Size:** src 6260 after 4a → 5126 after the behaviour → 5150 after the
+  move: 4b −1110, so slices 4a+4b come to −800. Slice 5's estimated +200
+  leaves slices 4–5 near 5350, below 5950.

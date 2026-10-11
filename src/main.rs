@@ -10,6 +10,7 @@ mod place;
 mod receipt;
 mod record;
 mod repository;
+mod run;
 mod transport;
 
 use clap::{Args, Parser, Subcommand};
@@ -468,7 +469,7 @@ fn execute(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Action::ExecuteSession { spec, result } => {
-            execution::execute_session(&spec, &result)?;
+            crate::run::execute_session(&spec, &result)?;
             Ok(0)
         }
     }
