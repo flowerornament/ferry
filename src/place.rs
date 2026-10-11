@@ -282,12 +282,17 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     let deadline = deadline_ms(reservation.submitted_ms, &request);
     result.deadline_ms = Some(deadline);
     record::reconcile_seat(root, &request.seat);
+    // The locks stay held until the record is final (SPEC §5: final record,
+    // then close locks): a named run that is still live holds them.
+    let mut held = None;
     let executed: Result<execution::Ended> = (|| {
         crate::custody::supervise()?;
         let (seat, lease, host_lease) =
             execution::prepare(root, &request, &stop, &mut result.admission)?;
+        // Held from here, on every path, until the record is final.
+        let (lease, host_lease) = held.insert((lease, host_lease));
         // The work inherits both, on every platform (SPEC §3).
-        let locks: Vec<_> = std::iter::once(&lease).chain(host_lease.files()).collect();
+        let locks: Vec<_> = std::iter::once(&*lease).chain(host_lease.files()).collect();
         let finished = execution::run_released(root, &seat, &request, &stop, &locks, deadline);
         if let Some(error) = &finished.custody.error {
             note(
@@ -311,7 +316,6 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         ) {
             collect_artifacts(root, &seat, &request, &mut result);
         }
-        // Stamped while held; the locks drop as this scope ends.
         result.lease = Some(host_lease.stamp());
         Ok(ended)
     })();
@@ -337,7 +341,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         });
     }
     // The record is the truth; a failure to write it leaves the reservation
-    // for a reconcile once this supervisor is gone.
+    // for a reconcile once this supervisor is gone (and its locks with it).
+    execution::pause_at("pre-finalize", &dir.join("finalize"));
     result.state = Some("final".into());
     let stored = serde_json::to_value(&result)
         .map_err(Into::into)
@@ -345,6 +350,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     if let Err(error) = stored {
         execution::warn(&format!("ferry: host record: {error}"));
     }
+    // Only now: the record is final before the locks close.
+    drop(held);
     Ok(result.exit_code)
 }
 

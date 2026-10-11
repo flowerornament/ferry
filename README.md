@@ -362,10 +362,15 @@ reservation shows a run is alive, not that it has the lock. The work inherits th
 platform, so whatever a run leaves running while holding them keeps them
 held. Its waits for the host lease end by its submit plus `--wait-seconds`
 (default 30 min), apart from `--timeout-seconds`. Past it the run refuses
-(125), naming the exclusive run that holds the lease, or, if that run has
-ended, "held after exclusive run <id> ended … or by shared runs"; an empty
-name means shared runs. No holder's name is ever cleared: the work inherits
-the lock and may outlive its run.
+(125). If a shared probe of the lock succeeds, the reason is "held by shared
+runs", which the probe proves. Otherwise it names the exclusive run that
+took it, reconciled first: a live one holds it; an ended one means something
+it started holds it, or an exclusive run that is starting. No holder's name
+is ever cleared: the work inherits the lock and may outlive its run.
+
+A run's record is final before its locks close (SPEC §5). So a named run
+that is still live holds the lock it names, and a free lock's last holder is
+always already final.
 A place's refusal carries `why` and `next` apart (SPEC §6); the receipt's
 reason is `<why>; <next>`.
 

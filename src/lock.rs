@@ -85,7 +85,7 @@ pub(crate) fn acquire_as(
                     return Err(format!(
                         "waited {:?} for lock {name}, the end of the run's wait: {}",
                         started.elapsed(),
-                        crate::record::host_holder(root, named.trim())
+                        crate::record::host_holder(root, path, named.trim())
                     )
                     .into());
                 }

@@ -307,4 +307,30 @@ the same window.
 - **Next step for a lock that outlived its run:** "stop what run <id> left
   running (its processes in this seat's checkout)". 4b's survivors
   `{pid, start}` make it exact.
+- **The end order is load-bearing (SPEC §5; murail-4a's RETURN on
+  7f870775).** The supervisor had closed its locks before finalizing its
+  record, the reverse of SPEC §5. That created a window: lock free, file
+  naming A, A's reservation live, so a refusal named A while B held the
+  lock. The seat lock and host lease are now held until after
+  `record::finalize`, on every path, from the moment `prepare` returns
+  them; a failed finalize leaves them to close when the supervisor exits,
+  and the run reconciles to lost. With that order:
+  - a named run whose reservation is live (after reconcile) holds the
+    lock;
+  - a named run that is final means a leftover of it holds the lock, or a
+    run that is starting;
+  - the named run is reconciled first (critic L3), so a killed supervisor's
+    run is lost before it is named.
+
+  Controls: `a_run_holds_its_seat_until_its_record_is_final`,
+  `an_exclusive_run_holds_the_host_until_its_record_is_final` (both with a
+  FERRY_FAIL_AT=pre-finalize pause), and
+  `a_dead_exclusive_run_is_reconciled_before_it_is_named` (macOS).
+  `a_failed_reconcile_leaves_the_receipt_submitted_until_the_next_reader`
+  now also shows the seat taking the next run once the supervisor whose
+  finalize failed has exited.
+- **Shared probe (critic L4).** If `try_lock_shared` on the waited lock
+  succeeds, only shared runs hold it: "held by shared runs", alone.
+  Otherwise the named exclusive run, live or ended, as above. Control:
+  `a_host_held_by_shared_runs_says_so_alone`.
 

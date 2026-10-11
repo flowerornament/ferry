@@ -263,6 +263,10 @@ pub fn reconcile_seat(root: &Path, seat: &str) {
 /// named run may have left something holding it. When both are possible,
 /// both are named.
 pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
+    // A named run whose supervisor died is lost before it is named.
+    if !named.is_empty() {
+        let _ = reconcile(root, named);
+    }
     let live: Vec<Reservation> = fs::read_dir(records(root))
         .into_iter()
         .flatten()
@@ -304,23 +308,38 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     }
 }
 
-/// Who holds the host lease, by state as for the seat (`busy`): an
-/// exclusive run writes its id on acquisition and never clears it, and
-/// shared runs write nothing.
-pub fn host_holder(root: &Path, named: &str) -> String {
-    if named.is_empty() {
+/// Who holds a host lock that a wait gave up on, by what the protocol
+/// proves (SPEC §5: a run's record is final before its locks close). A
+/// shared probe that succeeds proves only shared runs hold it. Otherwise
+/// the named exclusive run, reconciled first: live, it holds the lock;
+/// ended, something it started holds it, or an exclusive run that has not
+/// yet written its id.
+pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
+    let shared_only =
+        fs::File::open(lock).is_ok_and(|probe| fs2::FileExt::try_lock_shared(&probe).is_ok());
+    if shared_only {
         return "held by shared runs".into();
     }
-    if let Ok(bytes) = fs::read(final_path(root, named)) {
-        let outcome = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|record| record["outcome"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| "unknown".into());
-        return format!(
-            "held after exclusive run {named} ended ({outcome}) by something it started, or by shared runs"
-        );
+    if named.is_empty() {
+        return "held exclusively, by a run that is starting or a process outside Ferry".into();
     }
-    format!("held by exclusive run {named}; ferry follow {named} or ferry stop {named}")
+    match reconcile(root, named) {
+        Ok(Some(bytes)) => {
+            let outcome = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|record| record["outcome"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".into());
+            format!(
+                "held after exclusive run {named} ended ({outcome}) by something it started, or by an exclusive run that is starting"
+            )
+        }
+        Ok(None) if reserved_path(root, named).exists() => {
+            format!("held by exclusive run {named}; ferry follow {named} or ferry stop {named}")
+        }
+        _ => format!(
+            "held exclusively; its lock file names run {named}, which this place does not know"
+        ),
+    }
 }
 
 #[cfg(test)]

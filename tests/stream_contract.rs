@@ -1302,8 +1302,8 @@ fn runs_refused_together_behind_a_leaver_each_name_the_ended_run() {
 }
 
 /// An exclusive run's leftover holds the host (critic L2): the holder's
-/// name is never cleared, so a waiter on another seat refuses naming the
-/// ended exclusive run, not "shared runs".
+/// name is never cleared, and the shared probe fails, so a waiter on
+/// another seat refuses naming the ended exclusive run, not "shared runs".
 #[cfg(target_os = "macos")]
 #[test]
 fn a_host_held_after_an_exclusive_run_names_that_run() {
@@ -1332,9 +1332,229 @@ fn a_host_held_after_an_exclusive_run_names_that_run() {
     let reason = record["reason"].as_str().unwrap();
     assert!(
         reason.contains(&format!(
-            "held after exclusive run {} ended (ran-pass) by something it started, or by shared runs",
+            "held after exclusive run {} ended (ran-pass) by something it started, or by an exclusive run that is starting",
             first["id"].as_str().unwrap()
         )),
+        "{reason}"
+    );
+}
+
+/// The run in `runs` paused at `point` (its `<at>.paused` marker), as its
+/// id and the marker's path.
+fn paused_at(runs: &Path, at: &str) -> (String, PathBuf) {
+    let mut found = None;
+    wait_until(&format!("a run paused at {at}"), || {
+        found = fs::read_dir(runs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find_map(|e| {
+                let marker = e.path().join(format!("{at}.paused"));
+                marker
+                    .exists()
+                    .then(|| (e.file_name().to_string_lossy().into_owned(), marker))
+            });
+        found.is_some()
+    });
+    found.unwrap()
+}
+
+/// A run's record is final before its locks close (SPEC §5), so a named
+/// run that is still live holds its seat (murail-4a's reproduction,
+/// 2324dd77): paused just before finalizing, it still holds it.
+#[test]
+fn a_run_holds_its_seat_until_its_record_is_final() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let mut first = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "pre-finalize")
+            .args(["run", "probe", "--local", "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the first run ended", || {
+        first.0.try_wait().unwrap().is_some()
+    });
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("seat busy: run {id}, submitted")),
+        "{reason}"
+    );
+}
+
+/// The same for the host (murail-4a's 75fafcb6): an exclusive run paused
+/// before finalizing still holds the host, and a shared waiter names it.
+#[test]
+fn an_exclusive_run_holds_the_host_until_its_record_is_final() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let mut first = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "pre-finalize")
+            .args(["run", "probe", "--local", "--json", "--exclusive"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let out = bounded_output(ferry(dir.path()).args([
+        "run",
+        "probe",
+        "--local",
+        "--json",
+        "--seat",
+        "other",
+        "--wait-seconds",
+        "2",
+    ]));
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the first run ended", || {
+        first.0.try_wait().unwrap().is_some()
+    });
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("held by exclusive run {id};")),
+        "{reason}"
+    );
+}
+
+/// A dead exclusive run is reconciled before it is named (critic L3): its
+/// finalize failed, its supervisor is gone, and a leaver it started holds
+/// the host. A waiter names it ended (lost), not live.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dead_exclusive_run_is_reconciled_before_it_is_named() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaver.pid");
+    let dir = fixture(&leaving(&pidfile), "");
+    let _leaver = Owned(pidfile);
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "finalize-link")
+        .env("FERRY_UNREACHABLE_MS", "2000")
+        .args([
+            "run",
+            "probe",
+            "--local",
+            "--json",
+            "--exclusive",
+            "--seat",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let reserved = dir
+        .path()
+        .join(format!(".ferry/local/records/{id}.reserved.json"));
+    let reservation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&reserved).unwrap()).unwrap();
+    let supervisor =
+        Pid::from_raw(i32::try_from(reservation["supervisor"]["pid"].as_i64().unwrap()).unwrap());
+    wait_until("its supervisor exited", || kill(supervisor, None).is_err());
+    let out = bounded_output(ferry(dir.path()).args([
+        "run",
+        "probe",
+        "--local",
+        "--json",
+        "--seat",
+        "other",
+        "--wait-seconds",
+        "3",
+    ]));
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("held after exclusive run {id} ended (lost)")),
+        "{reason}"
+    );
+}
+
+/// After a normal exclusive run, shared runs holding the host are proven
+/// by a shared probe and named alone (critic L4), not as "after exclusive
+/// run X ended".
+#[test]
+fn a_host_held_by_shared_runs_says_so_alone() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (started, release) = (
+        scratch.path().join("started"),
+        scratch.path().join("release"),
+    );
+    let dir = fixture(
+        &format!(
+            "touch {}; while [ ! -e {} ]; do sleep 0.1; done",
+            started.display(),
+            release.display()
+        ),
+        "",
+    );
+    // A normal exclusive run first; it ends, leaving its name in the files.
+    let out = ferry(dir.path())
+        .args([
+            "run",
+            "pass",
+            "--local",
+            "--json",
+            "--exclusive",
+            "--seat",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(receipt(&out)["outcome"], "ran-pass");
+    let shared = Caller(
+        ferry(dir.path())
+            .args([
+                "run",
+                "probe",
+                "--local",
+                "--seat",
+                "s",
+                "--timeout-seconds",
+                "60",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("the shared run started", || started.exists());
+    let out = bounded_output(ferry(dir.path()).args([
+        "run",
+        "pass",
+        "--local",
+        "--json",
+        "--exclusive",
+        "--seat",
+        "e",
+        "--wait-seconds",
+        "3",
+    ]));
+    fs::write(&release, "").unwrap();
+    drop(shared);
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.ends_with(": held by shared runs") && !reason.contains("exclusive run"),
         "{reason}"
     );
 }
@@ -1407,8 +1627,12 @@ fn the_lock_waits_together_end_by_one_bound() {
     });
     assert_eq!(code.flatten(), Some(125), "{record}");
     assert_eq!(record["outcome"], "refused", "{record}");
+    // The test holds the locks itself, writing no run id.
     assert!(
-        record["reason"].as_str().unwrap().contains("held by"),
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("held exclusively, by a run that is starting or a process outside Ferry"),
         "{record}"
     );
 }
@@ -1921,6 +2145,13 @@ fn a_failed_reconcile_leaves_the_receipt_submitted_until_the_next_reader() {
     let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(record["state"], "final", "{record}");
     assert_eq!(record["outcome"], "lost", "{record}");
+    // The locks held through the failed finalize closed when its supervisor
+    // exited: the seat takes the next run.
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
 }
 
 #[test]
