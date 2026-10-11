@@ -264,3 +264,11 @@ working tree.
 12. **Fault injection** (`FERRY_FAIL_AT`, debug builds) at every fallible
     point keeps 1–3.
 13. **The cells:** Darwin and Linux Nix checks, bench, a Mac place.
+14. **Seat count:** `ferry seats prune` retires a seat only when its
+    workspace is provably gone (`NotFound`, a listable parent on the
+    recorded device). An unreadable or unmounted workspace is kept and
+    reported. It never touches another caller's seat, and skips a busy one.
+15. **Seat size:** over `seat_cap_bytes`, a run starts cold with `pruned`
+    recorded. Nothing outside `slots/<key>` and `caches/<key>` is ever
+    measured or deleted: not through a symbolic link, not through an
+    unvalidated preserve path.
