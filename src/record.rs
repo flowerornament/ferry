@@ -312,7 +312,7 @@ mod tests {
             .unwrap()
             .unwrap();
         // The caller reads it as any host result, bound to the request.
-        let result: crate::transport::HostResult = serde_json::from_slice(&bytes).unwrap();
+        let result: crate::place::HostResult = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(result.outcome, crate::receipt::Outcome::Lost);
         assert_eq!(
             (result.token.as_str(), result.binary_sha256.as_str()),

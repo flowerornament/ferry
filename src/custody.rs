@@ -106,7 +106,7 @@ struct Idle<'a> {
 }
 
 /// Makes this process the reaper of its orphaned descendants (Linux). Only
-/// a freshly spawned `ferry host-run` supervises: it has no children of its
+/// a freshly spawned `ferry place supervise` does: it has no children of its
 /// own yet, so everything the census later finds is the run's.
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn supervise() -> Result<()> {

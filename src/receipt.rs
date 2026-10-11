@@ -10,7 +10,14 @@ use std::{
 pub const PROTOCOL: u32 = 1;
 /// What this Ferry can do, as a project contract may require it under
 /// `[provider] requires`. Documented in README; only ever extended.
-pub const CAPABILITIES: &[&str] = &["args", "refusal-event", "custody", "lease", "admission"];
+pub const CAPABILITIES: &[&str] = &[
+    "args",
+    "refusal-event",
+    "custody",
+    "lease",
+    "admission",
+    "detach",
+];
 
 /// Refuses requirements this binary does not provide.
 pub fn provides(
@@ -56,6 +63,8 @@ pub enum Outcome {
     Refused,
     Lost,
     Timeout,
+    /// Stopped by `ferry stop` or a signal before its result: 128 + n.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -116,14 +125,18 @@ pub struct Receipt {
     /// The provider capabilities the project required.
     #[serde(default)]
     pub provider_requires: Vec<String>,
-    /// Output lines that could not be delivered, by where they were lost:
-    /// `stdout`/`stderr` (this caller's), `host` (the host's stream).
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub output_dropped: std::collections::BTreeMap<String, u64>,
-    /// Output lines this caller wrote, by stream; with `output_dropped`,
-    /// every relayed line is accounted for.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub output_delivered: std::collections::BTreeMap<String, u64>,
+    /// What reached the place's output log (`bytes`, `capped`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<crate::execution::Output>,
+    /// When the run had to end by (ms since the epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u128>,
+    /// Who stopped the run and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<serde_json::Value>,
+    /// Binds the place's record to this receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     /// `submitted` while the run is under way (every caller fact, no
     /// verdict yet), then `final`. Absent on older receipts: final.
     #[serde(default)]
@@ -136,56 +149,6 @@ pub fn now_ms() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Standard base64 with padding, for output bytes that are not UTF-8.
-pub fn base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
-            if i <= chunk.len() {
-                out.push(char::from(BASE64[((n >> shift) & 63) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// Decodes standard base64; `None` for anything malformed.
-pub fn unbase64(text: &str) -> Option<Vec<u8>> {
-    let text = text.as_bytes();
-    if !text.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    for chunk in text.chunks(4) {
-        let mut n = 0u32;
-        let mut padding = 0;
-        for &c in chunk {
-            let value = if c == b'=' {
-                padding += 1;
-                0
-            } else if padding > 0 {
-                return None;
-            } else {
-                u32::try_from(BASE64.iter().position(|&b| b == c)?).ok()?
-            };
-            n = (n << 6) | value;
-        }
-        let bytes = n.to_be_bytes();
-        out.extend_from_slice(&bytes[1..4 - padding]);
-    }
-    Some(out)
-}
-
 pub fn digest(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
@@ -221,15 +184,30 @@ pub fn run_id() -> std::io::Result<String> {
     fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
     Ok(format!("{}-{}", now_ms(), hex(&nonce)))
 }
-/// Stores a receipt, complete or not at all. A submitted receipt never
-/// replaces another; the final one replaces its submitted receipt.
+fn path(root: &Path, id: &str) -> std::path::PathBuf {
+    root.join(".ferry/receipts").join(format!("{id}.json"))
+}
+
+/// Stores a run's first receipt, complete or not at all, never over another.
+pub fn submit(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Error>> {
+    crate::record::write_new(
+        &path(root, &receipt.id),
+        &serde_json::to_vec_pretty(receipt)?,
+        None,
+    )
+}
+
+/// A stored receipt.
+pub fn load(root: &Path, id: &str) -> Result<Receipt, Box<dyn std::error::Error>> {
+    crate::config::identifier(id)?;
+    Ok(serde_json::from_slice(&fs::read(path(root, id))?)?)
+}
+
+/// Stores a receipt, complete or not at all, replacing its earlier copy.
 pub fn save(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Error>> {
     let dir = root.join(".ferry/receipts");
-    let path = dir.join(format!("{}.json", receipt.id));
+    let path = path(root, &receipt.id);
     let bytes = serde_json::to_vec_pretty(receipt)?;
-    if receipt.state.as_deref() == Some("submitted") {
-        return crate::record::write_new(&path, &bytes, None);
-    }
     fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!(".{}.json.tmp", receipt.id));
     fs::write(&tmp, bytes)?;
@@ -239,18 +217,16 @@ pub fn save(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Adds a note to a reason, keeping what was already there.
+pub fn note(reason: &mut Option<String>, text: String) {
+    *reason = Some(match reason.take() {
+        Some(previous) => format!("{previous}; {text}"),
+        None => text,
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn base64_round_trips_every_length() {
-        for len in 0..10 {
-            let bytes: Vec<u8> = (0..len).map(|i| 0xff - i).collect();
-            assert_eq!(super::unbase64(&super::base64(&bytes)), Some(bytes));
-        }
-        assert_eq!(super::base64(b"foob"), "Zm9vYg==");
-        assert_eq!(super::unbase64("Zm9v!g=="), None);
-    }
-
     use super::*;
     #[test]
     fn recipe_125_is_still_a_recipe_failure() {

@@ -8,30 +8,36 @@ pub const SESSION_CLEANUP: Duration = Duration::from_secs(5);
 /// The collect hook's own bound.
 pub const COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long one of the host's own events may wait for room in the output
-/// channel before it is dropped and counted.
-pub const EVENT_BOUND: Duration = Duration::from_secs(5);
-
-/// How long host-run waits for its final events to reach the client.
-pub const FINAL_EMIT: Duration = Duration::from_secs(5);
-
 /// How long stopped survivors get between TERM and KILL.
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// How long survivors sent SIGKILL get to be reaped before the final census.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// How long delivery after the run may see no progress before giving up.
-pub const STALL: Duration = Duration::from_secs(15);
-
-/// The most delivery after the run may take, however bytes move.
-pub const CAP: Duration = Duration::from_secs(60);
-
-/// The most bytes waiting in the queue.
-pub const MAX_QUEUE: usize = 8 << 20;
-
-/// The longest line relayed as one: longer lines are split.
-pub const MAX_LINE: usize = 1 << 20;
-
-/// How long readers get to drain what was readable when delivery ended.
+/// How long a session's output writer gets after the session stop.
 pub const DRAIN: Duration = Duration::from_secs(2);
+
+/// The most a run's output log holds; later output is read and dropped.
+pub const OUTPUT_CAP: u64 = 1 << 30;
+
+/// The default bound on each lock wait (a request may name its own).
+pub const WAIT: Duration = Duration::from_mins(30);
+
+/// The timeout of a request that names none, and the most one may name.
+/// Transitional until consumers declare timeouts (ferry-8kk.2).
+pub const MAX_TIMEOUT: Duration = Duration::from_hours(6);
+
+/// Everything after the recipe: its teardown, the collect hook and its
+/// teardown, survivors' stop, the output drains, and a margin. Part of the
+/// absolute deadline.
+pub const TEARDOWN: Duration = Duration::from_secs(
+    SESSION_CLEANUP.as_secs() * 2
+        + COLLECT_TIMEOUT.as_secs()
+        + STOP_GRACE.as_secs()
+        + KILL_GRACE.as_secs()
+        + DRAIN.as_secs() * 2
+        + 10,
+);
+
+/// How long a caller keeps trying a place that does not answer.
+pub const UNREACHABLE: Duration = Duration::from_mins(5);
