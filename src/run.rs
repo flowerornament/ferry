@@ -315,7 +315,7 @@ pub fn verdict(
 /// runs one request, so they are kept here and taken once.
 static NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-fn note_after(note: String) {
+pub(crate) fn note_after(note: String) {
     if let Ok(mut notes) = NOTES.lock() {
         notes.push(note);
     }

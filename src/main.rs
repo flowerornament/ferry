@@ -11,6 +11,7 @@ mod receipt;
 mod record;
 mod repository;
 mod run;
+mod seats;
 mod transport;
 
 use clap::{Args, Parser, Subcommand};
@@ -38,6 +39,11 @@ enum Action {
     Machines,
     Receipt {
         id: String,
+    },
+    /// This caller's seats on its places.
+    Seats {
+        #[command(subcommand)]
+        command: SeatsAction,
     },
     /// Follow a run's output from any terminal until it ends.
     Follow {
@@ -80,6 +86,14 @@ enum Action {
     },
 }
 #[derive(Subcommand)]
+enum SeatsAction {
+    /// Retire this caller's seats whose workspace is gone (SPEC §9).
+    Prune {
+        #[arg(long)]
+        on: Option<String>,
+    },
+}
+#[derive(Subcommand)]
 enum PlaceVerb {
     Submit,
     Supervise {
@@ -104,6 +118,9 @@ enum PlaceVerb {
     },
     Record {
         id: String,
+    },
+    Retire {
+        key: String,
     },
 }
 #[derive(Args)]
@@ -399,6 +416,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         custody: None,
         lease: None,
         admission: None,
+        pruned: None,
         provider_requires: vec![],
         output: None,
         deadline_ms: None,
@@ -411,6 +429,9 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Action::Run(options) => run(&options),
+        Action::Seats {
+            command: SeatsAction::Prune { on },
+        } => seats::prune(on.as_deref(), &machines()?),
         Action::Machines => {
             println!("{}", serde_json::to_string_pretty(&machines()?.host)?);
             Ok(0)
@@ -462,6 +483,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     signal,
                 } => place::stop(&root, &id, &seat, &who, &why, other, signal),
                 PlaceVerb::Record { id } => place::print_record(&root, &id),
+                PlaceVerb::Retire { key } => place::retire(&root, &key),
             }
         }
         Action::HostInfo => {

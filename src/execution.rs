@@ -230,6 +230,23 @@ pub fn prepare(
     )?);
     // Measured after any wait for the lease, under this seat's lock.
     crate::admission::admit(root, admission.get_or_insert_with(Default::default))?;
+    // The per-seat cap, under this run's seat lock, before the checkout: a
+    // failure to wipe is a note, and the run goes on with what is there.
+    let admitted = admission.get_or_insert_with(Default::default);
+    if let Some(cap) = admitted.seat_cap_bytes {
+        match crate::admission::cap(root, &request.seat, &request.preserve, cap) {
+            Ok(wiped) => {
+                if let Some(wiped) = &wiped {
+                    crate::run::note_after(format!(
+                        "seat over its cap ({} bytes > {}): wiped, the run started cold",
+                        wiped.bytes, wiped.cap
+                    ));
+                }
+                admitted.pruned = wiped;
+            }
+            Err(error) => crate::run::note_after(format!("seat cap: {error}")),
+        }
+    }
     let bare = root.join("repo.git");
     repository::output(Command::new("git").arg("--git-dir").arg(&bare).args([
         "cat-file",

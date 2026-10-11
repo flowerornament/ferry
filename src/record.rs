@@ -264,6 +264,9 @@ pub fn reconcile_seat(root: &Path, seat: &str) {
 /// both are named.
 pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     // A named run whose supervisor died is lost before it is named.
+    if named == crate::place::RETIRING {
+        return "seat busy: it is being retired (its workspace is gone); try again".into();
+    }
     if !named.is_empty() {
         let _ = reconcile(root, named);
     }

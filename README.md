@@ -79,6 +79,8 @@ ferry record <id>                   the receipt, completed once the run is final
 ferry recipes                       the recipes at this commit
 ferry machines                      the configured machines
 ferry receipt <id>                  print a receipt
+ferry seats prune [--on <machine>]  retire this caller's seats whose workspace
+                                    is gone (SPEC §9)
 ```
 
 `ferry place`, `host-info` and `execute-session` are internal: the caller
@@ -247,17 +249,44 @@ before checkout and hooks.
 # Version 1: a guard. Below the floor, refuse (125).
 version = 1
 min_free_bytes = 42949672960
+# Optional: a seat whose preserve paths and cache exceed this starts cold.
+seat_cap_bytes = 21474836480
 ```
 
 - **No file:** the run proceeds, and the receipt records `not-configured`.
 - **A malformed policy refuses** before anything is measured: an unknown
   version or key. Version 2 (eviction of idle seats' targets) is retired with
-  the idle records it read. Slice 5 bounds seats instead, with `ferry seats
-  prune` and a per-seat cap (SPEC §9).
+  the idle records it read; seats are bounded instead, below.
 
 The receipt's `admission` records the policy read, the floor, the filesystem,
 the bytes available, and the result. Availability can change for reasons
 outside Ferry, so it is an observation.
+
+### Seat bounds (SPEC §9)
+
+Seats are bounded in count and in size; neither touches source, logs,
+receipts or records.
+
+- **Count.** Each accepted run appends one line to the caller's seat book,
+  `~/.local/state/ferry/seats.jsonl` (`{key, place, repo_path, seat,
+  last_used_ms}`; one `O_APPEND` write, never rewritten). A failed append is
+  retried when the run completes, and a failure then is a note. `ferry seats
+  prune [--on <machine>]` retires each recorded seat whose `repo_path` no
+  longer exists: the place's `retire` verb tries the seat's lock once and,
+  if it is free, deletes the seat's checkout and cache, records
+  `records/retired-<key>.json`, and keeps the lock file. A held seat is
+  skipped (busy). A run refused meanwhile is told the seat "is being
+  retired". Prune prints one line per seat and appends a tombstone for each
+  one retired; a later run on the same workspace revives it. Exit 0 when
+  every candidate was retired or busy, 125 if a place refused otherwise
+  (including a place without the `retire` capability, named by revision),
+  255 if a place was unreachable. Prune only ever names this caller's seats.
+- **Size.** With `seat_cap_bytes` set, a run measures its seat's preserve
+  paths and cache under its seat lock, before the checkout, when the last
+  measurement is over an hour old. Over the cap, they are wiped and the run
+  starts cold: the receipt's `pruned` is `{bytes, cap}` and `reason` says so.
+  The cap can be exceeded by at most an hour of runs' growth. A failed wipe is
+  a note, and the run goes on with what is there.
 
 ## Hooks and environment
 

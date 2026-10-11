@@ -50,6 +50,10 @@ pub struct HostResult {
     /// As the place wrote it, for the same reason as `custody`.
     #[serde(default)]
     pub admission: Option<serde_json::Value>,
+    /// What the per-seat cap wiped at this run's start (SPEC §9), as the
+    /// place wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned: Option<serde_json::Value>,
     /// What reached `output.log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<crate::run::Output>,
@@ -82,6 +86,7 @@ impl HostResult {
             custody: None,
             lease: None,
             admission: None,
+            pruned: None,
             output: None,
             deadline_ms: None,
             stopped_by: None,
@@ -259,6 +264,16 @@ fn existing(root: &Path, request: &Request) -> Option<u32> {
 }
 
 /// Runs a submitted request to its final record, detached from any client.
+/// Records admission and what the cap pruned as JSON, as the place writes
+/// them (an older shape must always parse: 4b's review R3).
+fn record_admission(result: &mut HostResult, admission: Option<crate::admission::Admission>) {
+    let mut admission = admission;
+    result.pruned = admission
+        .as_mut()
+        .and_then(|a| serde_json::to_value(a.pruned.take()?).ok());
+    result.admission = admission.and_then(|admission| serde_json::to_value(admission).ok());
+}
+
 pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     // Its own session, no terminal: nothing the client's session does
     // reaches it.
@@ -332,7 +347,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         }),
     )
     .unwrap_or_else(|_| Err("supervisor panicked".into()));
-    result.admission = admission.and_then(|admission| serde_json::to_value(admission).ok());
+    record_admission(&mut result, admission);
     // One verdict, from the first terminal fact (Rule B). A stop's signal is
     // the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
@@ -551,6 +566,69 @@ fn first_stop_signal(dir: &Path) -> Option<i32> {
     stop["signal"]
         .as_i64()
         .and_then(|signal| i32::try_from(signal).ok())
+}
+
+/// The name a retire writes into a seat's lock file while it holds it, so a
+/// run refused then is told the seat is being retired.
+pub const RETIRING: &str = "retiring";
+
+/// Retires a seat whose caller's workspace is gone (SPEC §6, §9): tries its
+/// lock once; held → refused, naming the holder; free → deletes its slot and
+/// cache under the lock and records `records/retired-<key>.json`. The lock
+/// file itself is never removed: unlinking a held flock file would let a new
+/// run lock a fresh file of the same name beside it.
+pub fn retire(root: &Path, key: &str) -> Result<i32> {
+    crate::config::identifier(key)?;
+    let lock = root.join("locks").join(key);
+    if !lock.exists() {
+        return Ok(refuse(
+            &format!("no seat {key} on this place"),
+            "nothing to retire",
+        ));
+    }
+    let Some(_held) = crate::lock::try_seat(&lock, RETIRING)? else {
+        let named = fs::read_to_string(&lock).unwrap_or_default();
+        let why = record::busy(root, key, RETIRING, named.trim());
+        return Ok(refuse(&why, "prune again later"));
+    };
+    execution::pause_at("retire-pause", &lock);
+    let paths = [root.join("slots").join(key), root.join("caches").join(key)];
+    let bytes: u64 = paths.iter().map(|path| crate::admission::size(path)).sum();
+    for path in &paths {
+        if execution::fail_at("retire-delete") {
+            return Ok(refuse(
+                "retire-delete: injected by FERRY_FAIL_AT",
+                "prune again",
+            ));
+        }
+        match fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Ok(refuse(
+                    &format!("deleting {}: {e}", path.display()),
+                    "prune again",
+                ));
+            }
+        }
+    }
+    let retired = serde_json::json!({"key": key, "bytes": bytes, "retired_ms": receipt::now_ms()});
+    let path = root.join("records").join(format!("retired-{key}.json"));
+    let written = if execution::fail_at("retire-record") {
+        Err("retire-record: injected by FERRY_FAIL_AT".into())
+    } else {
+        record::write_new(&path, retired.to_string().as_bytes(), None)
+    };
+    if let Err(error) = written
+        && !path.exists()
+    {
+        return Ok(refuse(
+            &format!("recording the retire: {error}"),
+            "prune again",
+        ));
+    }
+    reply(&serde_json::json!({"retired": key, "bytes": bytes}));
+    Ok(0)
 }
 
 /// Prints the run's final record (exit 0), or its reservation while it is

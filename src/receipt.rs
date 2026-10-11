@@ -17,6 +17,7 @@ pub const CAPABILITIES: &[&str] = &[
     "lease",
     "admission",
     "detach",
+    "retire",
 ];
 
 /// Refuses requirements this binary does not provide.
@@ -125,6 +126,10 @@ pub struct Receipt {
     /// in slice 4b).
     #[serde(default)]
     pub admission: Option<serde_json::Value>,
+    /// What the per-seat cap wiped at the run's start (SPEC §9), as the
+    /// place wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned: Option<serde_json::Value>,
     /// The provider capabilities the project required.
     #[serde(default)]
     pub provider_requires: Vec<String>,

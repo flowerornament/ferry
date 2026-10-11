@@ -65,6 +65,7 @@ fn run(root: &Path, args: &[&str]) -> Output {
         .env_remove("GIT_WORK_TREE")
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
         .args(args)
         .output()
         .unwrap()
@@ -515,6 +516,7 @@ fn caller_environment_is_declared_forwarded_and_recorded() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ferry"));
         cmd.current_dir(dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
             .env("APP_ALLOWED", "selected")
             .env("APP_LOCAL", "not-forwarded")
             .args(["run", "pass", "--local", "--json"]);
@@ -585,6 +587,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .args(["run", "pass", "--local", "--json"])
         .stdout(fs::File::create(&caller_output).unwrap())
         .stderr(fs::File::create(&diagnostic).unwrap())
@@ -735,6 +738,7 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .env("HOME", dir.path())
         .env(
             "PATH",
@@ -903,6 +907,7 @@ fn interrupted_caller_kills_children_and_exits_128_plus_signal(
     let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .args(["run", "hold", "--local", "--json"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -962,6 +967,7 @@ fn a_signal_before_dispatch_still_writes_a_receipt() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .args(["run", "pass", "--local", "--json"])
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1108,6 +1114,7 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     command
         .current_dir(dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state"))
         .env("HOME", dir)
         .env(
             "PATH",
@@ -1255,6 +1262,7 @@ impl HoldRuns {
         let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
             .current_dir(dir)
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("XDG_STATE_HOME", dir.join("state"))
             .args(args)
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -1788,6 +1796,7 @@ fn a_local_failure_reading_the_final_record_leaves_the_receipt_submitted() {
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .env("FERRY_FAIL_AT", "record-read")
         .args(["run", "pass", "--local", "--json"])
         .output()
@@ -1799,6 +1808,7 @@ fn a_local_failure_reading_the_final_record_leaves_the_receipt_submitted() {
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .args(["record", id])
         .output()
         .unwrap();
@@ -1864,4 +1874,366 @@ fn an_unreachable_place_leaves_the_receipt_submitted_until_ferry_record() {
     assert_eq!(record["state"], "final", "{record}");
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     assert_eq!(record["host_binary_sha256"], "e".repeat(64), "{record}");
+}
+
+/// A second workspace of the fixture's repository, at `dir/<name>`.
+fn workspace(dir: &Path, name: &str) -> std::path::PathBuf {
+    git(dir, &["clone", "--quiet", ".", name]);
+    dir.join(name)
+}
+
+/// The caller's seat book, one JSON value per line.
+fn seats_book(dir: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(dir.join("state/ferry/seats.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The key this caller recorded for its seat in `repo`.
+fn key_of(dir: &Path, repo: &Path) -> String {
+    let repo = repo.canonicalize().unwrap().display().to_string();
+    seats_book(dir)
+        .iter()
+        .find(|line| line["repo_path"] == repo.as_str())
+        .and_then(|line| line["key"].as_str())
+        .expect("the seat was recorded")
+        .to_owned()
+}
+
+fn remote_pass(dir: &Path, repo: &Path) -> Output {
+    remote_command(
+        dir,
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .current_dir(repo)
+    .output()
+    .unwrap()
+}
+
+fn prune(dir: &Path, binary: &str) -> (Option<i32>, String) {
+    let out = remote_command(dir, binary, &["seats", "prune"])
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// `ferry seats prune` retires a seat whose workspace is gone, through the
+/// place's `retire` verb, and spares one whose workspace exists. The lock
+/// file survives; the place records the retire and the book a tombstone
+/// (SPEC §9, slice 5).
+#[test]
+fn seats_prune_retires_a_gone_workspaces_seat_and_spares_a_live_one() {
+    let dir = fixture();
+    let gone = workspace(dir.path(), "gone");
+    assert_eq!(remote_pass(dir.path(), dir.path()).status.code(), Some(0));
+    assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
+    let live = key_of(dir.path(), dir.path());
+    let retired = key_of(dir.path(), &gone);
+    assert_ne!(live, retired);
+    let place = dir.path().join("host/.local/state/ferry");
+    assert!(place.join("slots").join(&retired).exists());
+    fs::remove_dir_all(&gone).unwrap();
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("retired"), "{said}");
+    assert!(!place.join("slots").join(&retired).exists(), "{said}");
+    assert!(place.join("locks").join(&retired).exists());
+    assert!(
+        place
+            .join(format!("records/retired-{retired}.json"))
+            .exists()
+    );
+    assert!(place.join("slots").join(&live).exists());
+    assert!(
+        seats_book(dir.path())
+            .iter()
+            .any(|line| line["key"] == retired.as_str() && line["retired_ms"].is_u64())
+    );
+    // Nothing is left to do.
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.trim().is_empty(), "{said}");
+}
+
+/// Prune touches only the seats this caller recorded: another caller's book
+/// does not name them.
+#[test]
+fn seats_prune_never_names_another_callers_seat() {
+    let dir = fixture();
+    let gone = workspace(dir.path(), "gone");
+    assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
+    let key = key_of(dir.path(), &gone);
+    fs::remove_dir_all(&gone).unwrap();
+    let out = remote_command(dir.path(), ".local/bin/ferry", &["seats", "prune"])
+        .env("XDG_STATE_HOME", dir.path().join("another-caller"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+    let place = dir.path().join("host/.local/state/ferry");
+    assert!(place.join("slots").join(&key).exists());
+}
+
+/// While a retire holds a seat: a second prune skips it as busy, a run on
+/// that seat is refused naming the retire, and a run's line appended to the
+/// book meanwhile survives. After it, a run on the same workspace path
+/// revives the seat, and prune spares it (SPEC §9, slice 5).
+#[test]
+fn a_seat_being_retired_is_busy_and_the_book_keeps_concurrent_appends() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let gone = workspace(dir.path(), "gone");
+    assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
+    let key = key_of(dir.path(), &gone);
+    fs::remove_dir_all(&gone).unwrap();
+    let lock = dir.path().join("host/.local/state/ferry/locks").join(&key);
+    let first = remote_command(dir.path(), ".local/bin/ferry", &["seats", "prune"])
+        .env("FERRY_FAIL_AT", "retire-pause")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let paused = lock.with_extension("paused");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !paused.exists() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(paused.exists(), "the retire never paused");
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        said.contains("skipped") && said.contains("being retired"),
+        "{said}"
+    );
+    // The same workspace path again: the same seat.
+    let back = workspace(dir.path(), "gone");
+    let out = remote_pass(dir.path(), &back);
+    let refused = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{refused}");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("being retired"),
+        "{refused}"
+    );
+    // Appended while the prune runs.
+    assert_eq!(remote_pass(dir.path(), dir.path()).status.code(), Some(0));
+    let live = key_of(dir.path(), dir.path());
+    fs::write(lock.with_extension("go"), "").unwrap();
+    let out = first.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    assert!(said.contains("retired"), "{said}");
+    let book = seats_book(dir.path());
+    assert!(book.iter().any(|line| line["key"] == live.as_str()));
+    assert!(
+        book.iter()
+            .any(|line| line["key"] == key.as_str() && line["retired_ms"].is_u64())
+    );
+    // A run on the workspace revives the seat; prune then spares it.
+    fs::remove_file(lock.with_extension("go")).unwrap();
+    assert_eq!(remote_pass(dir.path(), &back).status.code(), Some(0));
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    assert_eq!(code, Some(0), "{said}");
+    assert!(!said.contains("retired"), "{said}");
+}
+
+/// A place without `retire` is refused, naming its revision (125), as for
+/// `detach`; nothing is deleted.
+#[test]
+fn seats_prune_refuses_a_place_without_retire_naming_its_revision() {
+    let dir = fixture();
+    let gone = workspace(dir.path(), "gone");
+    assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
+    let key = key_of(dir.path(), &gone);
+    fs::remove_dir_all(&gone).unwrap();
+    let bin = dir.path().join("host/.local/bin");
+    fs::write(
+        bin.join("old-ferry"),
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"retire\"//' -e 's/,,/,/' -e 's/,\\]/]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, said) = prune(dir.path(), ".local/bin/old-ferry");
+    assert_eq!(code, Some(125), "{said}");
+    assert!(
+        said.contains("lacks retire") && said.contains("0ld-place-rev"),
+        "{said}"
+    );
+    let place = dir.path().join("host/.local/state/ferry");
+    assert!(place.join("slots").join(&key).exists());
+}
+
+/// The release points of retire: a failed delete or record is reported and
+/// refused (125), and a later prune finishes the retire.
+#[test]
+fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    for point in ["retire-delete", "retire-record"] {
+        let dir = fixture();
+        let gone = workspace(dir.path(), "gone");
+        assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
+        let key = key_of(dir.path(), &gone);
+        fs::remove_dir_all(&gone).unwrap();
+        let out = remote_command(dir.path(), ".local/bin/ferry", &["seats", "prune"])
+            .env("FERRY_FAIL_AT", point)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(125), "{point}: {said}");
+        assert!(said.contains(point), "{said}");
+        assert!(
+            !seats_book(dir.path())
+                .iter()
+                .any(|line| line["retired_ms"].is_u64()),
+            "{point}: a failed retire left a tombstone"
+        );
+        let (code, said) = prune(dir.path(), ".local/bin/ferry");
+        assert_eq!(code, Some(0), "{point}: {said}");
+        assert!(said.contains("retired"), "{said}");
+        let place = dir.path().join("host/.local/state/ferry");
+        assert!(place.join(format!("records/retired-{key}.json")).exists());
+    }
+}
+
+/// A failed append to the seat book is a note; the run is not the book's.
+#[test]
+fn a_failed_seat_book_append_is_a_note() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_FAIL_AT", "seats-append")
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("seat book"),
+        "{record}"
+    );
+    assert_eq!(seats_book(dir.path()), Vec::<serde_json::Value>::new());
+}
+
+/// A seat over `seat_cap_bytes` starts cold: its preserve paths and cache
+/// are wiped before the checkout, the record says `pruned`, and tracked
+/// source is reset as always. It is measured at most once an hour, so the
+/// stamp is removed to force the measurement (SPEC §9, slice 5).
+#[test]
+fn a_seat_over_its_cap_starts_cold_with_pruned() {
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "big/\nconfig/\nstate/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['big']\n[recipe.pass]\ncommand=['sh','-c','if test -f big/blob; then echo warm; else echo cold; mkdir -p big; head -c 4096 /dev/zero > big/blob; fi']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "a preserved path that grows"]);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
+    );
+    let first = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(String::from_utf8_lossy(&first.stderr).contains("cold"));
+    // Measured within the hour: not again, so the seat runs warm.
+    let second = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(String::from_utf8_lossy(&second.stderr).contains("warm"));
+    assert!(receipt(&second)["pruned"].is_null());
+    let caches = dir.path().join(".ferry/local/caches");
+    for entry in fs::read_dir(&caches).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".measured-")
+        {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let third = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let record = receipt(&third);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(String::from_utf8_lossy(&third.stderr).contains("cold"));
+    assert_eq!(record["pruned"]["cap"], 1000, "{record}");
+    assert!(
+        record["pruned"]["bytes"].as_u64().unwrap() >= 4096,
+        "{record}"
+    );
+    assert!(
+        record["reason"].as_str().unwrap().contains("started cold"),
+        "{record}"
+    );
+    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(
+        slot.join("ferry.toml").exists(),
+        "tracked source was touched"
+    );
+}
+
+/// A failed wipe is a note, and the run goes on with what is there.
+#[test]
+fn a_failed_cap_wipe_is_a_note_and_the_run_goes_on() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "big/\nconfig/\nstate/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['big']\n[recipe.pass]\ncommand=['sh','-c','if test -f big/blob; then echo warm; else echo cold; mkdir -p big; head -c 4096 /dev/zero > big/blob; fi']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "a preserved path that grows"]);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
+    );
+    run(dir.path(), &["run", "pass", "--local", "--json"]);
+    for entry in fs::read_dir(dir.path().join(".ferry/local/caches")).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".measured-")
+        {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env("FERRY_FAIL_AT", "cap-wipe")
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warm"));
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("seat cap: cap-wipe"),
+        "{record}"
+    );
 }

@@ -50,7 +50,8 @@ pub fn ferry(dir: &Path) -> Command {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("FERRY_ID")
-        .env("XDG_CONFIG_HOME", dir.join("config"));
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state"));
     command
 }
 

@@ -491,6 +491,10 @@ pub fn run_on(
         return Ok(());
     }
     record.deadline_ms = reply["deadline_ms"].as_u64().map(u128::from);
+    // The seat book (SPEC §9): a failure is a note, never the run's.
+    if let Err(error) = crate::seats::record(&request.seat, &record.machine, root, &record.seat) {
+        note(&mut record.reason, format!("seat book: {error}"));
+    }
     if json {
         execution::emit(
             serde_json::json!({"protocol": receipt::PROTOCOL, "event": "submitted", "id": request.id, "pid": reply["pid"]})
@@ -701,6 +705,25 @@ fn is_final(place: &Place, record: &Receipt) -> Result<bool> {
         .success())
 }
 
+/// Asks a place to retire one of this caller's seats (SPEC §6). A place
+/// without `retire` is refused, naming its revision, as for `detach`.
+pub fn retire(place: &Place, key: &str) -> Result<serde_json::Value> {
+    let info = place.info()?;
+    if !info.capabilities.iter().any(|c| c == "retire") {
+        return Ok(serde_json::json!({
+            "refused": "retire",
+            "why": format!(
+                "the place runs ferry {}, which lacks retire",
+                info.source_rev.as_deref().unwrap_or("of unknown revision")
+            ),
+            "next": format!("install this caller's ferry ({}) there", receipt::source_rev()),
+        }));
+    }
+    let out = place.verb(&["retire", key])?.output()?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|_| format!("retire gave no reply ({})", out.status).into())
+}
+
 /// The key that identifies this caller's seat on a place: the caller's host,
 /// the repository and the seat name.
 pub fn seat_key(root: &Path, seat: &str) -> Result<String> {
@@ -778,9 +801,17 @@ pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> 
     record.custody = result.custody;
     record.lease = result.lease;
     record.admission = result.admission;
+    record.pruned = result.pruned;
     record.output = result.output;
     record.deadline_ms = result.deadline_ms;
     record.stopped_by = result.stopped_by;
+    // The seat book (SPEC §9): recorded at acceptance; a failure then is
+    // retried here, and a failure now is a note on the final receipt.
+    if let Err(error) = seat_key(root, &record.seat)
+        .and_then(|key| crate::seats::ensure(&key, &record.machine, root, &record.seat))
+    {
+        note(&mut record.reason, format!("seat book: {error}"));
+    }
     if let Some(error) = result.artifacts_error {
         note(
             &mut record.reason,

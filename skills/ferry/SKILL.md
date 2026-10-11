@@ -85,6 +85,7 @@ ferry stop <id>                        # stop your run (another's: --other --rea
 - `custody`: what the run left behind and what was stopped;
 - `lease`: shared or exclusive, and how long it waited;
 - `admission`: host disk policy;
+- `pruned`: `{bytes, cap}` when the seat was over its cap and started cold;
 - `output`: `{bytes, capped}` (past 1 GiB the rest is dropped);
 - `deadline_ms`, and `stopped_by` for a stopped run.
 
@@ -113,10 +114,14 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
   operator; do not work around it.
 - **Disk floor (admission):** the machine is below its operator's free-space
   floor. Tell the operator.
+- **Seat being retired:** `ferry seats prune` is retiring that seat (its
+  workspace was gone). Run again in a moment; the seat starts cold.
 - **What a run left behind:** the receipt's `custody.survivors` lists the
   run's session members still alive after the stop (pid and start). Stop them
   by exact pid, never by pattern. There is no `ferry seat recover`: a busy
   seat clears when what holds its lock exits.
+- **Stale seats:** `ferry seats prune` retires your seats whose workspace is
+  gone; it skips busy ones and only names seats you recorded.
 
 ## Waiting lines
 

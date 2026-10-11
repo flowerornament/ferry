@@ -451,6 +451,7 @@ fn a_closed_caller_pipe_is_data_and_the_run_reaches_its_own_end() {
         .env_remove("GIT_DIR")
         .env_remove("FERRY_ID")
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .arg("-c")
         .arg(format!(
             "{} run probe --local | head -1",
@@ -2664,6 +2665,7 @@ while True:
         .current_dir(dir)
         .env_remove("FERRY_ID")
         .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state"))
         .arg("-c")
         .arg(harness)
         .arg(if interrupt { "interrupt" } else { "wait" })

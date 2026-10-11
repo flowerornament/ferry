@@ -169,3 +169,47 @@ There is no daemon, no second lock protocol, and no cross-seat eviction.
 - Also approved: `O_APPEND` and tombstones, never rewriting; prune touching
   only recorded keys; the busy refusal naming the run via `record::busy`.
 
+
+## 10. As built (2026-10-11, on main 6cd551fa after 4b)
+
+- **Seat book** (`src/seats.rs`): as §2. The caller appends after the place
+  accepts the run. A failed append is retried when the run completes, if
+  the book does not already hold the seat live; a failure then is a
+  `seat book:` note on the final receipt. (An append that failed at
+  acceptance was otherwise lost: the final record's `reason` replaces the
+  submitted receipt's.)
+- **`retire <key>`** (`place::retire`): as §3. It tries the lock once and
+  writes its own name, `retiring`, into the lock file while it holds it, so
+  a run refused meanwhile is told "seat busy: it is being retired (its
+  workspace is gone); try again", and a second prune skips it as busy. The
+  lock file is never removed (Q2). Deviation: `retired-<key>.json` is
+  `{key, bytes, retired_ms}`, without §3's `by`: the place does not know
+  its caller's name, and `retire` takes only a key (Q4).
+- **The cap** (`admission::cap`, called in `prepare` after admission): as
+  §4, measured at most once an hour (Q3). Deviation: the stamp is
+  `caches/.measured-<key>`, beside the seat's cache rather than in it,
+  because the wipe deletes `caches/<key>` and would take the stamp with it.
+- **Records:** `pruned` is kept in the place record and the receipt as the
+  JSON the place wrote, like `custody` and `admission` after 4b's R3, so a
+  later shape change can never break an older record.
+- **Fallible points:** `seats-append`, `retire-delete`, `retire-record` and
+  `cap-wipe`, each with an injection test, and the `retire-pause` debug
+  point for the busy and concurrency controls.
+- **Controls** (`run_contract`):
+  - `seats_prune_retires_a_gone_workspaces_seat_and_spares_a_live_one`
+    (the lock file survives; place record and tombstone; a second prune is
+    a no-op);
+  - `seats_prune_never_names_another_callers_seat`;
+  - `a_seat_being_retired_is_busy_and_the_book_keeps_concurrent_appends`
+    (a second prune skips it as busy; a run on the seat is refused "being
+    retired"; a run's line appended meanwhile survives; the same workspace
+    path later revives the seat, and prune spares it);
+  - `seats_prune_refuses_a_place_without_retire_naming_its_revision`;
+  - `a_failed_retire_is_reported_and_a_later_prune_finishes_it`
+    (`retire-delete`, `retire-record`);
+  - `a_failed_seat_book_append_is_a_note`;
+  - `a_seat_over_its_cap_starts_cold_with_pruned` (not measured again
+    within the hour; source untouched);
+  - `a_failed_cap_wipe_is_a_note_and_the_run_goes_on`.
+- **SPEC §12** gains these controls with this slice (§7); the coordinator
+  amends SPEC.
