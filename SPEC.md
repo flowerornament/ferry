@@ -116,7 +116,11 @@ depends on the client being present.
 | `record` | `id` | the final or reserved record |
 
 - **Capabilities:** a new caller uses this protocol only if the place
-  advertises `detach`. Otherwise it uses the legacy `host-run` shim.
+  advertises `detach`. Otherwise it refuses with 125, naming the place's
+  `source_rev` and the next step (install the M1 build on that place).
+  There is no legacy `host-run` shim: a caller is never installed before
+  its places, and both move in one announced window (decided 2026-10-10
+  on ferry-ljc.3; it supersedes the shim in ferry-minimal §7).
 - **Version skew:** old and new binaries never share a state root; the
   sentinel `locks/legacy-closed` makes old binaries refuse.
 
@@ -219,7 +223,7 @@ working tree.
 9. **A survivor holding a lock:** the seat stays busy and the record names it.
 10. **A nested run on the same place:** 125.
 11. **Old caller with a new place, and a new caller with an old place:** the
-    shim or a refusal, never a mixed state root.
+    refusal (125, naming the old `source_rev`), never a mixed state root.
 12. **Fault injection** (`FERRY_FAIL_AT`, debug builds) at every fallible
     point keeps 1–3.
 13. **The cells:** Darwin and Linux Nix checks, bench, a Mac place.
