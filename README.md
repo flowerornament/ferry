@@ -343,7 +343,9 @@ exclusive run:
 
 There is no queue. Before it holds the gate, an exclusive run competes for it
 like any other run. Receipts record `lease.mode`, `wait_ms`, `acquired_ms` and
-`released_ms`.
+`released_ms`, which is when the run's use of the lease ended, stamped just
+before its record is final; the locks themselves close after the record
+(SPEC §5).
 
 **Scope.** "Exclusive" means no other Ferry run under the same state root:
 one user's Ferry on one machine, or one repository's `.ferry/local`. It is not
@@ -362,15 +364,19 @@ reservation shows a run is alive, not that it has the lock. The work inherits th
 platform, so whatever a run leaves running while holding them keeps them
 held. Its waits for the host lease end by its submit plus `--wait-seconds`
 (default 30 min), apart from `--timeout-seconds`. Past it the run refuses
-(125). If a shared probe of the lock succeeds, the reason is "held by shared
-runs", which the probe proves. Otherwise it names the exclusive run that
-took it, reconciled first: a live one holds it; an ended one means something
-it started holds it, or an exclusive run that is starting. No holder's name
+(125), saying what a probe of the lock proves. If it is free now: "released
+as the wait ended; retry". If only shared runs hold it: "held by shared
+runs". Otherwise it names the exclusive run that took it, reconciled first:
+a live one holds it; an ended one means something it started holds it, or
+an exclusive run that is starting. An error while probing names no holder
+("holder unknown"). No holder's name
 is ever cleared: the work inherits the lock and may outlive its run.
 
-A run's record is final before its locks close (SPEC §5). So a named run
-that is still live holds the lock it names, and a free lock's last holder is
-always already final.
+A run's record is final before its locks close (SPEC §5), on every path: each
+lock passes to the supervisor as it is taken, a refusal after that keeps it
+until the refusal is final, and a panic in the supervisor is caught so the
+record is still written first. So a named run that is still live holds the
+lock it names, and a free lock's last holder is always already final.
 A place's refusal carries `why` and `next` apart (SPEC §6); the receipt's
 reason is `<why>; <next>`.
 

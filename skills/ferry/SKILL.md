@@ -102,7 +102,8 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 - **Host held after an exclusive run ended:** the same, for the host lease:
   something an `--exclusive` run left running still holds it, or an
   exclusive run is starting. "Held by shared runs" is proven by a probe:
-  wait, or ask with a longer `--wait-seconds`.
+  wait, or ask with a longer `--wait-seconds`. "Released as the wait
+  ended; retry" means just that.
 
 - **Unmet requirement or unknown machine:** the recipe's `requires` are not
   all in a machine's features. Pick another `--on`, or run `--local` if the

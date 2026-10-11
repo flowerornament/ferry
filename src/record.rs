@@ -315,10 +315,24 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
 /// ended, something it started holds it, or an exclusive run that has not
 /// yet written its id.
 pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
-    let shared_only =
-        fs::File::open(lock).is_ok_and(|probe| fs2::FileExt::try_lock_shared(&probe).is_ok());
-    if shared_only {
-        return "held by shared runs".into();
+    use fs2::FileExt;
+    let busy = |e: &std::io::Error| e.kind() == std::io::ErrorKind::WouldBlock;
+    // Each probe proves only what it can, and closes at once (it is never
+    // an acquisition): free now; shared holders and no exclusive one; or
+    // an exclusive holder. An error proves no holder at all.
+    let probe = match fs::File::open(lock) {
+        Ok(probe) => probe,
+        Err(e) => return format!("holder unknown ({e})"),
+    };
+    match probe.try_lock_exclusive() {
+        Ok(()) => return "the lock was released as the wait ended; retry".into(),
+        Err(e) if !busy(&e) => return format!("holder unknown ({e})"),
+        Err(_) => {}
+    }
+    match FileExt::try_lock_shared(&probe) {
+        Ok(()) => return "held by shared runs".into(),
+        Err(e) if !busy(&e) => return format!("holder unknown ({e})"),
+        Err(_) => drop(probe),
     }
     if named.is_empty() {
         return "held exclusively, by a run that is starting or a process outside Ferry".into();
@@ -376,6 +390,25 @@ mod tests {
             )),
             "{reason}"
         );
+    }
+
+    /// murail-4a's a8eb64ff: a free lock is not proof of shared holders
+    /// (P1), and a probe that cannot open the lock is not proof of an
+    /// exclusive one (P2).
+    #[test]
+    fn a_free_host_lock_does_not_prove_shared_holders_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host-lock");
+        fs::File::create(&path).unwrap();
+        let reason = super::host_holder(dir.path(), &path, "");
+        assert_eq!(reason, "the lock was released as the wait ended; retry");
+    }
+
+    #[test]
+    fn an_unopenable_host_lock_does_not_prove_exclusive_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let reason = super::host_holder(dir.path(), &dir.path().join("missing"), "");
+        assert!(reason.starts_with("holder unknown ("), "{reason}");
     }
 
     fn reservation(pid: u32, start: Option<u128>, boot: &str) -> Reservation {

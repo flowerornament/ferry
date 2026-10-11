@@ -275,7 +275,8 @@ pub fn prepare(
     request: &Request,
     stop: &AtomicBool,
     admission: &mut Option<crate::admission::Admission>,
-) -> Result<(PathBuf, fs::File, crate::lock::HostLease)> {
+    held: &mut crate::lock::Held,
+) -> Result<PathBuf> {
     validate(request)?;
     fs::create_dir_all(root.join("locks"))?;
     let local = root.ends_with("local");
@@ -292,6 +293,9 @@ pub fn prepare(
         let named = fs::read_to_string(&path).unwrap_or_default();
         return Err(crate::record::busy(root, &request.seat, &request.id, named.trim()).into());
     };
+    // Each lock goes to the supervisor as soon as it is taken, so no later
+    // refusal here closes it before the record is final.
+    held.seat = Some(lease);
     crate::seat::check(root, &request.seat, local)?;
     tainted()?;
     crate::custody::begin(root, &request.seat)?;
@@ -304,7 +308,12 @@ pub fn prepare(
             return Err("cleanup_pending: an earlier session has unconfirmed teardown".into());
         }
     }
-    let exclusive = crate::lock::HostLease::acquire(root, request, stop)?;
+    held.host = Some(crate::lock::HostLease::acquire(
+        root,
+        request,
+        stop,
+        &mut held.partial,
+    )?);
     // Measured after any wait for the lease, under this seat's lock.
     crate::admission::admit(
         root,
@@ -355,7 +364,7 @@ pub fn prepare(
             )?;
         }
     }
-    Ok((seat, lease, exclusive))
+    Ok(seat)
 }
 
 fn reset_checkout(seat: &Path, request: &Request) -> Result<()> {

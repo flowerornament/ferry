@@ -35,6 +35,17 @@ pub(crate) fn try_seat(path: &Path, id: &str) -> Result<Option<fs::File>> {
     }
 }
 
+/// A run's locks, from the moment each is taken until its record is final
+/// (SPEC §5: final record, then close locks), on every path.
+#[derive(Default)]
+pub struct Held {
+    pub seat: Option<fs::File>,
+    /// Host locks taken before the lease is complete (the gate, while the
+    /// host lock is still waited for).
+    pub partial: Vec<fs::File>,
+    pub host: Option<HostLease>,
+}
+
 /// Polls for a lock until it is granted, `stop` is set, `waiting` (run on
 /// every contended attempt) refuses, or the run's one wait budget ends
 /// (`waits_end_ms`, else `wait` from now); then it refuses naming the holder. An exclusive holder writes its run id into
@@ -82,6 +93,10 @@ pub(crate) fn acquire_as(
                     // the lock and may outlive its run (SPEC §3).
                     let named = fs::read_to_string(path).unwrap_or_default();
                     let root = path.parent().and_then(Path::parent).unwrap_or(path);
+                    crate::execution::pause_at(
+                        "host-probe",
+                        &root.join("runs").join(&request.id).join("probe"),
+                    );
                     return Err(format!(
                         "waited {:?} for lock {name}, the end of the run's wait: {}",
                         started.elapsed(),
@@ -126,7 +141,9 @@ pub struct Lease {
     pub mode: String,
     /// How long the session waited for the lease.
     pub wait_ms: u128,
-    /// When the lease was granted and released (ms since the epoch).
+    /// When the lease was granted, and when the run's use of it ended (ms
+    /// since the epoch). The latter is stamped just before the record is
+    /// final; the descriptors close after it (SPEC §5).
     #[serde(default)]
     pub acquired_ms: Option<u128>,
     #[serde(default)]
@@ -146,7 +163,14 @@ impl HostLease {
             ..self.record.clone()
         }
     }
-    pub(crate) fn acquire(root: &Path, request: &Request, stop: &AtomicBool) -> Result<Self> {
+    /// Takes the lease; each lock taken goes to `partial` at once, so a
+    /// failed wait after the gate leaves the gate to the supervisor.
+    pub(crate) fn acquire(
+        root: &Path,
+        request: &Request,
+        stop: &AtomicBool,
+        partial: &mut Vec<fs::File>,
+    ) -> Result<Self> {
         let started = std::time::Instant::now();
         let gate = root.join("locks/host-gate");
         // The name earlier binaries used for their exclusive lock, so an old and
@@ -158,18 +182,19 @@ impl HostLease {
             // A tainted seat's survivors may hold the lease: no exclusive claim.
             let tainted = || crate::custody::check_exclusive(root, local);
             tainted()?;
-            let gate = acquire_as(&gate, stop, false, &tainted, request)?;
-            let host = acquire_as(&host, stop, false, &tainted, request)?;
+            partial.push(acquire_as(&gate, stop, false, &tainted, request)?);
+            partial.push(acquire_as(&host, stop, false, &tainted, request)?);
             tainted()?;
-            vec![gate, host]
+            std::mem::take(partial)
         } else {
             // A tainted exclusive run's survivors may hold the gate or lease.
             let tainted = || crate::custody::check_host(root, local);
             // Before the first try too, not only once contended.
             tainted()?;
-            let gate = acquire_as(&gate, stop, true, &tainted, request)?;
+            partial.push(acquire_as(&gate, stop, true, &tainted, request)?);
             let host = acquire_as(&host, stop, true, &tainted, request)?;
-            drop(gate);
+            // A shared run passes the gate: it closes once the lease is held.
+            partial.clear();
             vec![host]
         };
         Ok(Self {

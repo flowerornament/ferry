@@ -333,4 +333,46 @@ the same window.
   succeeds, only shared runs hold it: "held by shared runs", alone.
   Otherwise the named exclusive run, live or ended, as above. Control:
   `a_host_held_by_shared_runs_says_so_alone`.
+- **Every path (herald-1b's and murail-4a's RETURN on 785949a0).** 785949a0
+  held the locks from the moment `prepare` returned Ok. On a refusal inside
+  `prepare` after the seat was taken (owner or cleanup-pending checks, the
+  host wait, admission, the repository), they still dropped before finalize.
+  Now `supervise` owns `lock::Held`, and `prepare` stores each lock in it
+  the moment it is taken. A panic anywhere in the supervisor's body is
+  caught (`catch_unwind`) and recorded as "supervisor panicked", so `held`
+  survives to finalize; `panic=abort` would remove `run_released`'s
+  backstop, which custody needs until 4b. A stop during a wait is an `Err`
+  from `prepare`, with `held` intact. Controls:
+  - `a_prepare_refusal_keeps_its_acquired_seat_until_finalization`
+    (herald-1b's 08211dcd);
+  - `a_host_wait_refusal_keeps_its_seat_until_finalization`;
+  - `a_supervisor_panic_keeps_its_locks_until_finalization`
+    (FERRY_FAIL_AT=supervise-panic).
+- **What the probes prove (murail-4a's P1 and P2).** A shared probe succeeds
+  on a free lock too, and an open error proves nothing. An expired host
+  wait now asks, in order:
+  - exclusive succeeds: the lock is free now ("released as the wait ended;
+    retry"; 125 kept, the budget is spent);
+  - shared succeeds: shared holders and no exclusive one ("held by shared
+    runs");
+  - otherwise exclusive: the named run, by state, as above;
+  - any error: "holder unknown (<error>)".
+
+  The probe fd closes at once; it never counts as acquiring. Controls:
+  `a_host_lock_freed_as_the_wait_ends_says_so` and
+  `a_host_lock_that_cannot_be_probed_names_no_holder` (FERRY_FAIL_AT=host-probe
+  pauses before the probe).
+- **A partly taken host lease (critic on 785949a0).** An exclusive run that
+  takes the gate and then gives up waiting for the host lock kept the gate
+  only in a local, so the gate closed before the refusal was final.
+  `lock::Held.partial` now owns each host lock as it is taken. A shared
+  run's gate is released once its lease is held, by design. Control:
+  `a_partly_taken_host_lease_keeps_its_gate_until_finalization`.
+- **Residue: a finalize that stalls on disk holds the locks with no bound.**
+  Accepted (critic, coordinator): a disk stall stalls everything on the
+  place anyway, and the record cannot be final without the disk. Closing
+  the locks first would bring back the false-holder window that SPEC §5's
+  order removes.
+- **`lease.released_ms`** is when the run's use of the lease ended, stamped
+  just before the record is final. The descriptors close after the record.
 

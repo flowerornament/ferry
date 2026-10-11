@@ -13,9 +13,12 @@ use nix::{
 };
 use std::{
     fs,
-    os::unix::{fs::PermissionsExt, process::CommandExt},
+    os::unix::{
+        fs::PermissionsExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, ExitStatus, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -1555,6 +1558,262 @@ fn a_host_held_by_shared_runs_says_so_alone() {
     let reason = record["reason"].as_str().unwrap();
     assert!(
         reason.ends_with(": held by shared runs") && !reason.contains("exclusive run"),
+        "{reason}"
+    );
+}
+
+/// Whether the default seat's lock is held now, by an exclusive probe.
+fn seat_held(dir: &Path) -> bool {
+    let probe = fs::File::open(seat_lock(dir)).unwrap();
+    fs2::FileExt::try_lock_exclusive(&probe)
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// A lock passes to the supervisor as it is taken, so a refusal after the
+/// seat is held keeps it until the refusal is final (herald-1b's
+/// reproduction, 08211dcd): here, a cleanup-pending marker refuses.
+#[test]
+fn a_prepare_refusal_keeps_its_acquired_seat_until_finalization() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let locks = dir.path().join(".ferry/local/locks");
+    fs::create_dir_all(&locks).unwrap();
+    fs::write(locks.join("cleanup-pending-review"), "unconfirmed").unwrap();
+    let mut first = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "pre-finalize")
+            .args(["run", "probe", "--local", "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let held = seat_held(dir.path());
+    // Release the rendezvous before asserting, so a failure cleans up.
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the refused run ended", || {
+        first.0.try_wait().unwrap().is_some()
+    });
+    assert!(
+        held,
+        "prepare dropped its seat lock before its refusal was final"
+    );
+}
+
+/// The same when the host wait expires after the seat is held: the seat
+/// stays held until the refused record is final.
+#[test]
+fn a_host_wait_refusal_keeps_its_seat_until_finalization() {
+    use fs2::FileExt;
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let locks = dir.path().join(".ferry/local/locks");
+    fs::create_dir_all(&locks).unwrap();
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(locks.join("host-exclusive"))
+        .unwrap();
+    host.lock_exclusive().unwrap();
+    let mut first = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "pre-finalize")
+            .args(["run", "probe", "--local", "--json", "--wait-seconds", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let held = seat_held(dir.path());
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the refused run ended", || {
+        first.0.try_wait().unwrap().is_some()
+    });
+    drop(host);
+    assert!(
+        held,
+        "the host refusal dropped the seat before its record was final"
+    );
+}
+
+/// An exclusive run that takes the gate, then gives up waiting for the
+/// host lock, keeps the gate until its refusal is final (critic on
+/// 785949a0): the gate is the supervisor's from the moment it is taken.
+#[test]
+fn a_partly_taken_host_lease_keeps_its_gate_until_finalization() {
+    use fs2::FileExt;
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let locks = dir.path().join(".ferry/local/locks");
+    fs::create_dir_all(&locks).unwrap();
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(locks.join("host-exclusive"))
+        .unwrap();
+    host.lock_exclusive().unwrap();
+    let mut first = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "pre-finalize")
+            .args([
+                "run",
+                "probe",
+                "--local",
+                "--json",
+                "--exclusive",
+                "--wait-seconds",
+                "1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let gate = fs::File::open(locks.join("host-gate")).unwrap();
+    let held = gate
+        .try_lock_exclusive()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock);
+    drop(gate);
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the refused run ended", || {
+        first.0.try_wait().unwrap().is_some()
+    });
+    drop(host);
+    assert!(held, "the gate closed before the refusal was final");
+}
+
+/// A panic in the supervisor after its locks are taken is caught: the
+/// record is final first, then the locks close.
+#[test]
+fn a_supervisor_panic_keeps_its_locks_until_finalization() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let mut first = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "supervise-panic,pre-finalize")
+            .args(["run", "probe", "--local", "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let held = seat_held(dir.path());
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the run ended", || first.0.try_wait().unwrap().is_some());
+    assert!(
+        held,
+        "a panic dropped the locks before the record was final"
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(dir.path().join(format!(".ferry/local/records/{id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("supervisor panicked"),
+        "{record}"
+    );
+}
+
+/// A run waiting for a host lock this test holds, paused at the host
+/// probe after its wait expired; returns the caller, the held lock file
+/// and the pause marker.
+fn paused_at_the_host_probe(dir: &Path) -> (Caller, fs::File, PathBuf) {
+    use fs2::FileExt;
+    let locks = dir.join(".ferry/local/locks");
+    fs::create_dir_all(&locks).unwrap();
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(locks.join("host-exclusive"))
+        .unwrap();
+    host.lock_exclusive().unwrap();
+    let caller = Caller(
+        ferry(dir)
+            .env("FERRY_FAIL_AT", "host-probe")
+            .args(["run", "probe", "--local", "--json", "--wait-seconds", "1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (_, paused) = paused_at(&dir.join(".ferry/local/runs"), "probe");
+    (caller, host, paused)
+}
+
+/// The receipt a paused caller ends with, once released.
+fn released(mut caller: Caller, paused: &Path) -> (Option<i32>, serde_json::Value) {
+    fs::write(paused.with_extension("go"), "").unwrap();
+    let mut stdout = caller.0.stdout.take().unwrap();
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut stdout, &mut out).unwrap();
+    let code = caller.0.wait().unwrap().code();
+    let record = receipt(&Output {
+        status: ExitStatus::from_raw(0),
+        stdout: out,
+        stderr: vec![],
+    });
+    (code, record)
+}
+
+/// A host lock freed just as the wait ended is not "held by shared runs":
+/// a shared probe succeeds on a free lock too (murail-4a's P1). The
+/// exclusive probe proves it free, and the refusal says retry.
+#[test]
+fn a_host_lock_freed_as_the_wait_ends_says_so() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let (caller, host, paused) = paused_at_the_host_probe(dir.path());
+    drop(host);
+    let (code, record) = released(caller, &paused);
+    assert_eq!(code, Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.ends_with(": the lock was released as the wait ended; retry"),
+        "{reason}"
+    );
+}
+
+/// A lock file the probe cannot open names no holder (murail-4a's P2): an
+/// error is not evidence of one.
+#[test]
+fn a_host_lock_that_cannot_be_probed_names_no_holder() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let (caller, host, paused) = paused_at_the_host_probe(dir.path());
+    let file = dir.path().join(".ferry/local/locks/host-exclusive");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    let (code, record) = released(caller, &paused);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    drop(host);
+    assert_eq!(code, Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(": holder unknown (") && !reason.contains("held"),
         "{reason}"
     );
 }

@@ -283,42 +283,52 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     result.deadline_ms = Some(deadline);
     record::reconcile_seat(root, &request.seat);
     // The locks stay held until the record is final (SPEC §5: final record,
-    // then close locks): a named run that is still live holds them.
-    let mut held = None;
-    let executed: Result<execution::Ended> = (|| {
-        crate::custody::supervise()?;
-        let (seat, lease, host_lease) =
-            execution::prepare(root, &request, &stop, &mut result.admission)?;
-        // Held from here, on every path, until the record is final.
-        let (lease, host_lease) = held.insert((lease, host_lease));
-        // The work inherits both, on every platform (SPEC §3).
-        let locks: Vec<_> = std::iter::once(&*lease).chain(host_lease.files()).collect();
-        let finished = execution::run_released(root, &seat, &request, &stop, &locks, deadline);
-        if let Some(error) = &finished.custody.error {
-            note(
-                &mut result.reason,
-                format!("custody release failed: {error}"),
+    // then close locks): each passes to `held` as it is taken, and `held`
+    // drops only after finalize, on every path.
+    let mut held = crate::lock::Held::default();
+    // A panic anywhere in here is caught, so the verdict is still recorded
+    // with `held` intact, and the locks still close only after finalize.
+    let executed: Result<execution::Ended> = std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| -> Result<execution::Ended> {
+            crate::custody::supervise()?;
+            let seat = execution::prepare(root, &request, &stop, &mut result.admission, &mut held)?;
+            assert!(
+                !execution::fail_at("supervise-panic"),
+                "injected by FERRY_FAIL_AT"
             );
-        }
-        result.custody = Some(finished.custody);
-        for after in finished.notes {
-            note(&mut result.reason, after);
-        }
-        result.output = Some(finished.output);
-        result.collection = finished.collection;
-        if let Some(error) = result.collection.as_ref().and_then(|c| c.error.as_ref()) {
-            note(&mut result.reason, format!("collection: {error}"));
-        }
-        let ended = finished.executed?;
-        if matches!(
-            ended,
-            execution::Ended::Result(_) | execution::Ended::Timeout
-        ) {
-            collect_artifacts(root, &seat, &request, &mut result);
-        }
-        result.lease = Some(host_lease.stamp());
-        Ok(ended)
-    })();
+            let (Some(lease), Some(host_lease)) = (&held.seat, &held.host) else {
+                return Err("prepare returned without its locks".into());
+            };
+            // The work inherits both, on every platform (SPEC §3).
+            let locks: Vec<_> = std::iter::once(lease).chain(host_lease.files()).collect();
+            let finished = execution::run_released(root, &seat, &request, &stop, &locks, deadline);
+            if let Some(error) = &finished.custody.error {
+                note(
+                    &mut result.reason,
+                    format!("custody release failed: {error}"),
+                );
+            }
+            result.custody = Some(finished.custody);
+            for after in finished.notes {
+                note(&mut result.reason, after);
+            }
+            result.output = Some(finished.output);
+            result.collection = finished.collection;
+            if let Some(error) = result.collection.as_ref().and_then(|c| c.error.as_ref()) {
+                note(&mut result.reason, format!("collection: {error}"));
+            }
+            let ended = finished.executed?;
+            if matches!(
+                ended,
+                execution::Ended::Result(_) | execution::Ended::Timeout
+            ) {
+                collect_artifacts(root, &seat, &request, &mut result);
+            }
+            result.lease = Some(host_lease.stamp());
+            Ok(ended)
+        }),
+    )
+    .unwrap_or_else(|_| Err("supervisor panicked".into()));
     // One verdict, from the first terminal fact (Rule B). A stop's signal is
     // the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
