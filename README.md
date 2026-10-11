@@ -62,7 +62,8 @@ feature refuses rather than running.
 | **Seat** | A private, warm checkout for one workspace (`--seat`, default `default`). One run at a time per seat. |
 | **Host lease** | Shared by every run on a machine; held alone by an exclusive run. |
 | **Run** | One attempt. It ends with exactly one receipt and one exit code. |
-| **Receipt** | `.ferry/receipts/<id>.json`: the commit, the binaries on both ends, the outcome, custody, lease and admission facts. |
+| **Receipt** | `.ferry/receipts/<id>.json`: the commit, the binaries on both ends, the outcome, custody, lease and admission facts. Written at submit with every caller fact (`state: submitted`), then replaced by the final receipt (`state: final`). A refusal before submit is a final receipt. |
+| **Host record** | The machine's account of a run (`records/<id>.json` under its state root). The supervisor reserves the id before any effect (`<id>.reserved.json`, with its pid, start time and boot id), so a second submit of the id is refused. It finalizes once, with the reservation's fields plus the run's, linked into place and synced, never replaced. A reservation whose supervisor is provably gone (another boot, a dead pid, another start time) is reconciled to `lost`/255, `supervisor gone (reconciled)`, by its caller or by the next run on its seat; a live supervisor never is. |
 
 ## Commands
 
@@ -399,9 +400,10 @@ Three rules hold once a run is accepted:
 - **The supervisor never waits on data.**
   - After release it delivers the remaining output. It stops after 15 s
     without progress, 60 s in all, or a stop, and counts what was left.
-  - Then it writes its record and sends `host-result` last.
+  - Then it finalizes its record and sends `host-result` last.
   - If `host-result` does not arrive, the caller reads the host's final record
-    instead, and the receipt says so.
+    instead, and the receipt says so. A reservation alone is never a verdict:
+    the run is still going, or lost.
 
 **Counts.** The output log on the machine (`runs/<id>/output.log`; for a local
 run, `.ferry/local/runs/<id>/output.log`) is the complete account of
@@ -433,8 +435,8 @@ until a second signal, then kills it and says so in the receipt.
 - **Not a sandbox.** Runs execute as you, with your permissions.
 - **Outside custody:** processes a run did not start, other users and other
   hosts. On macOS, also descendants that leave the session.
-- **A supervisor killed outright** (SIGKILL of `host-run`) records nothing and
-  stops nothing.
+- **A supervisor killed outright** (SIGKILL of `host-run`) stops nothing. Its
+  run is reconciled to `lost`/255 by its caller or the next run on the seat.
   - Its owner marker keeps that seat refused until `ferry seat recover`.
   - On Linux the inherited locks keep other runs out while its work lives.
   - On macOS an `--exclusive` run on another seat is not kept out.

@@ -7,6 +7,7 @@ mod execution;
 mod limits;
 mod output;
 mod receipt;
+mod record;
 mod repository;
 mod seat;
 mod transport;
@@ -193,6 +194,14 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     )?;
     record.mirrors.clone_from(&request.mirrors);
     interrupted()?;
+    // Every caller fact, stored before the host is asked to run anything:
+    // lost until the final receipt replaces it.
+    let mut submitted = record.clone();
+    submitted.state = Some("submitted".into());
+    submitted.outcome = receipt::Outcome::Lost;
+    submitted.exit_code = 255;
+    submitted.reason = Some("submitted; no verdict yet".into());
+    receipt::save(root, &submitted)?;
     match route {
         config::Route::Local => transport::local(root, &request, record, options.json),
         config::Route::Remote(name) => {
@@ -255,6 +264,7 @@ fn run(options: &Run) -> Result<i32> {
         });
     }
     record.elapsed_ms = receipt::now_ms() - start;
+    record.state = Some("final".into());
     receipt::save(&root, &record)?;
     // The receipt is stored; a closed stdout or stderr never changes the code.
     if options.json {
@@ -311,6 +321,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         provider_requires: vec![],
         output_dropped: BTreeMap::default(),
         output_delivered: BTreeMap::default(),
+        state: None,
     })
 }
 
@@ -332,6 +343,7 @@ fn recover(seat: &str, local: bool, accept_unknown: Option<&str>) -> Result<i32>
         Err(error) => record.reason = Some(error.to_string()),
     }
     record.elapsed_ms = receipt::now_ms() - record.started_ms;
+    record.state = Some("final".into());
     receipt::save(&root, &record)?;
     execution::emit(
         serde_json::json!({"protocol":receipt::PROTOCOL,"event":"receipt","receipt":record})

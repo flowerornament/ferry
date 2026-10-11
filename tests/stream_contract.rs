@@ -120,8 +120,15 @@ fn only_record(dir: &Path) -> serde_json::Value {
         found = fs::read_dir(dir).ok().and_then(|entries| {
             entries
                 .flatten()
+                // A final record: not a reservation, not a temporary file.
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    !name.starts_with('.') && !name.ends_with(".reserved.json")
+                })
                 .filter_map(|e| fs::read(e.path()).ok())
                 .find_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                // A receipt is complete once its run is no longer under way.
+                .filter(|record| record["state"] != "submitted")
         });
         found.is_some()
     });
@@ -1187,4 +1194,157 @@ fn recipe_and_collect_lines_never_interleave_in_the_log() {
     assert_eq!(recipe, 20000);
     assert!(collect > 0);
     assert_eq!(host["output_lines"], recipe + collect, "{host}");
+}
+
+/// The names in a run-records directory, sorted.
+fn record_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(dir.join(".ferry/local/records"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The one receipt in the repository, whatever its state.
+fn only_receipt_file(dir: &Path) -> serde_json::Value {
+    let entry = fs::read_dir(dir.join(".ferry/receipts"))
+        .unwrap()
+        .flatten()
+        .find(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .unwrap();
+    serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap()
+}
+
+#[test]
+fn a_crashed_supervisor_is_reconciled_to_lost_by_its_caller() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = fixture("echo started; sleep 2", "");
+    let events = scratch.path().join("caller.out");
+    let caller = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .stdout(fs::File::create(&events).unwrap())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut caller = Caller(caller);
+    let mut supervisor = None;
+    wait_until("the recipe started", || {
+        let text = fs::read_to_string(&events).unwrap_or_default();
+        supervisor = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "accepted")
+            .and_then(|event| event["pid"].as_i64());
+        supervisor.is_some() && text.contains("started")
+    });
+    // Under way, the receipt holds the caller's facts and no verdict.
+    let submitted = only_receipt_file(dir.path());
+    assert_eq!(submitted["state"], "submitted", "{submitted}");
+    assert_eq!(submitted["outcome"], "lost", "{submitted}");
+    assert_eq!(submitted["exit_code"], 255, "{submitted}");
+    assert!(submitted["caller_exe"].is_string(), "{submitted}");
+    // The supervisor this caller spawned, by the pid it announced.
+    kill(
+        Pid::from_raw(i32::try_from(supervisor.unwrap()).unwrap()),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    assert_eq!(caller.0.wait().unwrap().code(), Some(255));
+    let record = only_record(&dir.path().join(".ferry/receipts"));
+    assert_eq!(record["outcome"], "lost", "{record}");
+    assert_eq!(record["state"], "final", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("supervisor gone (reconciled)"),
+        "{record}"
+    );
+    let id = record["id"].as_str().unwrap();
+    assert_eq!(record_names(dir.path()), [format!("{id}.json")]);
+}
+
+#[test]
+fn a_record_left_unfinalized_is_reconciled_exactly_once_by_the_next_run() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let first = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "finalize-link")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let first = receipt(&first);
+    // The verdict still reached the caller; the host could not record it.
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
+    assert!(
+        first["reason"]
+            .as_str()
+            .unwrap()
+            .contains("host record: finalizing run"),
+        "{first}"
+    );
+    let id = first["id"].as_str().unwrap();
+    let reserved = format!("{id}.reserved.json");
+    assert_eq!(record_names(dir.path()), [reserved.as_str()]);
+    // A reconcile that fails leaves the reservation for the next reader.
+    let held = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "reconcile")
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(receipt(&held)["outcome"], "ran-pass");
+    assert!(record_names(dir.path()).contains(&reserved));
+    let mut lost = None;
+    for _ in 0..2 {
+        let next = ferry(dir.path())
+            .args(["run", "pass", "--local", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(receipt(&next)["outcome"], "ran-pass");
+        let path = dir.path().join(format!(".ferry/local/records/{id}.json"));
+        let bytes = fs::read(path).unwrap();
+        // Reconciled once; the next run leaves the record as it was.
+        assert_eq!(*lost.get_or_insert_with(|| bytes.clone()), bytes);
+        assert!(!record_names(dir.path()).contains(&reserved));
+    }
+    let lost: serde_json::Value = serde_json::from_slice(&lost.unwrap()).unwrap();
+    assert_eq!(lost["outcome"], "lost", "{lost}");
+    assert_eq!(lost["exit_code"], 255, "{lost}");
+    assert_eq!(lost["reason"], "supervisor gone (reconciled)", "{lost}");
+    // The reservation's fields, then the verdict.
+    assert_eq!(lost["id"], id, "{lost}");
+    assert!(lost["supervisor"]["pid"].is_u64(), "{lost}");
+}
+
+#[test]
+fn a_failed_reservation_refuses_before_anything_runs() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    // A failed sync is met first by the reservation.
+    for point in ["reserve", "fsync"] {
+        let dir = fixture("echo ran", "");
+        let out = ferry(dir.path())
+            .env("FERRY_FAIL_AT", point)
+            .args(["run", "probe", "--local", "--json"])
+            .output()
+            .unwrap();
+        let record = receipt(&out);
+        assert_eq!(out.status.code(), Some(125), "{record}");
+        assert_eq!(record["outcome"], "refused", "{record}");
+        assert!(
+            record["reason"].as_str().unwrap().contains(point),
+            "{record}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("\"accepted\""), "{stdout}");
+        assert!(
+            !dir.path().join(".ferry/local/records").exists()
+                || record_names(dir.path()).is_empty()
+        );
+    }
 }

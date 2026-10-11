@@ -124,6 +124,10 @@ pub struct Receipt {
     /// every relayed line is accounted for.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub output_delivered: std::collections::BTreeMap<String, u64>,
+    /// `submitted` while the run is under way (every caller fact, no
+    /// verdict yet), then `final`. Absent on older receipts: final.
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 pub fn now_ms() -> u128 {
@@ -217,16 +221,21 @@ pub fn run_id() -> std::io::Result<String> {
     fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
     Ok(format!("{}-{}", now_ms(), hex(&nonce)))
 }
+/// Stores a receipt, complete or not at all. A submitted receipt never
+/// replaces another; the final one replaces its submitted receipt.
 pub fn save(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Error>> {
     let dir = root.join(".ferry/receipts");
-    fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", receipt.id));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    serde_json::to_writer_pretty(&mut file, receipt)?;
-    file.sync_all()?;
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    if receipt.state.as_deref() == Some("submitted") {
+        return crate::record::write_new(&path, &bytes, None);
+    }
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!(".{}.json.tmp", receipt.id));
+    fs::write(&tmp, bytes)?;
+    fs::File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    fs::File::open(&dir)?.sync_all()?;
     Ok(())
 }
 

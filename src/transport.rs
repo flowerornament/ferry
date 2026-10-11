@@ -337,6 +337,9 @@ pub struct HostResult {
     /// Of those, lines whose output-log write failed (counted, not logged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_log_errors: Option<u64>,
+    /// `final` in a host record; absent in a result never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 impl HostResult {
     /// A result that says nothing ran yet: refused 125 until the run says more.
@@ -359,6 +362,7 @@ impl HostResult {
             admission: None,
             output_lines: None,
             output_log_errors: None,
+            state: None,
         })
     }
 }
@@ -380,17 +384,10 @@ fn refuse(reason: &str) -> i32 {
     125
 }
 
-/// A host record that stands in for a host-result: only a final one. A
-/// reserved (empty) or unreadable record means the host never finished.
-fn final_record(bytes: &[u8]) -> std::result::Result<HostResult, String> {
-    if bytes.is_empty() {
-        return Err("host record not final".into());
-    }
-    serde_json::from_slice::<HostResult>(bytes).map_err(|e| format!("host record not final: {e}"))
-}
-
-/// The host record of a remote run, read over SSH when its host-result did
-/// not arrive. Bounded (P5): a dead link fails within about 25 s.
+/// The final host record of a remote run, read over SSH when its
+/// host-result did not arrive. Bounded (P5): a dead link fails within about
+/// 25 s. A reservation alone is no verdict: the run is still going, or lost
+/// until the host's next run on the seat reconciles it.
 fn remote_record(
     machine: &config::Machine,
     request: &Request,
@@ -412,8 +409,30 @@ fn remote_record(
             "cat .local/state/ferry/records/{}.json",
             request.id
         ));
-    let bytes = repository::output(&mut command).map_err(|e| e.to_string())?;
-    final_record(&bytes)
+    let bytes = repository::output(&mut command)
+        .map_err(|e| format!("no final host record (still running, or lost): {e}"))?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+/// Finalizes the host record, the truth. A failure to write it is noted in
+/// the result the caller still receives, and the reservation stays for a
+/// reconcile once this supervisor is gone.
+fn finalize(root: &Path, request: &Request, result: &mut HostResult) {
+    result.state = Some("final".into());
+    let stored = serde_json::to_value(&*result)
+        .map_err(Into::into)
+        .and_then(|record| crate::record::finalize(root, &request.id, &record));
+    if let Err(error) = stored {
+        note(&mut result.reason, format!("host record: {error}"));
+    }
+}
+
+/// The final host record of a local run, read when its host-result did not
+/// arrive. Its supervisor has exited, so a run it left reserved is
+/// reconciled as lost here.
+fn local_record(state: &Path, request: &Request) -> std::result::Result<HostResult, String> {
+    let found = crate::record::reconcile(state, &request.id).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&found.ok_or("no host record")?).map_err(|e| e.to_string())
 }
 
 /// Archives the recipe's declared artifacts. A failure, the digest's
@@ -465,8 +484,8 @@ fn note(reason: &mut Option<String>, text: String) {
         None => text,
     });
 }
-/// Reads, validates and reserves a request. Any error here is a refusal.
-fn admit(input: &mut impl BufRead, state: Option<PathBuf>) -> Result<(Request, PathBuf, fs::File)> {
+/// Reads and validates a request. Any error here is a refusal.
+fn admit(input: &mut impl BufRead, state: Option<PathBuf>) -> Result<(Request, PathBuf)> {
     let mut line = String::new();
     input
         .read_line(&mut line)
@@ -479,16 +498,35 @@ fn admit(input: &mut impl BufRead, state: Option<PathBuf>) -> Result<(Request, P
         None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?)
             .join(".local/state/ferry"),
     };
-    let records = root.join("records");
-    fs::create_dir_all(&records).map_err(|e| format!("creating {}: {e}", records.display()))?;
-    let record_path = records.join(format!("{}.json", request.id));
-    // A reservation refuses reuse even after a crash, before acquiring any seat.
-    let record = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&record_path)
-        .map_err(|e| format!("reserving {}: {e}", record_path.display()))?;
-    Ok((request, root, record))
+    Ok((request, root))
+}
+
+/// Reserves `request`'s id before any effect, so a second submit of it is
+/// refused even after a crash; then finalizes as lost the runs of its seat
+/// whose supervisor is gone.
+fn reserve(root: &Path, request: &Request, result: &HostResult) -> Result<()> {
+    let pid = std::process::id();
+    crate::record::reserve(
+        root,
+        &crate::record::Reservation {
+            state: "reserved".into(),
+            id: request.id.clone(),
+            token: request.token.clone(),
+            commit: request.commit.clone(),
+            seat: request.seat.clone(),
+            binary_sha256: result.binary_sha256.clone(),
+            supervisor: crate::record::Supervisor {
+                pid,
+                start: i32::try_from(pid)
+                    .ok()
+                    .and_then(|pid| crate::seat::start_time(pid).ok()),
+            },
+            boot_id: crate::record::boot_id(),
+            submitted_ms: receipt::now_ms(),
+        },
+    )?;
+    crate::record::reconcile_seat(root, &request.seat);
+    Ok(())
 }
 /// SIGTTOU and SIGTTIN: blocked in host-run, restored in its sessions.
 pub fn terminal_signals() -> nix::sys::signal::SigSet {
@@ -510,7 +548,7 @@ pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
     // Everything before `accepted` is a refusal: nothing ran. Say so in the
     // protocol, so the caller records refused 125 rather than a lost run.
     let admitted = admit(&mut input, state);
-    let (request, root, mut record) = match admitted {
+    let (request, root) = match admitted {
         Ok(admitted) => admitted,
         Err(error) => return Ok(refuse(&error.to_string())),
     };
@@ -528,6 +566,9 @@ pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
         reader_stop.store(true, Ordering::SeqCst);
     });
     let mut result = HostResult::refused(&request)?;
+    if let Err(error) = reserve(&root, &request, &result) {
+        return Ok(refuse(&error.to_string()));
+    }
     // Before acceptance, so a failure here is a refusal: nothing ran.
     if let Err(error) = crate::custody::supervise() {
         return Ok(refuse(&format!("supervising: {error}")));
@@ -596,18 +637,7 @@ pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
             format!("{log_errors} output lines could not be written to output.log"),
         );
     }
-    // The host record is the truth; a failure to write it is noted in the
-    // result the caller still receives.
-    let stored = serde_json::to_vec(&result)
-        .map_err(std::io::Error::from)
-        .and_then(|bytes| record.write_all(&bytes))
-        .and_then(|()| record.sync_all());
-    if let Err(error) = stored {
-        note(
-            &mut result.reason,
-            format!("host record not written: {error}"),
-        );
-    }
+    finalize(&root, &request, &mut result);
     event(&serde_json::json!({"protocol":1,"event":"host-result","result":result}));
     // A stalled client never holds the supervisor: the caller can read the
     // record instead.
@@ -683,15 +713,12 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
     let (mut stream, status) = converse(child, request, &stop, json, supervisor_grace())?;
     record.output_dropped.clone_from(&stream.dropped);
     record.output_delivered.clone_from(&stream.delivered);
-    // The record on disk is the truth when the host-result did not arrive.
-    // The record is reserved only after admission and bound by the token
-    // checks below, so it can stand in even when no event arrived at all.
+    // The final record on disk is the truth when the host-result did not
+    // arrive. It is bound by the token checks below, so it can stand in
+    // even when no event arrived at all.
     let from_record = stream.result.is_none() && stream.refusal.is_none();
     if from_record {
-        match fs::read(state.join("records").join(format!("{}.json", request.id)))
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| final_record(&bytes))
-        {
+        match local_record(&state, request) {
             Ok(result) => stream.result = Some(result),
             Err(error) => note(
                 &mut record.reason,
@@ -740,7 +767,7 @@ pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -
         record.exit_code = 125;
         record.reason = Some(reason);
     } else {
-        // Keep what the fallback said (e.g. "host record not final").
+        // Keep what the fallback said (e.g. "no host record").
         note(
             &mut record.reason,
             format!("no result from host-run: {status}"),
@@ -915,9 +942,9 @@ pub fn remote(
     let (mut stream, status) = converse(child, request, &stop, json, Duration::ZERO)?;
     record.output_dropped.clone_from(&stream.dropped);
     record.output_delivered.clone_from(&stream.delivered);
-    // The record on disk is the truth when the host-result did not arrive.
-    // The record is reserved only after admission and bound by the token
-    // checks below, so it can stand in even when no event arrived at all.
+    // The final record on the host is the truth when the host-result did
+    // not arrive. It is bound by the token checks in accept_result, so it
+    // can stand in even when no event arrived at all.
     let from_record = stream.result.is_none() && stream.refusal.is_none();
     if from_record {
         let fetched = remote_record(machine, request);
@@ -1221,7 +1248,7 @@ fn accept_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{final_record, read_stream};
+    use super::read_stream;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -1233,15 +1260,5 @@ mod tests {
         assert!(read.accepted);
         assert!(read.result.is_none());
         assert_eq!(read.received, 1);
-    }
-
-    #[test]
-    fn only_a_final_record_stands_in_for_the_host_result() {
-        assert!(final_record(b"").unwrap_err().contains("not final"));
-        assert!(
-            final_record(b"{\"protocol\":1")
-                .unwrap_err()
-                .contains("not final")
-        );
     }
 }

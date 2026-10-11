@@ -1273,7 +1273,7 @@ fn a_host_refusal_before_acceptance_is_refused_not_lost() {
         record["reason"]
             .as_str()
             .unwrap()
-            .starts_with("host refused before acceptance: creating "),
+            .starts_with("host refused before acceptance: reserving "),
         "{}",
         record["reason"]
     );
@@ -2172,4 +2172,71 @@ exit 1
     );
     assert_eq!(receipt(&out)["outcome"], "ran-fail");
     assert_eq!(receipt(&out)["exit_code"], 7);
+}
+
+/// Submits `request` to `ferry host-run --state <state>`; its exit code and
+/// event stream.
+fn submit(state: &Path, request: &serde_json::Value) -> (Option<i32>, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("host-run")
+        .arg("--state")
+        .arg(state)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        child.stdin.as_mut().unwrap(),
+        format!("{request}\n").as_bytes(),
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn a_second_submit_of_an_id_is_refused_and_a_live_supervisor_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let records = state.join("records");
+    fs::create_dir_all(&records).unwrap();
+    let request = |id: &str| {
+        serde_json::json!({
+            "protocol": 1, "id": id, "token": "tok", "commit": "0".repeat(40), "seat": "s",
+            "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
+            "timeout_seconds": null, "mirrors": [], "forwarded_env": {}
+        })
+    };
+    // A run still under way: its supervisor is a live process.
+    let mut live = Command::new("sleep").arg("60").spawn().unwrap();
+    let reservation = serde_json::json!({
+        "state": "reserved", "id": "1-live", "token": "tok", "commit": "0".repeat(40),
+        "seat": "s", "binary_sha256": "x", "supervisor": {"pid": live.id(), "start": null},
+        "boot_id": null, "submitted_ms": 1
+    });
+    let reserved = records.join("1-live.reserved.json");
+    fs::write(&reserved, reservation.to_string()).unwrap();
+    let (code, events) = submit(&state, &request("1-live"));
+    assert_eq!(code, Some(125), "{events}");
+    assert!(events.contains("already submitted"), "{events}");
+    assert!(!events.contains("\"accepted\""), "{events}");
+    // Another run on the seat reconciles gone supervisors, never a live one.
+    let (_, events) = submit(&state, &request("2-next"));
+    assert!(events.contains("\"accepted\""), "{events}");
+    assert!(records.join("2-next.json").exists(), "{events}");
+    assert_eq!(
+        fs::read_to_string(&reserved).unwrap(),
+        reservation.to_string()
+    );
+    assert!(!records.join("1-live.json").exists());
+    // A finished run is refused just the same: no second run.
+    let (code, events) = submit(&state, &request("2-next"));
+    assert_eq!(code, Some(125), "{events}");
+    assert!(events.contains("already finished"), "{events}");
+    // The test's own child, by its handle.
+    live.kill().unwrap();
+    live.wait().unwrap();
 }
