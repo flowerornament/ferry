@@ -296,6 +296,8 @@ receipts or records.
   run that has spent its wait budget, or a measurement over 30 s, is not
   measured (a note). Over the cap, they are wiped and the run
   starts cold: the receipt's `pruned` is `{bytes, cap}` and `reason` says so.
+  `pruned.bytes` is what was measured over the cap; after a partial wipe
+  (a path it could not delete, each a note) less than that was removed.
   The cap can be exceeded by at most an hour of runs' growth. A failed wipe is
   a note, and the run goes on with what is there.
 - **Keep `slots/` and `caches/` real directories** on the state root's disk.

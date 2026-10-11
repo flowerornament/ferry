@@ -302,4 +302,10 @@ The critic's P2s on 9f6fafe2 (GO; none a safety escape); evidence
   `a_seat_swapped_for_a_link_after_the_walk_is_not_deleted_through`).
 - **The device walk is bounded** by `MEASURE_LIMIT`; past it, it fails
   closed and nothing is deleted.
+- **Final residue** (the critic, GO on d1b8984f): an ancestor of the wipe
+  path swapped for a symbolic link in the microseconds between the last
+  containment check and the delete is not excluded. It is irreducible for a
+  delete by path; every other gap was hooked and refused. Only a leaver of an
+  earlier run, holding no lock, could make the swap; the scope tier
+  (ferry-xtx.20) removes leavers.
 
