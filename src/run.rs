@@ -29,11 +29,54 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// A run's session, by its leader: stopped once, on every path.
+///
+/// Invariant: no signal by pid or group is sent unless the leader is
+/// unreaped. Its zombie pins its pid, which is the session and group id, so
+/// nothing that is signalled can belong to another session. The leader is
+/// reaped exactly once, after the last signal.
 struct SessionOwner {
     child: std::process::Child,
     stopped: bool,
+    reaped: bool,
 }
 impl SessionOwner {
+    /// Signals the session; refused, as an error, once the leader is reaped.
+    fn signal(&self, signal: Signal, errors: &mut Vec<String>) {
+        let sid = self.child.id();
+        if self.reaped {
+            errors.push(format!(
+                "refused {signal:?} to session {sid}: its leader is already reaped"
+            ));
+            return;
+        }
+        signal_session(sid, signal, errors);
+    }
+
+    /// Whether the leader has exited, without reaping it: an unreaped
+    /// child's pid cannot be reused, and an exited one is a zombie, whose
+    /// process details cannot be read.
+    fn leader_exited(&self) -> bool {
+        let pid = self.child.id();
+        #[cfg(target_os = "macos")]
+        {
+            i32::try_from(pid).is_ok_and(|pid| {
+                libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0).is_err()
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            i32::try_from(pid).is_ok_and(zombie)
+        }
+    }
+
+    /// Reaps the leader, once, after the last signal.
+    fn reap(&mut self, errors: &mut Vec<String>) {
+        if let Err(e) = self.child.wait() {
+            errors.push(format!("wait for session leader {}: {e}", self.child.id()));
+        }
+        self.reaped = true;
+    }
+
     /// Stops the session (SPEC §7): TERM to every member, up to
     /// `STOP_GRACE` for them to leave, KILL, then up to `KILL_GRACE` for them
     /// to be gone, killing again whatever is left. It never gives up early:
@@ -46,7 +89,7 @@ impl SessionOwner {
         if fail_at("session-term") {
             errors.push("session TERM: injected by FERRY_FAIL_AT".to_owned());
         } else {
-            signal_session(sid, Signal::SIGTERM, &mut errors);
+            self.signal(Signal::SIGTERM, &mut errors);
             // A listing that fails cannot confirm the others left, so the
             // grace runs out.
             let until = Instant::now() + STOP_GRACE;
@@ -62,7 +105,7 @@ impl SessionOwner {
         }
         let killing = !fail_at("session-kill");
         if killing {
-            signal_session(sid, Signal::SIGKILL, &mut errors);
+            self.signal(Signal::SIGKILL, &mut errors);
         }
         // Also handles failure before the child called setsid.
         match self.child.kill() {
@@ -70,30 +113,47 @@ impl SessionOwner {
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
             Err(e) => errors.push(format!("kill session leader {sid}: {e}")),
         }
-        if let Err(e) = self.child.wait() {
-            errors.push(format!("wait for session leader {sid}: {e}"));
-        }
         let until = Instant::now() + KILL_GRACE;
         let mut left = session_list(sid);
         while Instant::now() < until && !left.as_ref().is_ok_and(Vec::is_empty) {
             thread::sleep(Duration::from_millis(20));
             // Again, for whatever a failed signal or listing missed; the
-            // first pass's errors are already kept.
+            // first pass's errors are already kept, a refusal is not.
             if killing {
-                signal_session(sid, Signal::SIGKILL, &mut Vec::new());
+                let mut again = Vec::new();
+                self.signal(Signal::SIGKILL, &mut again);
+                errors.extend(again.into_iter().filter(|e| e.starts_with("refused")));
             }
             left = session_list(sid);
         }
+        self.reap(&mut errors);
         let survivors = match left {
-            // A member whose start cannot be read has gone (R6).
+            // A member whose start cannot be read is dropped only on proven
+            // absence; otherwise it is kept without a start, and the error
+            // noted (R6).
             Ok(pids) => Some(
                 pids.into_iter()
                     .filter_map(|pid| {
-                        let start = crate::record::start_time(pid).ok()?;
-                        Some(crate::custody::Survivor {
-                            pid,
-                            start: u64::try_from(start).ok(),
-                        })
+                        match if fail_at("survivor-start") {
+                            Err("survivor-start: injected by FERRY_FAIL_AT".into())
+                        } else {
+                            crate::record::start_time(pid)
+                        } {
+                            Ok(start) => Some(crate::custody::Survivor {
+                                pid,
+                                start: u64::try_from(start).ok(),
+                            }),
+                            Err(_)
+                                if kill(Pid::from_raw(pid), None)
+                                    == Err(nix::errno::Errno::ESRCH) =>
+                            {
+                                None
+                            }
+                            Err(error) => {
+                                errors.push(format!("start of survivor {pid}: {error}"));
+                                Some(crate::custody::Survivor { pid, start: None })
+                            }
+                        }
                     })
                     .collect(),
             ),
@@ -165,19 +225,20 @@ fn process_ids() -> Result<Vec<i32>> {
     )
 }
 
+// Read from /proc, not by running `ps`: a subprocess could hang and stall
+// the stop past every bound (the critic's P2 on d502ae21). A /proc that
+// cannot be read is a listing failure, which takes the group fallback.
 #[cfg(not(target_os = "macos"))]
 fn process_ids() -> Result<Vec<i32>> {
-    let bytes = repository::output(Command::new("ps").args(["-axo", "pid="]))?;
-    Ok(String::from_utf8(bytes)?
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
+    Ok(fs::read_dir("/proc")?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
         .collect())
 }
 /// Signals every member of the session, keeping each error. When the
 /// session cannot be listed, the leader's process group (the session, unless
 /// a member moved to its own group) is signalled instead.
 fn signal_session(sid: u32, signal: Signal, errors: &mut Vec<String>) {
-    // The retained session leader keeps the SID from being reused until reaped.
+    // Only through `SessionOwner::signal`, while the leader is unreaped.
     let members = match session_list(sid) {
         Ok(members) => members,
         Err(error) => {
@@ -529,6 +590,7 @@ fn run_session(
     let mut owner = SessionOwner {
         child,
         stopped: false,
+        reaped: false,
     };
     // After the owner exists, so a failure here still tears the session down.
     restored?;
@@ -554,8 +616,9 @@ fn run_session(
         {
             break Ended::Timeout;
         }
-        if let Some(status) = owner.child.try_wait()? {
-            return Err(format!("session owner exited without result: {status}").into());
+        // Not reaped here: the stop still signals the session by its id.
+        if owner.leader_exited() {
+            return Err("session owner exited without result".into());
         }
         thread::sleep(Duration::from_millis(20));
     };

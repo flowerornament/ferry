@@ -365,8 +365,9 @@ its own.
 stopped: SIGTERM to every member, up to 10 s for them to leave, SIGKILL, and
 up to 2 s for them to be gone. The receipt's `custody` records:
 - `tier`: `session`;
-- `survivors`: the members still alive after that, by pid and start time, or
-  `"unknown"` if the session could not be listed at the end;
+- `survivors`: the members still alive after that, by pid and start time
+  (`null` if it could not be read), or `"unknown"` if the session could not
+  be listed at the end;
 - `error`: what failed on the way (a signal, a listing). The stop never
   gives up early: it goes on to the KILL and the leader's reaping, and the
   verdict stands.

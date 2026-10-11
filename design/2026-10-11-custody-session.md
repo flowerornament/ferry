@@ -208,17 +208,32 @@ custody: { tier: "session",
   JSON, so stored receipts of the old shape still load.
 - **Session stop** (`run::SessionOwner::stop`): TERM to every member, up to
   `STOP_GRACE` (10 s), KILL, then up to `KILL_GRACE` (2 s), killing again
-  whatever is left. The members left are the survivors, without any whose
-  start can no longer be read: it has gone (review R6). The stop never gives
-  up early (review R4): every member is signalled and each error kept; a
-  failed listing signals the leader's process group instead; the KILL and
-  the leader's reaping always follow. The errors are the custody `error`,
-  and the survivors are `"unknown"` only when the final listing fails.
+  whatever is left. The members left are the survivors. One whose start
+  cannot be read is dropped only on proven absence (`ESRCH`); otherwise it
+  is kept with `start: null` and the error noted (review R6, as amended on
+  d502ae21). The stop never gives up early (review R4): every member is
+  signalled and each error kept; a failed listing signals the leader's
+  process group instead; the KILL and the leader's reaping always follow.
+  The errors are the custody `error`, and the survivors are `"unknown"` only
+  when the final listing fails.
+- **No signal without an unreaped leader** (herald-1b's RETURN on
+  d502ae21): the leader's zombie pins its pid, which is the session and
+  group id, so it is reaped exactly once, after the last signal, including
+  the KILL retries and the group fallback. `SessionOwner::signal` is the
+  one place signals are sent, and it refuses, as a custody error, once the
+  leader is reaped. The deadline loop no longer reaps a leader that exited
+  early (it was `try_wait`): it sees the zombie without reaping it (`/proc`
+  state on Linux; on macOS a zombie's process details cannot be read).
+- **The listing runs no subprocess** (the critic's P2 on d502ae21): Linux
+  reads `/proc` instead of running `ps`, which could hang and stall the
+  stop past every bound. A `/proc` that cannot be read is a listing failure
+  and takes the group fallback.
   Debug points:
   - `session-term`: the TERM fails; KILL still runs;
   - `session-kill`: the KILL is skipped, so a TERM-ignoring member survives;
   - `session-list`: every listing in the stop fails;
-  - `session-signal-one`: the stop's first KILL to a member fails, once.
+  - `session-signal-one`: the stop's first KILL to a member fails, once;
+  - `survivor-start`: a survivor's start cannot be read.
 - **Old records always parse** (review R3): a place record keeps `custody`
   and `admission` as the JSON its place wrote, so a run finalized by the 4a
   binary still completes under `ferry record`.

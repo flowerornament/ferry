@@ -2404,9 +2404,9 @@ fn a_stop_that_cannot_list_its_session_still_kills_it() {
         "{record}"
     );
     assert!(
-        record["custody"]["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("session-list")),
+        record["custody"]["error"].as_str().is_some_and(
+            |error| error.contains("session-list") && !error.contains("already reaped")
+        ),
         "{record}"
     );
     assert!(
@@ -2460,7 +2460,7 @@ fn a_failed_kill_to_one_member_still_empties_the_session() {
     assert!(
         record["custody"]["error"]
             .as_str()
-            .is_some_and(|error| error.contains("SIGKILL")),
+            .is_some_and(|error| error.contains("SIGKILL") && !error.contains("already reaped")),
         "{record}"
     );
     assert!(
@@ -2477,6 +2477,89 @@ fn a_failed_kill_to_one_member_still_empties_the_session() {
         kill(Pid::from_raw(pid), None).is_err(),
         "the member survived"
     );
+}
+
+/// A survivor whose start cannot be read, though it is alive, is reported
+/// with `start: null` and the error noted, never hidden (4b review R6).
+#[test]
+fn a_live_survivor_whose_start_cannot_be_read_is_still_reported() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("survivor.pid");
+    let dir = fixture(
+        &format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {p}.tmp; mv {p}.tmp {p}; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let _survivor = Owned(pidfile.clone());
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "session-kill,survivor-start")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let pid: i64 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The loop's own `sleep` may be listed too; every entry is kept.
+    let survivors = record["custody"]["survivors"].as_array().unwrap();
+    assert!(
+        survivors.contains(&serde_json::json!({"pid": pid, "start": null})),
+        "{record}"
+    );
+    assert!(survivors.iter().all(|s| s["start"].is_null()), "{record}");
+    assert!(
+        record["custody"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("survivor-start")),
+        "{record}"
+    );
+}
+
+/// The stop's listing runs no subprocess: a `ps` that hangs cannot stall
+/// the stop past its bounds (the critic's P2 on d502ae21). Linux; macOS reads
+/// the process table through libproc.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hanging_ps_cannot_stall_the_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let ran = tmp.path().join("ps-ran");
+    fs::write(
+        bin.join("ps"),
+        format!("#!/bin/sh\ntouch {}\nexec sleep 120\n", ran.display()),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("ps"), fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = fixture("echo ran", "");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let started = Instant::now();
+    let out = ferry(dir.path())
+        .env("PATH", path)
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(
+        record["custody"]["survivors"],
+        serde_json::json!([]),
+        "{record}"
+    );
+    assert!(
+        started.elapsed() < limits::TEARDOWN,
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!ran.exists(), "the stop ran ps");
 }
 
 /// A survivor holding a lock (SPEC §12.9): a session member that ignores
