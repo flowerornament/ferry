@@ -2142,12 +2142,9 @@ fn a_survivor_holding_the_output_pipe_cannot_keep_the_run() {
         ),
         "",
     );
-    // Debug builds keep the survivor alive on Linux too.
-    let out = bounded_output(
-        ferry(dir.path())
-            .env("FERRY_FAIL_AT", "stop-survivors")
-            .args(["run", "probe", "--local", "--json"]),
-    );
+    // The setsid writer leaves the run's session, so the stop does not reach
+    // it: it outlives the run, holding the output pipe.
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
     let record = receipt(&out);
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     assert!(
@@ -2359,6 +2356,115 @@ fn a_session_member_that_ignores_term_is_killed_after_the_grace() {
     );
     assert!(
         started.elapsed() >= limits::STOP_GRACE,
+        "{:?}",
+        started.elapsed()
+    );
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        kill(Pid::from_raw(pid), None).is_err(),
+        "the member survived"
+    );
+}
+
+/// The stop never gives up early (4b review R4): when the session cannot
+/// be listed, the leader's group is signalled, the KILL still follows, the
+/// member is gone, and the survivors are unknown because the final listing
+/// failed.
+#[test]
+fn a_stop_that_cannot_list_its_session_still_kills_it() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("member.pid");
+    let dir = fixture(
+        &format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {p}.tmp; mv {p}.tmp {p}; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let _member = Owned(pidfile.clone());
+    let started = Instant::now();
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "session-list")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["state"], "final", "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(
+        record["custody"]["survivors"],
+        serde_json::json!("unknown"),
+        "{record}"
+    );
+    assert!(
+        record["custody"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("session-list")),
+        "{record}"
+    );
+    assert!(
+        started.elapsed() < limits::TEARDOWN,
+        "{:?}",
+        started.elapsed()
+    );
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        kill(Pid::from_raw(pid), None).is_err(),
+        "the member survived"
+    );
+}
+
+/// The stop never gives up early (4b review R4): one failed KILL is kept
+/// as the custody error, every other member is still signalled, the leader
+/// is reaped, and the member is killed again within the grace.
+#[test]
+fn a_failed_kill_to_one_member_still_empties_the_session() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("member.pid");
+    let dir = fixture(
+        &format!(
+            "sh -c 'trap \"\" TERM; echo $$ > {p}.tmp; mv {p}.tmp {p}; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let _member = Owned(pidfile.clone());
+    let started = Instant::now();
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "session-signal-one")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["state"], "final", "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(
+        record["custody"]["survivors"],
+        serde_json::json!([]),
+        "{record}"
+    );
+    assert!(
+        record["custody"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("SIGKILL")),
+        "{record}"
+    );
+    assert!(
+        started.elapsed() < limits::TEARDOWN,
         "{:?}",
         started.elapsed()
     );

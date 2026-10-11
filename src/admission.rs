@@ -80,11 +80,25 @@ pub fn admit(root: &Path, admission: &mut Admission) -> Result<()> {
         "path": path.display().to_string(),
         "sha256": crate::receipt::digest(&bytes),
     }));
-    let policy: Policy = toml::from_str(std::str::from_utf8(&bytes)?)
+    let text = std::str::from_utf8(&bytes)?;
+    // The version first, whatever else the file holds: a version 2 policy
+    // (with its `evict` block) gets the retirement and its remedy, not a
+    // schema error. Unknown fields of a version 1 policy still refuse.
+    let version = toml::from_str::<toml::Value>(text)
+        .ok()
+        .and_then(|value| value.get("version").and_then(toml::Value::as_integer));
+    if version == Some(2) {
+        return Err(format!(
+            "host policy {}: version 2 eviction is retired: keep min_free_bytes as version 1",
+            path.display()
+        )
+        .into());
+    }
+    let policy: Policy = toml::from_str(text)
         .map_err(|e| format!("host policy {} is malformed: {e}", path.display()))?;
     if policy.version != 1 {
         return Err(format!(
-            "host policy {} is not a supported version 1 policy (version 2 eviction is retired: keep min_free_bytes as version 1)",
+            "host policy {} is not a supported version 1 policy",
             path.display()
         )
         .into());

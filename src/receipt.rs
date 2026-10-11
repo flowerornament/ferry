@@ -121,9 +121,10 @@ pub struct Receipt {
     /// The host lease the session held: `shared` or `exclusive`, and its wait.
     #[serde(default)]
     pub lease: Option<crate::lock::Lease>,
-    /// The host's disk admission: policy, measurements, evictions, verdict.
+    /// The host's disk admission, as its place wrote it (its shape changed
+    /// in slice 4b).
     #[serde(default)]
-    pub admission: Option<crate::admission::Admission>,
+    pub admission: Option<serde_json::Value>,
     /// The provider capabilities the project required.
     #[serde(default)]
     pub provider_requires: Vec<String>,

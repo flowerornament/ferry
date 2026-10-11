@@ -41,12 +41,15 @@ pub struct HostResult {
     pub source_rev: Option<String>,
     #[serde(default)]
     pub exe: Option<String>,
+    /// Kept as the place wrote it: a record of an older shape must always
+    /// parse, or `ferry record` could never complete its run (4b's review R3).
     #[serde(default)]
-    pub custody: Option<crate::custody::Release>,
+    pub custody: Option<serde_json::Value>,
     #[serde(default)]
     pub lease: Option<crate::lock::Lease>,
+    /// As the place wrote it, for the same reason as `custody`.
     #[serde(default)]
-    pub admission: Option<crate::admission::Admission>,
+    pub admission: Option<serde_json::Value>,
     /// What reached `output.log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<crate::run::Output>,
@@ -286,11 +289,12 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     // then close locks): each passes to `held` as it is taken, and `held`
     // drops only after finalize, on every path.
     let mut held = crate::lock::Held::default();
+    let mut admission = None;
     // A panic anywhere in here is caught, so the verdict is still recorded
     // with `held` intact, and the locks still close only after finalize.
     let executed: Result<crate::run::Ended> = std::panic::catch_unwind(
         std::panic::AssertUnwindSafe(|| -> Result<crate::run::Ended> {
-            let seat = execution::prepare(root, &request, &stop, &mut result.admission, &mut held)?;
+            let seat = execution::prepare(root, &request, &stop, &mut admission, &mut held)?;
             assert!(
                 !execution::fail_at("supervise-panic"),
                 "injected by FERRY_FAIL_AT"
@@ -307,7 +311,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
                     format!("custody release failed: {error}"),
                 );
             }
-            result.custody = Some(finished.custody);
+            result.custody = serde_json::to_value(finished.custody).ok();
             for after in finished.notes {
                 note(&mut result.reason, after);
             }
@@ -328,6 +332,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         }),
     )
     .unwrap_or_else(|_| Err("supervisor panicked".into()));
+    result.admission = admission.and_then(|admission| serde_json::to_value(admission).ok());
     // One verdict, from the first terminal fact (Rule B). A stop's signal is
     // the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));

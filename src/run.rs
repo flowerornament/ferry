@@ -36,65 +36,94 @@ struct SessionOwner {
 impl SessionOwner {
     /// Stops the session (SPEC §7): TERM to every member, up to
     /// `STOP_GRACE` for them to leave, KILL, then up to `KILL_GRACE` for them
-    /// to be gone. Returns the members still alive, by pid and start time.
-    fn stop(&mut self) -> Result<Vec<crate::custody::Survivor>> {
+    /// to be gone, killing again whatever is left. It never gives up early:
+    /// an error on the way is kept, and the stop goes on to the KILL and the
+    /// leader's reaping (4b review R4).
+    fn stop(&mut self) -> crate::custody::Stopped {
         self.stopped = true;
         let sid = self.child.id();
-        let others = || -> Result<bool> {
-            Ok(session_members(sid)?
-                .iter()
-                .any(|pid| u32::try_from(*pid).ok() != Some(sid)))
-        };
-        let termed = if fail_at("session-term") {
-            Err("session-term: injected by FERRY_FAIL_AT".into())
+        let mut errors = Vec::new();
+        if fail_at("session-term") {
+            errors.push("session TERM: injected by FERRY_FAIL_AT".to_owned());
         } else {
-            signal_session(sid, Signal::SIGTERM)
-        };
-        match termed {
-            Ok(()) => {
-                let until = Instant::now() + STOP_GRACE;
-                while Instant::now() < until && others()? {
-                    thread::sleep(Duration::from_millis(20));
-                }
+            signal_session(sid, Signal::SIGTERM, &mut errors);
+            // A listing that fails cannot confirm the others left, so the
+            // grace runs out.
+            let until = Instant::now() + STOP_GRACE;
+            while Instant::now() < until
+                && listed(sid).is_none_or(|members| {
+                    members
+                        .iter()
+                        .any(|pid| u32::try_from(*pid).ok() != Some(sid))
+                })
+            {
+                thread::sleep(Duration::from_millis(20));
             }
-            // KILL still follows; the failed TERM is a note.
-            Err(error) => note_after(format!("session TERM: {error}")),
         }
-        if !fail_at("session-kill") {
-            signal_session(sid, Signal::SIGKILL)?;
+        let killing = !fail_at("session-kill");
+        if killing {
+            signal_session(sid, Signal::SIGKILL, &mut errors);
         }
         // Also handles failure before the child called setsid.
         match self.child.kill() {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-            Err(e) => return Err(format!("kill session leader {sid}: {e}").into()),
+            Err(e) => errors.push(format!("kill session leader {sid}: {e}")),
         }
-        self.child
-            .wait()
-            .map_err(|e| format!("wait for session leader {sid}: {e}"))?;
+        if let Err(e) = self.child.wait() {
+            errors.push(format!("wait for session leader {sid}: {e}"));
+        }
         let until = Instant::now() + KILL_GRACE;
-        let mut left = session_members(sid)?;
-        while !left.is_empty() && Instant::now() < until {
+        let mut left = session_list(sid);
+        while Instant::now() < until && !left.as_ref().is_ok_and(Vec::is_empty) {
             thread::sleep(Duration::from_millis(20));
-            left = session_members(sid)?;
+            // Again, for whatever a failed signal or listing missed; the
+            // first pass's errors are already kept.
+            if killing {
+                signal_session(sid, Signal::SIGKILL, &mut Vec::new());
+            }
+            left = session_list(sid);
         }
-        Ok(left
-            .into_iter()
-            .map(|pid| crate::custody::Survivor {
-                pid,
-                start: crate::record::start_time(pid)
-                    .ok()
-                    .and_then(|start| u64::try_from(start).ok()),
-            })
-            .collect())
+        let survivors = match left {
+            // A member whose start cannot be read has gone (R6).
+            Ok(pids) => Some(
+                pids.into_iter()
+                    .filter_map(|pid| {
+                        let start = crate::record::start_time(pid).ok()?;
+                        Some(crate::custody::Survivor {
+                            pid,
+                            start: u64::try_from(start).ok(),
+                        })
+                    })
+                    .collect(),
+            ),
+            Err(error) => {
+                errors.push(format!("list session {sid}: {error}"));
+                None
+            }
+        };
+        crate::custody::Stopped { survivors, errors }
     }
 }
 impl Drop for SessionOwner {
     fn drop(&mut self) {
         if !self.stopped {
-            crate::custody::note(self.stop().map_err(|e| e.to_string()));
+            crate::custody::note(self.stop());
         }
     }
+}
+
+/// The session's members, as the stop lists them (`session-list` injects a
+/// failure).
+fn session_list(sid: u32) -> Result<Vec<i32>> {
+    if fail_at("session-list") {
+        return Err("session-list: injected by FERRY_FAIL_AT".into());
+    }
+    session_members(sid)
+}
+
+fn listed(sid: u32) -> Option<Vec<i32>> {
+    session_list(sid).ok()
 }
 
 pub fn session_members(sid: u32) -> Result<Vec<i32>> {
@@ -108,8 +137,8 @@ pub fn session_members(sid: u32) -> Result<Vec<i32>> {
         .collect())
 }
 
-/// A zombie has exited and holds nothing. Under the custody subreaper,
-/// killed session members wait as zombies until the release census reaps them.
+/// A zombie has exited and holds nothing, though it is listed until its
+/// parent reaps it: a session member that is a zombie is not a survivor.
 #[cfg(target_os = "linux")]
 fn zombie(pid: i32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -127,7 +156,7 @@ fn zombie(_pid: i32) -> bool {
 #[cfg(target_os = "macos")]
 fn process_ids() -> Result<Vec<i32>> {
     // Apple's ps executable cannot be spawned in the Darwin Nix sandbox.
-    // Read the same OS census directly, without weakening the sandbox.
+    // Read the process table directly, without weakening the sandbox.
     Ok(
         libproc::processes::pids_by_type(libproc::processes::ProcFilter::All)?
             .into_iter()
@@ -144,17 +173,43 @@ fn process_ids() -> Result<Vec<i32>> {
         .filter_map(|line| line.trim().parse().ok())
         .collect())
 }
-fn signal_session(sid: u32, signal: Signal) -> Result<()> {
+/// Signals every member of the session, keeping each error. When the
+/// session cannot be listed, the leader's process group (the session, unless
+/// a member moved to its own group) is signalled instead.
+fn signal_session(sid: u32, signal: Signal, errors: &mut Vec<String>) {
     // The retained session leader keeps the SID from being reused until reaped.
-    for pid in session_members(sid)? {
-        match kill(Pid::from_raw(pid), signal) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(e) => {
-                return Err(format!("signal {signal:?} to session {sid} member {pid}: {e}").into());
+    let members = match session_list(sid) {
+        Ok(members) => members,
+        Err(error) => {
+            errors.push(format!("list session {sid} for {signal:?}: {error}"));
+            let group = i32::try_from(sid).map(Pid::from_raw);
+            match group.map(|group| nix::sys::signal::killpg(group, signal)) {
+                Ok(Ok(()) | Err(nix::errno::Errno::ESRCH)) => {}
+                Ok(Err(e)) => errors.push(format!("signal {signal:?} to group {sid}: {e}")),
+                Err(e) => errors.push(format!("session {sid}: {e}")),
             }
+            return;
+        }
+    };
+    for pid in members {
+        let signalled = if signal == Signal::SIGKILL && signal_one_fails() {
+            Err(nix::errno::Errno::EPERM)
+        } else {
+            kill(Pid::from_raw(pid), signal)
+        };
+        match signalled {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => errors.push(format!(
+                "signal {signal:?} to session {sid} member {pid}: {e}"
+            )),
         }
     }
-    Ok(())
+}
+
+/// `session-signal-one`: the stop's first KILL to a member fails, once.
+fn signal_one_fails() -> bool {
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    fail_at("session-signal-one") && !FIRED.swap(true, Ordering::SeqCst)
 }
 pub fn attempted(root: &Path, request: &Request) -> bool {
     root.join("runs")
@@ -218,7 +273,7 @@ pub struct Finished {
 
 /// Runs the recipe and collect sessions, then custody release, while the
 /// locks are still held. No failure in between skips the release: every
-/// path collects, censuses and stops survivors, then reports.
+/// path collects, stops the session, then reports.
 pub fn run_released(
     root: &Path,
     workdir: &Path,
@@ -505,7 +560,7 @@ fn run_session(
         thread::sleep(Duration::from_millis(20));
     };
     // What the stop leaves is recorded, never chased (SPEC §7).
-    crate::custody::note(owner.stop().map_err(|e| e.to_string()));
+    crate::custody::note(owner.stop());
     // A process outside the session may still hold the pipe: its output is
     // not waited for past the drain, and that is reported.
     if done.recv_timeout(crate::limits::DRAIN).is_err() {

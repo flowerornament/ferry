@@ -1462,6 +1462,67 @@ fn version_one_guards_the_floor() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
 }
 
+/// A place record written by the 4a binary, with the old custody and
+/// admission shapes, still completes its run: `ferry record` keeps both as
+/// written (4b review R3, the critic's x1).
+#[test]
+fn ferry_record_completes_a_run_whose_record_has_the_old_shapes() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let old_custody = serde_json::json!({"census": "unsupported", "record": "none"});
+    let old_admission = serde_json::json!({
+        "policy": "not-configured", "floor_bytes": null, "filesystem": null,
+        "available_before": 7, "evicted": [], "skipped": {"busy": 0},
+        "available_after": 7, "result": "admitted",
+    });
+    let place = dir.path().join(format!(".ferry/local/records/{id}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&place).unwrap()).unwrap();
+    record["custody"] = old_custody.clone();
+    record["admission"] = old_admission.clone();
+    fs::write(&place, record.to_string()).unwrap();
+    // The caller had left it submitted, as a killed caller does.
+    let path = dir.path().join(format!(".ferry/receipts/{id}.json"));
+    let mut stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    stored["state"] = "submitted".into();
+    stored["outcome"] = "lost".into();
+    stored["exit_code"] = 255.into();
+    fs::write(&path, stored.to_string()).unwrap();
+    let out = run(dir.path(), &["record", &id]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(after["state"], "final", "{after}");
+    assert_eq!(after["outcome"], "ran-pass", "{after}");
+    assert_eq!(after["custody"], old_custody, "{after}");
+    assert_eq!(after["admission"], old_admission, "{after}");
+}
+
+/// A real version 2 policy, with its `evict` block, gets the retirement and
+/// its remedy, not a schema error (murail-4a's db0c1892).
+#[test]
+fn an_actual_version_two_eviction_policy_names_the_version_one_remedy() {
+    let dir = fixture();
+    with_host_policy(
+        dir.path(),
+        "version = 2\nmin_free_bytes = 1\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    let record = receipt(&out);
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("version 2 eviction is retired")
+            && reason.contains("keep min_free_bytes as version 1"),
+        "{record}"
+    );
+}
+
 /// Eviction is retired with the idle records it read: a version 2 policy
 /// refuses, naming what to keep (slice 4b; seats are bounded by slice 5).
 #[test]

@@ -207,10 +207,21 @@ custody: { tier: "session",
   this as a parse failure on the first run. The receipt keeps custody as
   JSON, so stored receipts of the old shape still load.
 - **Session stop** (`run::SessionOwner::stop`): TERM to every member, up to
-  `STOP_GRACE` (10 s), KILL, then up to `KILL_GRACE` (2 s). The members left
-  are the survivors. Debug points:
-  - `session-term`: the TERM fails; it becomes a note, and KILL still runs;
-  - `session-kill`: the KILL is skipped, so a TERM-ignoring member survives.
+  `STOP_GRACE` (10 s), KILL, then up to `KILL_GRACE` (2 s), killing again
+  whatever is left. The members left are the survivors, without any whose
+  start can no longer be read: it has gone (review R6). The stop never gives
+  up early (review R4): every member is signalled and each error kept; a
+  failed listing signals the leader's process group instead; the KILL and
+  the leader's reaping always follow. The errors are the custody `error`,
+  and the survivors are `"unknown"` only when the final listing fails.
+  Debug points:
+  - `session-term`: the TERM fails; KILL still runs;
+  - `session-kill`: the KILL is skipped, so a TERM-ignoring member survives;
+  - `session-list`: every listing in the stop fails;
+  - `session-signal-one`: the stop's first KILL to a member fails, once.
+- **Old records always parse** (review R3): a place record keeps `custody`
+  and `admission` as the JSON its place wrote, so a run finalized by the 4a
+  binary still completes under `ferry record`.
   `SESSION_CLEANUP` is gone; `TEARDOWN` is recomputed from the two stops.
 - **Deleted:**
   - the census, subreaper and `reap_adopted`;
@@ -235,3 +246,11 @@ custody: { tier: "session",
 - **Size:** src 6260 after 4a → 5126 after the behaviour → 5150 after the
   move: 4b −1110, so slices 4a+4b come to −800. Slice 5's estimated +200
   leaves slices 4–5 near 5350, below 5950.
+- **Residue (review R5):** a session leaver that closed its descriptors
+  holds no lock, so the next run takes the seat while it lives. It can then
+  write into that run's checkout after `reset_checkout`'s integrity check,
+  and into the seat's cache. Ferry neither sees nor reports it. The scope
+  tier (ferry-xtx.20) is its cure. Proposed SPEC §11 row, replacing the
+  `exact commit` row (for the coordinator to amend):
+
+  | exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (until the scope tier) |

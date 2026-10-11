@@ -366,13 +366,17 @@ stopped: SIGTERM to every member, up to 10 s for them to leave, SIGKILL, and
 up to 2 s for them to be gone. The receipt's `custody` records:
 - `tier`: `session`;
 - `survivors`: the members still alive after that, by pid and start time, or
-  `"unknown"` if the session could not be listed;
-- `error`, if the stop could not complete. The verdict stands.
+  `"unknown"` if the session could not be listed at the end;
+- `error`: what failed on the way (a signal, a listing). The stop never
+  gives up early: it goes on to the KILL and the leader's reaping, and the
+  verdict stands.
 
 Ferry proves nothing beyond the session. A process that left it (`setsid`,
 a double fork) is not chased. If it keeps the run's locks, the seat stays
 busy until it exits, and the next run's refusal names the run it outlived
-("held after run <id> ended"): stop it by its exact pid. There is no taint,
+("held after run <id> ended"): stop it by its exact pid. One that also
+closed its descriptors holds nothing, and can write into a later run's
+checkout or the seat's cache unseen; the scope tier will cure that. There is no taint,
 owner marker, idle record, quarantine or `seat recover`.
 
 **Locks outlive a killed supervisor.** The seat lock and host lease are

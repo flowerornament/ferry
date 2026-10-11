@@ -37,7 +37,8 @@ pub struct Release {
     /// is not built yet.
     pub tier: String,
     pub survivors: Survivors,
-    /// Why a session stop could not complete; its survivors are unknown.
+    /// What failed during a session stop. The stop went on regardless; the
+    /// survivors are unknown only when the final listing failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -45,9 +46,16 @@ pub struct Release {
 /// What this run's session stops found (recipe, then collect).
 static FOUND: Mutex<Option<Release>> = Mutex::new(None);
 
-/// Adds one session stop's result: the members alive after it, or why
-/// they could not be listed.
-pub fn note(stopped: Result<Vec<Survivor>, String>) {
+/// What one session stop came to: the members alive after it (`None` when
+/// the last listing failed), and every error on the way.
+pub struct Stopped {
+    pub survivors: Option<Vec<Survivor>>,
+    pub errors: Vec<String>,
+}
+
+/// Adds one session stop's result. Survivors are unknown only when a final
+/// listing failed; errors on the way are the release's error either way.
+pub fn note(stopped: Stopped) {
     let Ok(mut found) = FOUND.lock() else {
         return;
     };
@@ -56,13 +64,17 @@ pub fn note(stopped: Result<Vec<Survivor>, String>) {
         survivors: Survivors::Listed(vec![]),
         error: None,
     });
-    match (stopped, &mut release.survivors) {
-        (Ok(more), Survivors::Listed(list)) => list.extend(more),
-        (Ok(_), Survivors::Unknown(_)) => {}
-        (Err(error), _) => {
-            release.survivors = Survivors::Unknown(Unknown::Unknown);
-            release.error = Some(error);
-        }
+    match (stopped.survivors, &mut release.survivors) {
+        (Some(more), Survivors::Listed(list)) => list.extend(more),
+        (Some(_), Survivors::Unknown(_)) => {}
+        (None, _) => release.survivors = Survivors::Unknown(Unknown::Unknown),
+    }
+    if !stopped.errors.is_empty() {
+        let error = stopped.errors.join("; ");
+        release.error = Some(match release.error.take() {
+            Some(before) => format!("{before}; {error}"),
+            None => error,
+        });
     }
 }
 
