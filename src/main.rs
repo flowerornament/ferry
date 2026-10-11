@@ -225,6 +225,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         args: options.args.clone(),
         provider_requires: config.provider.requires.clone(),
         wait_seconds: options.wait_seconds,
+        waits_end_ms: None,
     };
     record.token = Some(request.token.clone());
     if matches!(route, config::Route::Remote(_)) {
@@ -283,18 +284,14 @@ fn attach(id: &str, follow: bool) -> Result<i32> {
     let mut record = receipt::load(&root, id)?;
     if record.state.as_deref() == Some("submitted") {
         let place = place_of(&root, &record, &hosts)?;
-        let done = if follow {
-            transport::finish(&root, &place, &mut record, false)
+        if follow {
+            transport::finish(&root, &place, &mut record, false);
+            receipt::save(&root, &record)?;
         } else {
-            transport::complete(&root, &place, &mut record)
-        };
-        match done {
-            Ok(()) => receipt::save(&root, &record)?,
-            Err(error) if follow => {
-                record.reason = Some(error.to_string());
-                receipt::save(&root, &record)?;
+            match transport::complete(&root, &place, &mut record) {
+                Ok(()) => receipt::save(&root, &record)?,
+                Err(error) => execution::warn(&format!("ferry: {error}")),
             }
-            Err(error) => execution::warn(&format!("ferry: {error}")),
         }
     }
     execution::emit(serde_json::to_string_pretty(&record)?.as_bytes());

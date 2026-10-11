@@ -673,6 +673,113 @@ fn a_caller_whose_stop_fails_or_that_is_signalled_twice_leaves_the_receipt_submi
     }
 }
 
+/// A signal after the run is final (critic C6), while its output is still
+/// on the way to a slow reader: the verdict stands, every byte arrives, and
+/// the caller exits with the run's code, not "not stopped" and 255.
+#[test]
+fn a_signal_after_the_run_is_final_keeps_its_verdict_and_every_byte() {
+    use std::io::Read;
+    let dir = fixture("head -c 4000000 /dev/zero; echo done", "");
+    let mut caller = Caller(
+        ferry(dir.path())
+            .args(["run", "probe", "--local", "--timeout-seconds", "60"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    // Nobody reads its stdout yet: a slow consumer.
+    let records = dir.path().join(".ferry/local/records");
+    only_record(&records);
+    thread::sleep(Duration::from_millis(500));
+    kill(
+        Pid::from_raw(i32::try_from(caller.0.id()).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+    let mut stdout = caller.0.stdout.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut all = Vec::new();
+        let _ = stdout.read_to_end(&mut all);
+        all.len()
+    });
+    let mut stderr = String::new();
+    caller
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let mut code = None;
+    wait_until("the caller ended", || {
+        code = caller.0.try_wait().unwrap().map(|status| status.code());
+        code.is_some()
+    });
+    assert_eq!(code.flatten(), Some(0), "{stderr}");
+    assert_eq!(reader.join().unwrap(), 4_000_005, "{stderr}");
+    let receipt = only_receipt_file(dir.path());
+    assert_eq!(receipt["state"], "final", "{receipt}");
+    assert_eq!(receipt["outcome"], "ran-pass", "{receipt}");
+}
+
+/// The first stop decides (critic C2): a later stop with another signal is
+/// accepted and changes nothing, neither the signal nor `stopped_by`.
+#[test]
+fn a_second_stop_changes_nothing() {
+    let scratch = tempfile::tempdir().unwrap();
+    let started = scratch.path().join("started");
+    // It takes 3 s to leave once stopped, so the second stop always comes
+    // before the verdict.
+    let dir = fixture(
+        &format!(
+            "trap 'sleep 3; exit 1' INT TERM; touch {}; while :; do sleep 0.1; done",
+            started.display()
+        ),
+        "",
+    );
+    let _caller = Caller(
+        ferry(dir.path())
+            .args(["run", "probe", "--local", "--timeout-seconds", "60"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("the recipe started", || started.exists());
+    let id = only_receipt_file(dir.path())["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let state = dir.path().join(".ferry/local");
+    let stop = |who: &str, signal: &str| {
+        Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .args(["place", "--state"])
+            .arg(&state)
+            .args([
+                "stop", &id, "--seat", "x", "--who", who, "--why", "w", "--other", "--signal",
+                signal,
+            ])
+            .output()
+            .unwrap()
+    };
+    assert!(stop("first", "2").status.success());
+    let second = stop("second", "15");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let record = only_record(&state.join("records"));
+    assert_eq!(record["outcome"], "stopped", "{record}");
+    assert_eq!(record["exit_code"], 130, "{record}");
+    assert_eq!(record["stopped_by"]["who"], "first", "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("SIGINT"),
+        "{record}"
+    );
+}
+
 #[test]
 fn ferry_stop_stops_its_own_run_and_refuses_anothers_without_a_reason() {
     let scratch = tempfile::tempdir().unwrap();
@@ -775,13 +882,17 @@ fn a_callers_signal_after_the_verdict_is_named_and_keeps_it() {
 
 #[test]
 fn the_deadline_ends_a_run_with_no_client() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
     let scratch = tempfile::tempdir().unwrap();
     let started = scratch.path().join("started");
-    // Long enough to start under load: the deadline must kill a recipe
-    // that is running, not one that never began.
     let dir = fixture(&format!("touch {}; sleep 600", started.display()), "");
+    // The deadline, 30 s after submit (long enough to start under load),
+    // ends it; the timeout, 600 s, never could within this test.
     let mut caller = ferry(dir.path())
-        .args(["run", "probe", "--local", "--timeout-seconds", "30"])
+        .env("FERRY_DEADLINE_MS", "30000")
+        .args(["run", "probe", "--local", "--timeout-seconds", "600"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -789,13 +900,107 @@ fn the_deadline_ends_a_run_with_no_client() {
     wait_until("the recipe started", || started.exists());
     caller.kill().unwrap();
     caller.wait().unwrap();
-    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let records = dir.path().join(".ferry/local/records");
+    let bound = Instant::now() + Duration::from_secs(30) + common::slack();
+    let host = loop {
+        let host = fs::read_dir(&records).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| !p.to_string_lossy().ends_with(".reserved.json"))
+                .and_then(|p| serde_json::from_slice::<serde_json::Value>(&fs::read(p).ok()?).ok())
+        });
+        if let Some(host) = host {
+            break host;
+        }
+        assert!(Instant::now() < bound, "the deadline did not end the run");
+        thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(host["outcome"], "timeout", "{host}");
     assert_eq!(host["exit_code"], 124, "{host}");
-    assert!(host["deadline_ms"].is_u64(), "{host}");
+    assert_eq!(
+        host["deadline_ms"].as_u64().unwrap() - host["submitted_ms"].as_u64().unwrap(),
+        30_000,
+        "{host}"
+    );
     // The session was stopped with it.
     let owners = dir.path().join(".ferry/local/owners");
     assert!(!owners.exists() || fs::read_dir(&owners).unwrap().count() == 0);
+}
+
+/// One wait budget for all of a run's locks (critic C3): seat, gate and
+/// host each held in turn for less than the wait must not add up past it.
+/// Every wait ends by submitted + wait, so the deadline holds by
+/// construction; the run is refused naming a holder.
+#[test]
+fn the_lock_waits_together_end_by_one_bound() {
+    use fs2::FileExt;
+    let dir = fixture("echo ran", "");
+    // One run to create the seat's lock and learn its name.
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let locks = dir.path().join(".ferry/local/locks");
+    let seat = fs::read_dir(&locks)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-default")
+        })
+        .unwrap();
+    let hold = |p: &Path| {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(p)
+            .unwrap();
+        file.lock_exclusive().unwrap();
+        file
+    };
+    let (seat_lock, gate, host) = (
+        hold(&seat),
+        hold(&locks.join("host-gate")),
+        hold(&locks.join("host-exclusive")),
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let stdout = scratch.path().join("out");
+    let mut caller = Caller(
+        ferry(dir.path())
+            .args(["run", "probe", "--local", "--json", "--wait-seconds", "4"])
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // Each held 3 s, under the 4 s wait; together 9 s.
+    for lock in [seat_lock, gate, host] {
+        thread::sleep(Duration::from_secs(3));
+        drop(lock);
+    }
+    let mut code = None;
+    wait_until("the caller ended", || {
+        code = caller.0.try_wait().unwrap().map(|status| status.code());
+        code.is_some()
+    });
+    let record = receipt(&Output {
+        status: caller.0.wait().unwrap(),
+        stdout: fs::read(&stdout).unwrap(),
+        stderr: vec![],
+    });
+    assert_eq!(code.flatten(), Some(125), "{record}");
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("held by"),
+        "{record}"
+    );
 }
 
 #[test]

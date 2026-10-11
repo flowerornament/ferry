@@ -490,7 +490,8 @@ pub fn run_on(
                 .as_bytes(),
         );
     }
-    finish(root, place, record, json)
+    finish(root, place, record, json);
+    Ok(())
 }
 
 /// How following a run ended.
@@ -506,15 +507,22 @@ enum Followed {
 /// Follows a run to its end, then completes the receipt from the place's
 /// final record. If the run's end cannot be seen, the receipt stays
 /// submitted: the run may go on, and `ferry record <id>` finishes it later.
-pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) -> Result<()> {
+pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) {
     let id = record.id.clone();
-    let left = match follow(root, place, record, json)? {
-        Followed::Final => return complete(root, place, record),
-        Followed::Unreachable => format!(
+    // After the place accepted the run, only its final record decides: any
+    // other failure leaves the receipt submitted (A3, rule B).
+    let followed = follow(root, place, record, json);
+    let left = match followed {
+        Ok(Followed::Final) => match complete(root, place, record) {
+            Ok(()) => return,
+            Err(error) => format!("{error}; the run's verdict is on the place: ferry record {id}"),
+        },
+        Err(error) => format!("{error}; the run may go on: ferry record {id}"),
+        Ok(Followed::Unreachable) => format!(
             "the place did not answer for {:?}; the run may go on: ferry record {id}",
             unreachable()
         ),
-        Followed::NotStopped => {
+        Ok(Followed::NotStopped) => {
             let until = record.deadline_ms.map_or_else(
                 || "its deadline".to_owned(),
                 |ms| {
@@ -528,7 +536,7 @@ pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) -> R
             execution::warn(&format!("ferry: {left}"));
             left
         }
-        Followed::Left(signal) => format!(
+        Ok(Followed::Left(signal)) => format!(
             "left at a second {} while the run was stopping: ferry record {id}",
             execution::signal_name(signal)
         ),
@@ -538,7 +546,6 @@ pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) -> R
     record.outcome = Outcome::Lost;
     record.exit_code = 255;
     note(&mut record.reason, left);
-    Ok(())
 }
 
 /// Writes the run's output as the place logs it, from offset 0, reconnecting
@@ -551,6 +558,9 @@ fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Fo
     let mut contact = std::time::Instant::now();
     let mut backoff = Duration::from_secs(1);
     let mut stopping: Option<(i32, std::sync::Arc<AtomicBool>)> = None;
+    // A signal that came after the run was final: the verdict stands, and
+    // the follow delivers every byte; a second signal leaves with it.
+    let mut ended: Option<std::sync::Arc<AtomicBool>> = None;
     loop {
         let mut child = place
             .verb(&[
@@ -599,31 +609,42 @@ fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Fo
                 }
                 Some(_) if checked.elapsed() >= Duration::from_secs(1) => {
                     checked = std::time::Instant::now();
-                    if place
-                        .verb(&["record", &record.id])?
-                        .output()?
-                        .status
-                        .success()
-                    {
+                    if is_final(place, record)? {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Ok(Followed::Final);
                     }
                 }
                 Some(_) => {}
-                None => {
-                    if let Some(signal) = execution::caught_signal() {
-                        // Watch for a second signal before asking, so one
-                        // that arrives while the stop is delivered counts.
-                        let again = execution::stopped()?;
-                        if !ask_stop(root, place, record, signal) {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Ok(Followed::NotStopped);
-                        }
-                        stopping = Some((signal, again));
+                None => match &ended {
+                    Some(again) if again.load(Ordering::SeqCst) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(Followed::Final);
                     }
-                }
+                    Some(_) => {}
+                    None => {
+                        if let Some(signal) = execution::caught_signal() {
+                            // Watch for a second signal before asking, so one
+                            // that arrives while the stop is delivered counts.
+                            let again = execution::stopped()?;
+                            match stop(root, place, record, &stop_reason(signal), false, signal) {
+                                Ok(_) => stopping = Some((signal, again)),
+                                // Refused because the run already ended.
+                                Err(_) if is_final(place, record)? => ended = Some(again),
+                                Err(error) => {
+                                    execution::warn(&format!(
+                                        "ferry: stopping run {}: {error}",
+                                        record.id
+                                    ));
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    return Ok(Followed::NotStopped);
+                                }
+                            }
+                        }
+                    }
+                },
             }
             thread::sleep(Duration::from_millis(50));
         };
@@ -659,15 +680,17 @@ fn unreachable() -> Duration {
     crate::limits::UNREACHABLE
 }
 
-/// Asks the place to stop the run as its own caller. A failure is a note
-/// on stderr: following goes on, and a second signal leaves.
-fn ask_stop(root: &Path, place: &Place, record: &Receipt, signal: i32) -> bool {
-    let why = format!("caller received {}", execution::signal_name(signal));
-    let stopped = stop(root, place, record, &why, false, signal);
-    if let Err(error) = &stopped {
-        execution::warn(&format!("ferry: stopping run {}: {error}", record.id));
-    }
-    stopped.is_ok()
+fn stop_reason(signal: i32) -> String {
+    format!("caller received {}", execution::signal_name(signal))
+}
+
+/// Whether the place holds the run's final record.
+fn is_final(place: &Place, record: &Receipt) -> Result<bool> {
+    Ok(place
+        .verb(&["record", &record.id])?
+        .output()?
+        .status
+        .success())
 }
 
 /// The key that identifies this caller's seat on a place: the caller's host,
@@ -756,15 +779,25 @@ pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> 
             format!("artifact collection failed: {error}"),
         );
     }
+    // The verdict is the place's; a failed transfer of its artifacts is a
+    // note on it, never a reason to withhold it.
     if let Some(expected) = result.artifacts_sha256 {
-        let destination = root.join(".ferry/runs").join(&record.id);
-        fs::create_dir_all(&destination)?;
-        let archive = destination.join("artifacts.tar");
-        fs::write(&archive, place.read(&record.id, "artifacts.tar")?)?;
-        if receipt::file_digest(&archive)? != expected {
-            return Err("artifact transfer integrity failed".into());
+        let fetched = (|| -> Result<()> {
+            let destination = root.join(".ferry/runs").join(&record.id);
+            fs::create_dir_all(&destination)?;
+            let archive = destination.join("artifacts.tar");
+            fs::write(&archive, place.read(&record.id, "artifacts.tar")?)?;
+            if receipt::file_digest(&archive)? != expected {
+                return Err("artifact transfer integrity failed".into());
+            }
+            crate::artifacts::unpack(&archive, &destination)
+        })();
+        if let Err(error) = fetched {
+            note(
+                &mut record.reason,
+                format!("artifacts not fetched: {error}"),
+            );
         }
-        crate::artifacts::unpack(&archive, &destination)?;
     }
     Ok(())
 }

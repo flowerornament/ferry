@@ -257,3 +257,39 @@ installs already happen. Slice 7 keeps only the old-root sentinel.
 - **A5. Controls:** the wait bound (an exclusive holder → 125 naming it, a
   deadline recorded); a stop from another seat without `--other` refused;
   unreachable → `submitted`, then `ferry record` makes it final.
+
+## 11. Adversarial critic (2026-10-11, on 003d838c): returned, fixed
+
+Findings with reproductions (`/private/tmp/claude-501/ferry-critic-s23-evidence/`),
+each now a control with a knockout:
+
+- **C1:** one transient failure after the place accepted a run made the
+  receipt final `lost` (remote) or `refused` (local) for good. Now, once the
+  run is accepted, only the place's final record gives a verdict. Any other
+  failure leaves the receipt `submitted`, exit 255, with `ferry record <id>`.
+  A failed artifact transfer is a note on the verdict.
+- **C3:** each lock wait had its own `wait` budget, so three waits could
+  carry a run about 60 min past its deadline. Now all of a run's lock waits
+  end by submitted + wait, so the deadline holds by construction.
+- **C2:** a second stop's signal replaced the first's in the verdict. Now the
+  first stop decides: its signal is recorded in `stop.json`, and a later stop
+  only re-sends that signal.
+- **C6:** a signal after the run was final printed "not stopped", exited 255
+  and cut the output short. Now the follow delivers every byte, and the
+  caller exits with the run's code.
+- **T1:** the §12.6 control was ended by its timeout, not the deadline. A
+  debug-only `FERRY_DEADLINE_MS` now makes the deadline bind.
+- Also: a stop that arrives while the run prepares now spawns nothing.
+
+**Residues, accepted (reported, not chased):**
+
+- `ferry stop` has a pid-reuse window between its liveness check (pid and
+  start time) and the kill.
+- Stop ownership trusts the caller's `--seat` key: places run as one user,
+  so the owner check is advisory, not a security boundary.
+- The stored submitted receipt keeps "submitted; no verdict yet"; the
+  caller's next step is on stderr and in the `--json` event (R5).
+
+**Not here:** the exit code of a signal before dispatch (lost 128+n against
+SPEC §4's lost 255) is ferry-xtx.14, a consumer-visible decision. SPEC §6's
+`{refused, why, next}` goes to slice 4a.

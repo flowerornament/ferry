@@ -344,10 +344,10 @@ a quiet-host certificate, and it does not quiet:
 - other virtual machines on the same hardware;
 - Ferry binaries older than the lease.
 
-Every lock wait (the seat's and the host lease's) is bounded by
-`--wait-seconds` (default 30 min), apart from `--timeout-seconds`: past it the
-run refuses (125), naming the run that holds the lock exclusively, or "shared
-runs".
+A run's lock waits (the seat's and the host lease's) share one bound: all of
+them end by its submit plus `--wait-seconds` (default 30 min), apart from
+`--timeout-seconds`. Past it the run refuses (125), naming the run that holds
+the lock exclusively, or "shared runs".
 
 ### Custody: nothing a run starts outlives it
 
@@ -410,16 +410,25 @@ A run belongs to its place, not to the connection that asked for it:
 - **Follow.** The caller copies `runs/<id>/output.log` from a byte offset until
   the record is final and every byte before it has arrived. After a dropped
   connection it resumes from the bytes it has. If the place does not answer
-  for 5 min, the caller exits 255 and its receipt stays `submitted`.
+  for 5 min, the caller exits 255 and its receipt stays `submitted`. Once the
+  place has accepted a run, only its final record gives the receipt a
+  verdict: any other failure (reading that record, for one) leaves it
+  `submitted`, exit 255, with `ferry record <id>` as the next step. A failed
+  transfer of the run's artifacts is a note on its verdict.
 - **Stop.** The first INT, TERM or HUP of the caller asks the place to stop the
-  run (`stopped` 128+signal), and the caller keeps following to the record. If
-  the stop cannot be delivered, the caller prints `not stopped; continues
-  until its deadline in <n> min; ferry stop <id>` and exits 255. A second
-  signal leaves at once with 255. Either way the receipt stays `submitted`. A
-  caller killed outright stops nothing: the run goes on to its end or its
-  deadline.
+  run (`stopped` 128+signal), and the caller keeps following to the record.
+  The first stop decides: a later one, from anyone and with any signal, is
+  accepted and changes neither the signal nor `stopped_by`. If the stop cannot
+  be delivered, the caller prints `not stopped; continues until its deadline
+  in <n> min; ferry stop <id>` and exits 255. A second signal leaves at once
+  with 255. Either way the receipt stays `submitted`. A signal that comes
+  after the run is final changes nothing: the caller delivers the rest of
+  the output and exits with the run's code (a second signal leaves early,
+  still with it). A caller killed outright stops nothing: the run goes on to
+  its end or its deadline.
 - **Deadline.** Every run ends by `submitted + wait + timeout + teardown`
-  (`wait` is `--wait-seconds`, 30 min by default), which submit returns. A
+  (`wait` is `--wait-seconds`, 30 min by default, the one bound on all its
+  lock waits), which submit returns. A
   request without `--timeout-seconds` gets the place's maximum, 6 h (and none
   may ask for more).
 

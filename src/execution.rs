@@ -116,12 +116,17 @@ pub struct Request {
     // Omitted when empty, like args; a host that predates it refuses it.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub provider_requires: BTreeSet<String>,
-    /// How long the run may wait for each lock; the place's default if absent.
+    /// How long the run may wait for its locks, all together; the place's
+    /// default if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_seconds: Option<u64>,
+    /// When every lock wait ends (unix ms): submitted + wait, set by the
+    /// supervisor, so the waits together never pass the deadline.
+    #[serde(skip)]
+    pub waits_end_ms: Option<u128>,
 }
 impl Request {
-    /// The bound on each lock wait.
+    /// The bound on all lock waits together.
     pub fn wait(&self) -> Duration {
         self.wait_seconds
             .map_or(crate::limits::WAIT, Duration::from_secs)
@@ -253,8 +258,8 @@ pub fn interrupted() -> Result<()> {
 }
 
 /// Polls for a lock until it is granted, `stop` is set, `waiting` (run on
-/// every contended attempt) refuses, or `request`'s wait bound passes; then
-/// it refuses naming the holder. An exclusive holder writes its run id into
+/// every contended attempt) refuses, or the run's one wait budget ends
+/// (`waits_end_ms`, else `wait` from now); then it refuses naming the holder. An exclusive holder writes its run id into
 /// the lock file for that.
 fn acquire_as(
     path: &Path,
@@ -270,6 +275,9 @@ fn acquire_as(
         .truncate(false)
         .open(path)?;
     let started = Instant::now();
+    let ends_ms = request
+        .waits_end_ms
+        .unwrap_or_else(|| crate::receipt::now_ms() + request.wait().as_millis());
     let mut said = false;
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -290,7 +298,7 @@ fn acquire_as(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 waiting()?;
-                if started.elapsed() >= request.wait() {
+                if crate::receipt::now_ms() >= ends_ms {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     let holder = fs::read_to_string(path).unwrap_or_default();
                     let holder = match holder.trim() {
@@ -298,8 +306,8 @@ fn acquire_as(
                         id => format!("run {id}"),
                     };
                     return Err(format!(
-                        "waited {:?} for lock {name}: held by {holder}",
-                        request.wait()
+                        "waited {:?} for lock {name}, the end of the run's wait: held by {holder}",
+                        started.elapsed()
                     )
                     .into());
                 }
@@ -1026,6 +1034,10 @@ fn run_session(
     let spec = run_dir.join("request.json");
     fs::write(&spec, serde_json::to_vec(request)?)?;
     let result_path = run_dir.join("result.json");
+    // A stop that came while the run prepared: nothing is spawned.
+    if stop.load(Ordering::SeqCst) {
+        return Ok(Ended::Stopped);
+    }
     crate::seat::reserve(root, request)?;
     let (reader, writer) = std::io::pipe()?;
     let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks, writer)?;

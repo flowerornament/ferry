@@ -38,8 +38,9 @@ ferry run test --on bench --json       # NDJSON events, for tools
   long.
 - **Every run has a deadline:** submit + `--wait-seconds` (30 min by
   default) + timeout + teardown. It ends the run even with no caller.
-- **Waits are bounded.** A run waits for its seat and the host lease at most
-  `--wait-seconds`, then is refused (125) naming the run that holds it.
+- **Waits are bounded.** A run's waits for its seat and the host lease
+  together end `--wait-seconds` after it was submitted; then it is refused
+  (125) naming the run that holds the lock.
 - **Exclusive waits.** An exclusive run waits for in-flight runs on that
   machine and keeps new ones out. Use it only for measurements.
 - **The run is the machine's, not your terminal's.** Closing the terminal or

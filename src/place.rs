@@ -208,8 +208,17 @@ pub fn submit(root: &Path) -> Result<i32> {
 }
 
 /// One absolute deadline (SPEC §5): the lock waits, the run, and its
-/// teardown, from the moment the run was submitted.
+/// teardown, from the moment the run was submitted. Debug builds read
+/// `FERRY_DEADLINE_MS` (from submit), so a control can make the deadline,
+/// not the timeout, end a run.
 fn deadline_ms(submitted_ms: u128, request: &Request) -> u128 {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("FERRY_DEADLINE_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u128>().ok())
+    {
+        return submitted_ms + ms;
+    }
     submitted_ms
         + request.wait().as_millis()
         + u128::from(request.timeout_seconds.unwrap_or_default()) * 1000
@@ -245,12 +254,14 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         .append(true)
         .open(dir.join("supervisor.log"))?;
     nix::unistd::dup2_stderr(&log)?;
-    let request: Request = serde_json::from_slice(&fs::read(dir.join("request.json"))?)?;
+    let mut request: Request = serde_json::from_slice(&fs::read(dir.join("request.json"))?)?;
     let stop = execution::stopped()?;
     let mut result = HostResult::refused(&request)?;
     let reservation: record::Reservation = serde_json::from_slice(&fs::read(
         root.join("records").join(format!("{id}.reserved.json")),
     )?)?;
+    // One wait budget for all the run's locks, from its submit (SPEC §5).
+    request.waits_end_ms = Some(reservation.submitted_ms + request.wait().as_millis());
     let deadline = deadline_ms(reservation.submitted_ms, &request);
     result.deadline_ms = Some(deadline);
     record::reconcile_seat(root, &request.seat);
@@ -286,10 +297,12 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         result.lease = Some(host_lease.stamp());
         Ok(ended)
     })();
-    // One verdict, from the first terminal fact (Rule B).
+    // One verdict, from the first terminal fact (Rule B). A stop's signal is
+    // the first stop's, whatever arrived after it.
+    let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
     let (outcome, exit_code, reason) = execution::verdict(
         &executed.map_err(|error| error.to_string()),
-        execution::caught_signal(),
+        signal,
         execution::attempted(root, &request),
     );
     result.outcome = outcome;
@@ -442,6 +455,7 @@ pub fn stop(
     }
     let stopped = serde_json::json!({
         "who": who, "why": why, "other": other, "at_ms": receipt::now_ms(),
+        "signal": signal as i32,
     });
     let written = if execution::fail_at("stop-write") {
         Err("stop-write: injected by FERRY_FAIL_AT".into())
@@ -452,19 +466,36 @@ pub fn stop(
             None,
         )
     };
-    if let Err(error) = written
-        && !run_dir(root, id).join("stop.json").exists()
-    {
-        return Ok(refuse(&format!("recording the stop: {error}")));
-    }
+    // The first stop decides: a later one is accepted and changes nothing.
+    // It sends the first stop's signal again, in case that stop's sender
+    // died between recording and signalling.
+    let signal = match written {
+        Ok(()) => signal,
+        Err(error) => match first_stop_signal(&run_dir(root, id)) {
+            Some(first) => nix::sys::signal::Signal::try_from(first)?,
+            None => return Ok(refuse(&format!("recording the stop: {error}"))),
+        },
+    };
     nix::sys::signal::kill(pid, signal)?;
     reply(&serde_json::json!({"accepted": id}));
     Ok(0)
 }
 
+/// The signal the first recorded stop of a run asked for.
+fn first_stop_signal(dir: &Path) -> Option<i32> {
+    let stop: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("stop.json")).ok()?).ok()?;
+    stop["signal"]
+        .as_i64()
+        .and_then(|signal| i32::try_from(signal).ok())
+}
+
 /// Prints the run's final record (exit 0), or its reservation while it is
 /// not final (exit 3), or nothing for a run this place never had (exit 4).
 pub fn print_record(root: &Path, id: &str) -> Result<i32> {
+    if execution::fail_at("record-read") {
+        return Err("record-read: injected by FERRY_FAIL_AT".into());
+    }
     if let Some(bytes) = record::reconcile(root, id)? {
         execution::emit(&bytes);
         return Ok(0);

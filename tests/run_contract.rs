@@ -1170,8 +1170,9 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     fs::create_dir_all(&tools).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
     // FERRY_TEST_SLOW_PUSH names a marker: a git push touches it, then stalls.
-    // A file `unreachable` on the host fails every follow, as a dead link.
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    // A file `unreachable` on the host fails every follow, as a dead link;
+    // a file `fail-record-once` fails the next `place record`, once.
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
@@ -2281,6 +2282,69 @@ fn a_second_submit_follows_its_own_run_and_refuses_another() {
     // The test's own child, by its handle.
     live.kill().unwrap();
     live.wait().unwrap();
+}
+
+/// After the place accepted a run, only its final record gives a verdict: a
+/// failure reading it (one dropped link, critic C1) leaves the receipt
+/// submitted, and `ferry record` later completes it to the place's verdict.
+#[test]
+fn a_failure_reading_the_final_record_leaves_the_receipt_submitted() {
+    let dir = fixture();
+    fs::create_dir_all(dir.path().join("host")).unwrap();
+    fs::write(dir.path().join("host/fail-record-once"), "").unwrap();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(255), "{record}");
+    assert_eq!(record["state"], "submitted", "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("ferry record"),
+        "{record}"
+    );
+    let id = record["id"].as_str().unwrap();
+    let out = remote_command(dir.path(), ".local/bin/ferry", &["record", id])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["state"], "final", "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+}
+
+/// The same on the local route, which must not call a run that ran
+/// "refused" (C1).
+#[test]
+fn a_local_failure_reading_the_final_record_leaves_the_receipt_submitted() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("FERRY_FAIL_AT", "record-read")
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(255), "{record}");
+    assert_eq!(record["state"], "submitted", "{record}");
+    let id = record["id"].as_str().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .args(["record", id])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["state"], "final", "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
 }
 
 #[test]
