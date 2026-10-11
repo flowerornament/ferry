@@ -29,12 +29,41 @@ pub struct Hooks {
     pub collect: Option<String>,
 }
 
+/// One object a run ships with its commit (SPEC §10): an extra ref in the
+/// checkout, or a dependency served from the place's store at its URL.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Ship {
+    Ref(ShipRef),
+    Url(ShipUrl),
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Mirror {
+pub struct ShipRef {
+    #[serde(rename = "ref")]
+    pub name: String,
+    pub from: Source,
+}
+
+/// A dependency at a caller-local repository path, pinned to `commit`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShipUrl {
     pub url: String,
     pub path: String,
     pub commit: String,
+}
+
+/// The keys `[[ship]]` replaced (`companion_refs`, `mirror`): present,
+/// they refuse, naming the new form.
+pub fn retired(keys: [&Option<serde::de::IgnoredAny>; 2]) -> Result<(), Refusal> {
+    if keys.iter().any(|key| key.is_some()) {
+        return Err(Refusal::Declaration(
+            "[companion_refs]/[[mirror]] are retired: use [[ship]] (see README)".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,10 +76,12 @@ pub struct Config {
     #[serde(default)]
     pub hooks: Hooks,
     #[serde(default)]
-    pub mirror: Vec<Mirror>,
+    pub ship: Vec<Ship>,
     pub environment: Option<Environment>,
     #[serde(default)]
-    pub companion_refs: BTreeMap<String, CompanionSource>,
+    pub companion_refs: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pub mirror: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub preserve: Vec<String>,
     #[serde(default)]
@@ -69,7 +100,7 @@ pub struct Provider {
 /// A caller revision, or an explicitly selected locally known tracking ref.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum CompanionSource {
+pub enum Source {
     Revision(String),
     Published(PublishedRef),
 }
@@ -152,10 +183,12 @@ pub struct CatalogContract {
     pub version: u32,
     pub recipe: BTreeMap<String, Recipe>,
     #[serde(default)]
-    pub mirror: Vec<Mirror>,
+    pub ship: Vec<Ship>,
     pub environment: Option<Environment>,
     #[serde(default)]
-    pub companion_refs: BTreeMap<String, CompanionSource>,
+    pub companion_refs: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pub mirror: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub preserve: Vec<String>,
     #[serde(default)]

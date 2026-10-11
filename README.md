@@ -159,7 +159,10 @@ If the catalog has another schema, set `[catalog] adapter =
 - **What the adapter emits:** this committed executable runs caller-side in
   fresh checkouts of the pinned commit and prints `{"version":1,"recipe":{...}}`.
   It may also emit:
-  - a `mirror` list derived from the repository's lockfile;
+  - a `ship` list (the `[[ship]]` entries below), for example dependencies
+    derived from the repository's lockfile. Entries from the adapter and
+    from `ferry.toml` are combined; the same ref or URL declared twice
+    refuses;
   - an `environment` declaration;
   - `preserve`, a list of ignored build directories kept across resets, for
     example `["_build", "deps", ".devenv"]`.
@@ -175,23 +178,36 @@ If the catalog has another schema, set `[catalog] adapter =
 - tracked files, HEAD and hidden index flags are still checked;
 - omit `preserve` for a clean run.
 
-### Companion references
+### Shipped objects
 
-A recipe can request exact companion commits under fully qualified host Git
-refs:
+A run can ship more than its commit. Each `[[ship]]` entry is either an
+extra ref in the checkout or a dependency served at its URL:
 
 ```toml
-[companion_refs]
-'refs/remotes/origin/master' = { remote = 'origin', branch = 'master' }
+[[ship]]          # an extra ref in the checkout
+ref = 'refs/remotes/origin/master'
+from = { remote = 'origin', branch = 'master' }   # or a revision: 'master@origin'
+
+[[ship]]          # a dependency, served from the place at its URL
+url = 'https://github.com/org/dep'
+path = 'deps/dep' # a caller-local repository
+commit = 'abc123…'
 ```
 
-- **Which commit:** this selects the caller's locally known tracking ref, not
-  the local branch or the remote's current state.
-- **No fetching:** Ferry does not fetch or fall back, and the ref must name a
-  commit directly (not a tag object).
-- **A string source** keeps the caller's revision syntax.
-- **In the receipt:** `companion_sources` (requested) and `companion_refs`
-  (resolved). Only those exact objects are transported.
+- **Which commit:** `from` as a table selects the caller's locally known
+  tracking ref, not the local branch or the remote's current state; a string
+  keeps the caller's revision syntax. Ferry does not fetch or fall back, and
+  the ref must name a commit directly (not a tag object).
+- **One store:** every object goes to the place's one store with the run's
+  commit, only after the place's capabilities are checked, and is kept as
+  `refs/heads/ferry/ship/<commit>`.
+- **In the checkout:** a `ref` entry is made in the seat's clone (and a ref
+  a later run no longer ships is removed); a `url` entry is served from the
+  store through the checkout's git configuration (`GIT_CONFIG_GLOBAL`), so
+  the recipe fetches it at its URL.
+- **In the receipt:** `ship`, one `{ref | url, commit, from}` per entry.
+- **Retired:** `[companion_refs]` and `[[mirror]]` (and the adapter's
+  `mirror` key) refuse, naming `[[ship]]`.
 
 ### Provider capabilities
 
@@ -316,7 +332,8 @@ or prepares its seat) runs none of them, collect included: nothing ran.
 - **Inputs:** `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, `FERRY_WORKDIR`,
   `FERRY_CACHE_DIR`; collect also gets `FERRY_EXIT_CODE`.
 - **Reserved:** `FERRY_*` and `GIT_CONFIG_GLOBAL`. A hook cannot replace the
-  run's identity or the seat-local mirror configuration.
+  run's identity or the seat-local git configuration that serves shipped
+  URLs.
 - **`FERRY_CACHE_DIR`** is a per-seat directory Ferry owns
   (`<state>/caches/<seat>`, mode 0700). Put regenerable build output there,
   for example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`.
@@ -335,7 +352,7 @@ or prepares its seat) runs none of them, collect included: nothing ran.
 ### Transport
 
 - **Exact objects only.** The caller pushes only the exact commit (and any
-  companions and mirrors) to the machine's private bare repository, under
+  `[[ship]]` objects) to the machine's private bare repository, under
   `refs/ferry/<repo key>-<seat>/<commit>`, never to origin. Two concurrent
   runs of the same commit may race to create that ref. A push that loses the
   race to an identical ref counts as published.

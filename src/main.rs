@@ -180,13 +180,11 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     record.provider_requires = config.provider.requires.iter().cloned().collect();
     receipt::provides(&config.provider.requires, &receipt::capabilities())
         .map_err(|e| format!("this caller: {e}"))?;
-    record.companion_sources.clone_from(&config.companion_refs);
-    for (name, revision) in &config.companion_refs {
-        repository::ref_name(name)?;
-        record
-            .companion_refs
-            .insert(name.clone(), repository::companion_commit(root, revision)?);
-    }
+    let shipped = repository::ship(root, &config.ship)?;
+    record.ship = shipped
+        .iter()
+        .map(|(_, _, recorded)| recorded.clone())
+        .collect();
     record.forwarded_env = config.environment.as_ref().map_or_else(
         || Ok(BTreeMap::default()),
         |environment| environment.capture(std::env::vars_os()),
@@ -207,7 +205,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         name.clone_into(&mut record.machine);
         record.machine_features = hosts.host[name].capabilities().into_iter().collect();
     }
-    let mut request = execution::Request {
+    let request = execution::Request {
         protocol: receipt::PROTOCOL,
         id: record.id.clone(),
         token: receipt::run_id()?,
@@ -217,9 +215,11 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         hooks: config.hooks,
         caller_binary_sha256: record.caller_binary_sha256.clone(),
         timeout_seconds: options.timeout_seconds,
-        mirrors: vec![],
         forwarded_env: record.forwarded_env.clone(),
-        companion_refs: record.companion_refs.clone(),
+        ship: shipped
+            .iter()
+            .map(|(object, _, _)| object.clone())
+            .collect(),
         preserve: record.preserve.clone(),
         args: options.args.clone(),
         provider_requires: config.provider.requires.clone(),
@@ -231,15 +231,6 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         record.outcome = receipt::Outcome::Lost;
         record.exit_code = 255;
     }
-    request.mirrors = transport::mirror(
-        root,
-        &config.mirror,
-        match route {
-            config::Route::Local => None,
-            config::Route::Remote(name) => Some(&hosts.host[name]),
-        },
-    )?;
-    record.mirrors.clone_from(&request.mirrors);
     execution::interrupted()?;
     // Every caller fact, stored before the host is asked to run anything:
     // lost until the final receipt replaces it.
@@ -253,7 +244,11 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         config::Route::Local => transport::Place::Local(root.join(".ferry/local")),
         config::Route::Remote(name) => transport::Place::Remote(&hosts.host[name]),
     };
-    transport::ship(root, &place, &request, record)?;
+    let objects: Vec<_> = shipped
+        .into_iter()
+        .map(|(object, repo, _)| (repo, object.commit))
+        .collect();
+    transport::ship(root, &place, &request, &objects, record)?;
     transport::run_on(root, &place, &request, record, options.json)
 }
 
@@ -399,12 +394,10 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         elapsed_ms: 0,
         requirements: vec![],
         machine_features: vec![],
-        mirrors: vec![],
         adapter_sha256: None,
         contract_sha256: None,
         forwarded_env: BTreeMap::default(),
-        companion_refs: BTreeMap::default(),
-        companion_sources: BTreeMap::default(),
+        ship: vec![],
         preserve: vec![],
         collection: None,
         args: vec![],

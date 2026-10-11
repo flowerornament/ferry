@@ -718,10 +718,6 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         ("FERRY_CACHE_DIR".to_owned(), cache.display().to_string()),
         ("FERRY_ID".to_owned(), request.id.clone()),
         ("FERRY_REQUEST_FILE".to_owned(), spec.display().to_string()),
-        (
-            "FERRY_MIRRORS_DIR".to_owned(),
-            root.join("mirrors").display().to_string(),
-        ),
     ]);
     if request
         .forwarded_env
@@ -731,7 +727,7 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         return Err("reserved forwarded environment".into());
     }
     env.extend(request.forwarded_env.clone());
-    if !request.mirrors.is_empty() {
+    if request.ship.iter().any(|shipped| shipped.url.is_some()) {
         env.insert(
             "GIT_CONFIG_GLOBAL".into(),
             workdir.join(".ferry/gitconfig").display().to_string(),

@@ -205,75 +205,6 @@ fn push(root: &Path, ssh: &str, store: &str, refspec: &str) -> Result<()> {
     if published { Ok(()) } else { Err(error) }
 }
 
-pub fn mirror(
-    root: &Path,
-    declarations: &[config::Mirror],
-    host: Option<&config::Machine>,
-) -> Result<Vec<execution::Mirrored>> {
-    let mut mirrors = vec![];
-    for declaration in declarations {
-        let source = root.join(&declaration.path);
-        let commit = repository::commit(&source, Some(&declaration.commit))?;
-        let key = receipt::digest(declaration.url.as_bytes());
-        let store = format!(".local/state/ferry/mirrors/{key}.git");
-        if let Some(host) = host {
-            config::identifier(&host.ssh)?;
-            repository::output(ssh(&host.ssh)?.arg(format!(
-                "mkdir -p .local/state/ferry/mirrors; test -d {store} || git init --bare {store}"
-            )))?;
-            push(
-                &source,
-                &host.ssh,
-                &store,
-                &format!("{commit}:refs/ferry/{commit}"),
-            )?;
-            pin_mirror(&store, &commit, Some(host))?;
-        } else {
-            let store = root.join(".ferry/local/mirrors").join(format!("{key}.git"));
-            fs::create_dir_all(store.parent().ok_or("invalid mirror directory")?)?;
-            if !store.exists() {
-                repository::output(Command::new("git").args(["init", "--bare"]).arg(&store))?;
-            }
-            repository::output(
-                Command::new("git")
-                    .arg("--git-dir")
-                    .arg(&store)
-                    .arg("fetch")
-                    .arg(repository::git_dir(&source)?)
-                    .arg(&commit),
-            )?;
-            pin_mirror(
-                store.to_str().ok_or("non-UTF-8 mirror path")?,
-                &commit,
-                None,
-            )?;
-        }
-        mirrors.push(execution::Mirrored {
-            url: declaration.url.clone(),
-            commit,
-            key,
-        });
-    }
-    Ok(mirrors)
-}
-
-fn pin_mirror(store: &str, commit: &str, host: Option<&config::Machine>) -> Result<()> {
-    // Ordinary dependency fetchers request heads, not Ferry's custody refs.
-    // A compare-and-set makes each content-addressed head an immutable GC pin.
-    let script = "set -eu; head=$(git --git-dir=\"$1\" symbolic-ref HEAD); case $head in refs/heads/ferry/*) exit 125;; esac; ref=refs/heads/ferry/$2; git --git-dir=\"$1\" update-ref \"$ref\" \"$2\" 0000000000000000000000000000000000000000 2>/dev/null || test \"$(git --git-dir=\"$1\" rev-parse --verify \"$ref\")\" = \"$2\"";
-    if let Some(host) = host {
-        let command = ["sh", "-c", script, "ferry-mirror", store, commit]
-            .into_iter()
-            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        repository::output(ssh(&host.ssh)?.arg(command))?;
-    } else {
-        repository::output(Command::new("sh").args(["-c", script, "ferry-mirror", store, commit]))?;
-    }
-    Ok(())
-}
-
 /// Where a run's place verbs run: a local exec on the repository's state
 /// root, or ssh to a machine.
 pub enum Place<'a> {
@@ -338,10 +269,20 @@ impl Place<'_> {
     }
 }
 
-/// Ships the commit and its companion objects to the place, after checking
-/// that the place can run the request. A place without `detach` is refused:
-/// callers are never installed before their places.
-pub fn ship(root: &Path, place: &Place, request: &Request, record: &mut Receipt) -> Result<()> {
+/// Ships the commit and its `[[ship]]` objects (`(repository, commit)`) to
+/// the place's one store, only after checking that the place can run the
+/// request: a refused place receives nothing. Each object is kept as
+/// `refs/heads/ferry/ship/<commit>`: a head, which a dependency clone
+/// fetches, and a name no dependency's own can resolve to. A place without
+/// `detach` is refused: callers are never installed before their places.
+pub fn ship(
+    root: &Path,
+    place: &Place,
+    request: &Request,
+    objects: &[(PathBuf, String)],
+    record: &mut Receipt,
+) -> Result<()> {
+    let kept = |commit: &str| format!("{commit}:refs/heads/ferry/ship/{commit}");
     match place {
         Place::Local(state) => {
             fs::create_dir_all(state)?;
@@ -349,15 +290,19 @@ pub fn ship(root: &Path, place: &Place, request: &Request, record: &mut Receipt)
             if !bare.exists() {
                 repository::output(Command::new("git").args(["init", "--bare"]).arg(&bare))?;
             }
-            for commit in std::iter::once(&request.commit).chain(request.companion_refs.values()) {
+            let fetch = |repo: &Path, refspec: &str| {
                 repository::output(
                     Command::new("git")
                         .arg("--git-dir")
                         .arg(&bare)
                         .arg("fetch")
-                        .arg(repository::git_dir(root)?)
-                        .arg(commit),
-                )?;
+                        .arg(repository::git_dir(repo)?)
+                        .arg(refspec),
+                )
+            };
+            fetch(root, &request.commit)?;
+            for (repo, commit) in objects {
+                fetch(repo, &kept(commit))?;
             }
             Ok(())
         }
@@ -416,7 +361,15 @@ pub fn ship(root: &Path, place: &Place, request: &Request, record: &mut Receipt)
                     request.commit, request.seat, request.commit
                 ),
             )?;
-            push_companions(root, machine, request)
+            for (repo, commit) in objects {
+                push(
+                    repo,
+                    &machine.ssh,
+                    ".local/state/ferry/repo.git",
+                    &kept(commit),
+                )?;
+            }
+            Ok(())
         }
     }
 }
@@ -837,21 +790,6 @@ pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> 
                 format!("artifacts not fetched: {error}"),
             );
         }
-    }
-    Ok(())
-}
-
-fn push_companions(root: &Path, machine: &config::Machine, request: &Request) -> Result<()> {
-    for commit in request.companion_refs.values() {
-        push(
-            root,
-            &machine.ssh,
-            ".local/state/ferry/repo.git",
-            &format!(
-                "{commit}:refs/ferry/{}/{}/companions/{commit}",
-                request.seat, request.id
-            ),
-        )?;
     }
     Ok(())
 }

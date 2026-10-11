@@ -1,5 +1,6 @@
 //! Exact-commit resolution and committed declarations for git and colocated jj.
 use crate::config::{Config, Recipe, Refusal, identifier, relative_path};
+use crate::execution::Shipped;
 use std::process::Stdio;
 use std::{
     collections::BTreeMap,
@@ -127,13 +128,13 @@ pub fn committed_file(
 }
 
 /// Resolve once without fetching, peeling tags, or substituting a local branch.
-pub fn companion_commit(
+pub fn source_commit(
     root: &Path,
-    source: &crate::config::CompanionSource,
+    source: &crate::config::Source,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let published = match source {
-        crate::config::CompanionSource::Revision(revision) => return commit(root, Some(revision)),
-        crate::config::CompanionSource::Published(published) => published,
+        crate::config::Source::Revision(revision) => return commit(root, Some(revision)),
+        crate::config::Source::Published(published) => published,
     };
     identifier(&published.remote)?;
     let reference = format!("refs/remotes/{}/{}", published.remote, published.branch);
@@ -163,6 +164,53 @@ pub fn companion_commit(
     }
     Ok(value)
 }
+/// A `[[ship]]` entry resolved: the object, its caller repository, and
+/// its receipt line.
+pub type Resolved = (Shipped, PathBuf, serde_json::Value);
+
+/// Resolves each `[[ship]]` entry once: the object as the place sees it, the
+/// caller repository holding it, and what the receipt records. A ref or URL
+/// declared twice (by ferry.toml and the adapter together) is refused.
+pub fn ship(
+    root: &Path,
+    entries: &[crate::config::Ship],
+) -> Result<Vec<Resolved>, Box<dyn std::error::Error>> {
+    let mut resolved: Vec<Resolved> = vec![];
+    for entry in entries {
+        let (name, url, repo, from, commit) = match entry {
+            crate::config::Ship::Ref(e) => {
+                ref_name(&e.name)?;
+                let from = serde_json::to_value(&e.from)?;
+                (
+                    Some(&e.name),
+                    None,
+                    root.to_path_buf(),
+                    from,
+                    source_commit(root, &e.from)?,
+                )
+            }
+            crate::config::Ship::Url(e) => {
+                let repo = root.join(&e.path);
+                let commit = commit(&repo, Some(&e.commit))?;
+                (None, Some(&e.url), repo, e.path.clone().into(), commit)
+            }
+        };
+        let (name, url) = (name.cloned(), url.cloned());
+        if let Some(twice) = resolved.iter().find_map(|(o, _, _)| {
+            (name.is_some() && o.name == name || url.is_some() && o.url == url).then_some(o)
+        }) {
+            let what = twice.name.as_ref().or(twice.url.as_ref()).cloned();
+            let message = format!("[[ship]] declares {} twice", what.unwrap_or_default());
+            return Err(Refusal::Declaration(message).into());
+        }
+        let object = Shipped { name, url, commit };
+        let mut recorded = serde_json::to_value(&object)?;
+        recorded["from"] = from;
+        resolved.push((object, repo, recorded));
+    }
+    Ok(resolved)
+}
+
 pub fn declaration(
     root: &Path,
     sha: &str,
@@ -176,6 +224,7 @@ pub fn declaration(
     if config.version != 1 {
         return Err(Refusal::Declaration("unsupported ferry.toml version".into()).into());
     }
+    crate::config::retired([&config.companion_refs, &config.mirror])?;
     for hook in [
         &config.hooks.prepare,
         &config.hooks.env,
@@ -211,12 +260,10 @@ pub fn declaration(
                 if contract.version != 1 {
                     return Err("unsupported catalog contract version".into());
                 }
-                if !contract.mirror.is_empty() {
-                    if !config.mirror.is_empty() {
-                        return Err("mirror declarations have two owners".into());
-                    }
-                    config.mirror = contract.mirror;
-                }
+                // Both may ship: a ref or URL declared twice is refused
+                // where the entries are resolved.
+                crate::config::retired([&contract.companion_refs, &contract.mirror])?;
+                config.ship.extend(contract.ship);
                 if let Some(environment) = contract.environment {
                     if config.environment.is_some() {
                         return Err("environment declarations have two owners".into());
@@ -234,12 +281,6 @@ pub fn declaration(
                         return Err("provider requirements have two owners".into());
                     }
                     config.provider = contract.provider;
-                }
-                if !contract.companion_refs.is_empty() {
-                    if !config.companion_refs.is_empty() {
-                        return Err("companion refs have two owners".into());
-                    }
-                    config.companion_refs = contract.companion_refs;
                 }
                 contract.recipe
             }

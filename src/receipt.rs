@@ -85,15 +85,13 @@ pub struct Receipt {
     pub elapsed_ms: u128,
     pub requirements: Vec<String>,
     pub machine_features: Vec<String>,
-    pub mirrors: Vec<crate::execution::Mirrored>,
     pub adapter_sha256: Option<String>,
     pub contract_sha256: Option<String>,
     #[serde(default)]
     pub forwarded_env: std::collections::BTreeMap<String, String>,
+    /// The objects shipped with the commit: `{ref | url, commit, from}`.
     #[serde(default)]
-    pub companion_refs: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    pub companion_sources: std::collections::BTreeMap<String, crate::config::CompanionSource>,
+    pub ship: Vec<serde_json::Value>,
     #[serde(default)]
     pub preserve: Vec<String>,
     #[serde(default)]
@@ -258,7 +256,7 @@ mod tests {
             "recipe": "r", "seat": "s", "machine": "m", "outcome": "ran-pass",
             "exit_code": 0, "reason": null, "caller_binary_sha256": "c",
             "host_binary_sha256": null, "started_ms": 0, "elapsed_ms": 0,
-            "requirements": [], "machine_features": [], "mirrors": [],
+            "requirements": [], "machine_features": [],
             "adapter_sha256": null, "contract_sha256": null, "state": "final"
         }))
         .unwrap();

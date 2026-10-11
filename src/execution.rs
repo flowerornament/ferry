@@ -32,10 +32,9 @@ pub struct Request {
     pub hooks: Hooks,
     pub caller_binary_sha256: String,
     pub timeout_seconds: Option<u64>,
-    pub mirrors: Vec<Mirrored>,
     pub forwarded_env: BTreeMap<String, String>,
-    #[serde(default)]
-    pub companion_refs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ship: Vec<Shipped>,
     #[serde(default)]
     pub preserve: Vec<String>,
     // Omitted when empty so argument-free runs still reach hosts that predate
@@ -62,11 +61,16 @@ impl Request {
     }
 }
 
+/// A shipped object as the place sees it: a commit in the store, made a ref
+/// in the checkout or served at a URL (SPEC §5 objects).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mirrored {
-    pub url: String,
+#[serde(deny_unknown_fields)]
+pub struct Shipped {
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub commit: String,
-    pub key: String,
 }
 
 pub fn validate(request: &Request) -> Result<()> {
@@ -79,10 +83,14 @@ pub fn validate(request: &Request) -> Result<()> {
     if request.commit.len() != 40 || !request.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid commit".into());
     }
-    for (name, commit) in &request.companion_refs {
-        repository::ref_name(name)?;
-        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err("invalid companion commit".into());
+    for shipped in &request.ship {
+        match (&shipped.name, &shipped.url) {
+            (Some(name), None) => repository::ref_name(name)?,
+            (None, Some(url)) if !url.is_empty() && !url.contains(['\n', '\0']) => {}
+            _ => return Err("invalid ship entry".into()),
+        }
+        if shipped.commit.len() != 40 || !shipped.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid ship commit".into());
         }
     }
     if request.recipe.command.is_empty() {
@@ -115,12 +123,6 @@ pub fn validate(request: &Request) -> Result<()> {
     .flatten()
     {
         crate::config::relative_path(hook)?;
-    }
-    for mirror in &request.mirrors {
-        identifier(&mirror.key)?;
-        if mirror.commit.len() != 40 || !mirror.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("invalid mirror commit".into());
-        }
     }
     Ok(())
 }
@@ -281,26 +283,7 @@ pub fn prepare(
         return Err("seat has a legacy shared-ref checkout; select a new --seat".into());
     }
     reset_checkout(&seat, request)?;
-    materialize_refs(root, &seat, request)?;
-    if !request.mirrors.is_empty() {
-        fs::create_dir_all(seat.join(".ferry"))?;
-        let config = seat.join(".ferry/gitconfig");
-        for mirror in &request.mirrors {
-            let store = root.join("mirrors").join(format!("{}.git", mirror.key));
-            repository::output(Command::new("git").arg("--git-dir").arg(&store).args([
-                "cat-file",
-                "-e",
-                &format!("{}^{{commit}}", mirror.commit),
-            ]))?;
-            repository::output(
-                Command::new("git")
-                    .args(["config", "--file"])
-                    .arg(&config)
-                    .arg(format!("url.file://{}/.insteadOf", store.display()))
-                    .arg(&mirror.url),
-            )?;
-        }
-    }
+    present_ship(&bare, &seat, request)?;
     Ok(seat)
 }
 
@@ -408,38 +391,36 @@ fn migrate_legacy(bare: &Path, seat: &Path) -> Result<()> {
     Ok(())
 }
 
-fn materialize_refs(root: &Path, seat: &Path, request: &Request) -> Result<()> {
-    let directory = root.join("companion-refs");
-    fs::create_dir_all(&directory)?;
-    let manifest = directory.join(format!("{}.json", request.seat));
-    let previous: BTreeMap<String, String> = match fs::read(&manifest) {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(error) => return Err(error.into()),
-    };
-    for name in previous
-        .keys()
-        .filter(|name| !request.companion_refs.contains_key(*name))
-    {
-        repository::ref_name(name)?;
-        repository::output(
-            Command::new("git")
-                .current_dir(seat)
-                .args(["update-ref", "-d", name]),
-        )?;
+/// The shipped objects in the checkout: each `ref` entry made in the seat
+/// clone, and last run's that this run did not ask for removed (the clone's
+/// own config lists them, so the list lives and dies with the seat); each
+/// `url` entry served from the store through the checkout's git config.
+fn present_ship(bare: &Path, seat: &Path, request: &Request) -> Result<()> {
+    let git = |args: &[&str]| repository::output(Command::new("git").current_dir(seat).args(args));
+    let made = git(&["config", "--local", "--get-all", "ferry.ref"]).unwrap_or_default();
+    for name in String::from_utf8(made)?.lines() {
+        if !request.ship.iter().any(|s| s.name.as_deref() == Some(name)) {
+            repository::ref_name(name)?;
+            git(&["update-ref", "-d", name])?;
+        }
     }
-    for (name, commit) in &request.companion_refs {
-        repository::output(Command::new("git").current_dir(seat).args([
-            "cat-file",
-            "-e",
-            &format!("{commit}^{{commit}}"),
-        ]))?;
-        repository::output(Command::new("git").current_dir(seat).args([
-            "update-ref",
-            name,
-            commit,
-        ]))?;
+    let _ = git(&["config", "--local", "--unset-all", "ferry.ref"]);
+    for shipped in &request.ship {
+        git(&["cat-file", "-e", &format!("{}^{{commit}}", shipped.commit)])?;
+        if let Some(name) = &shipped.name {
+            git(&["update-ref", name, &shipped.commit])?;
+            git(&["config", "--local", "--add", "ferry.ref", name])?;
+        }
+        if let Some(url) = &shipped.url {
+            fs::create_dir_all(seat.join(".ferry"))?;
+            repository::output(
+                Command::new("git")
+                    .args(["config", "--add", "--file"])
+                    .arg(seat.join(".ferry/gitconfig"))
+                    .arg(format!("url.file://{}/.insteadOf", bare.display()))
+                    .arg(url),
+            )?;
+        }
     }
-    fs::write(manifest, serde_json::to_vec(&request.companion_refs)?)?;
     Ok(())
 }

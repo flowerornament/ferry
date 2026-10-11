@@ -208,3 +208,39 @@ Each freeze states the measured running src.
 - **Q4:** the deployed binaries predate the sentinel, so slice 7 puts the M1 root at a fresh path, writes `locks/legacy-closed` in the old root at first start, and leaves the old root for a one-time operator cleanup (RELEASE).
 - **Confirmed:** the mirror-before-capability-check gap is a bug, fixed in 6 with a control: an old place receives no objects before its refusal. Retire deletes `caches/.measured-<key>` (7). Each freeze states the running src.
 - **Implementation note:** the stale-ref manifest moves into the seat clone's own git config (`ferry.ref`, multi-valued), not a listing. A shipped ref may sit in the clone's own namespace (Herald's is `refs/remotes/origin/master`), so a listing cannot tell Ferry's refs from git's. The list then lives and dies with the seat, and `companion-refs/<seat>.json` goes.
+
+## 8. Slice 6 as built (2026-10-11)
+
+- **Config:** `[[ship]]` is an untagged list of `{ref, from}` (`from` a
+  revision or `{remote, branch}`) or `{url, path, commit}`. The retired
+  `companion_refs` and `mirror` keys parse as ignored values only so that
+  they refuse with the new form, in `ferry.toml` and in the adapter's JSON
+  (serde cannot combine `flatten` with `deny_unknown_fields`, so each
+  struct carries the two keys).
+- **Caller:** one resolver (`repository::ship`) returns each object, the
+  caller repository holding it, and its receipt line; it refuses a ref or
+  URL declared twice. `transport::ship` pushes every object to the one
+  store under `refs/heads/ferry/ship/<commit>`, after the capability
+  checks; the local route fetches with the same refspec.
+- **Place:** `present_ship` makes `ref` entries with `update-ref` and lists
+  them in the seat clone's own config (`ferry.ref`, `--local`), removing
+  those a later run does not ship; `url` entries add an `insteadOf` value
+  (`--add`, since all URLs now share one store) to the checkout's
+  `.ferry/gitconfig`, which `GIT_CONFIG_GLOBAL` points at.
+- **Deleted:** `transport::mirror`, `pin_mirror` (and its compare-and-set
+  script), `push_companions`, the per-URL bare stores and their remote
+  `git init` over raw ssh, the companion manifest file, `materialize_refs`,
+  `Mirrored`, `FERRY_MIRRORS_DIR`, the two-owners rules for these keys.
+- **Size:** src 5985 → 5965 (−20), not the −165 the plan estimated. The
+  inventory counted the 287 lines the two mechanisms occupied but
+  underestimated their replacement (the typed entries, the resolver with its
+  duplicate rule, and `present_ship`, after rustfmt). Slice 7's estimate is
+  about −70, which would bring src to about 5895, below 5950; slice 7 is
+  measured, not estimated, at its freeze.
+- **Receipt:** `mirrors`, `companion_refs` and `companion_sources` are
+  replaced by `ship`; an older receipt still parses (its old keys are
+  ignored, not carried).
+- **A test that never tested it:** the old mirror test checked stdout for
+  the dependency commit, which the receipt JSON always contains; the
+  recipe's output is on stderr with `--json`. Its replacement checks
+  stderr for the served ref.

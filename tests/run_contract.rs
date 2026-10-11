@@ -97,7 +97,7 @@ fn published_companion_uses_tracking_ref_on_git_jj_and_worktree_callers() {
             dir.path(),
             &["update-ref", "refs/remotes/origin/master", &first],
         );
-        fs::write(dir.path().join("ferry.toml"), "version=1\n[companion_refs]\n'refs/remotes/origin/master'={remote='origin',branch='master'}\n[recipe.pass]\ncommand=['git','rev-parse','refs/remotes/origin/master']\n").unwrap();
+        fs::write(dir.path().join("ferry.toml"), "version=1\n[[ship]]\nref='refs/remotes/origin/master'\nfrom={remote='origin',branch='master'}\n[recipe.pass]\ncommand=['git','rev-parse','refs/remotes/origin/master']\n").unwrap();
         git(dir.path(), &["add", "ferry.toml"]);
         git(dir.path(), &["commit", "-m", "typed companion"]);
         let caller = if backend == "worktree" {
@@ -129,14 +129,9 @@ fn published_companion_uses_tracking_ref_on_git_jj_and_worktree_callers() {
             String::from_utf8_lossy(&out.stdout)
         );
         let record = receipt(&out);
-        assert_eq!(
-            record["companion_refs"]["refs/remotes/origin/master"],
-            first
-        );
-        assert_eq!(
-            record["companion_sources"]["refs/remotes/origin/master"],
-            serde_json::json!({"remote":"origin", "branch":"master"})
-        );
+        let shipped = serde_json::json!([{"ref": "refs/remotes/origin/master", "commit": first,
+            "from": {"remote": "origin", "branch": "master"}}]);
+        assert_eq!(record["ship"], shipped);
         assert!(String::from_utf8_lossy(&out.stdout).contains(&first));
         git(
             dir.path(),
@@ -144,16 +139,7 @@ fn published_companion_uses_tracking_ref_on_git_jj_and_worktree_callers() {
         );
         let out = run(&caller, &["run", "pass", "--local", "--json"]);
         assert_eq!(out.status.code(), Some(125));
-        let refused = receipt(&out);
-        assert_eq!(
-            refused["companion_sources"]["refs/remotes/origin/master"],
-            serde_json::json!({"remote":"origin", "branch":"master"})
-        );
-        assert!(refused["companion_refs"].as_object().unwrap().is_empty());
-        assert_eq!(
-            record["companion_refs"]["refs/remotes/origin/master"],
-            first
-        );
+        assert_eq!(receipt(&out)["ship"], serde_json::json!([]));
         for entry in fs::read_dir(caller.join(".ferry/local/slots")).unwrap() {
             let output = Command::new("git")
                 .current_dir(entry.unwrap().path())
@@ -175,17 +161,12 @@ fn published_companion_refuses_malformed_sources_and_tag_objects() {
         "{remote='-origin',branch='master'}",
         "{remote='origin',branch='../master'}",
     ] {
-        fs::write(dir.path().join("ferry.toml"), format!("version=1\n[companion_refs]\n'refs/remotes/origin/master'={source}\n[recipe.pass]\ncommand=['true']\n")).unwrap();
+        fs::write(dir.path().join("ferry.toml"), format!("version=1\n[[ship]]\nref='refs/remotes/origin/master'\nfrom={source}\n[recipe.pass]\ncommand=['true']\n")).unwrap();
         git(dir.path(), &["add", "ferry.toml"]);
         git(dir.path(), &["commit", "-m", "invalid source"]);
         let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
         assert_eq!(out.status.code(), Some(125), "source: {source}");
-        assert!(
-            receipt(&out)["companion_refs"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(receipt(&out)["ship"], serde_json::json!([]));
     }
     git(dir.path(), &["tag", "-a", "not-a-commit", "-m", "tag"]);
     git(
@@ -196,7 +177,7 @@ fn published_companion_refuses_malformed_sources_and_tag_objects() {
             "refs/tags/not-a-commit",
         ],
     );
-    fs::write(dir.path().join("ferry.toml"), "version=1\n[companion_refs]\n'refs/remotes/origin/master'={remote='origin',branch='master'}\n[recipe.pass]\ncommand=['true']\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[[ship]]\nref='refs/remotes/origin/master'\nfrom={remote='origin',branch='master'}\n[recipe.pass]\ncommand=['true']\n").unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
     git(dir.path(), &["commit", "-m", "tag refusal"]);
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
@@ -305,7 +286,7 @@ fn companion_refs_are_pinned_and_isolated_between_seats() {
     };
     let first = resolve(dir.path(), "HEAD");
     git(dir.path(), &["branch", "companion"]);
-    fs::write(dir.path().join("ferry.toml"), "version=1\n[companion_refs]\n'refs/remotes/origin/master'='companion'\n[recipe.pass]\ncommand=['git','rev-parse','refs/remotes/origin/master']\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[[ship]]\nref='refs/remotes/origin/master'\nfrom='companion'\n[recipe.pass]\ncommand=['git','rev-parse','refs/remotes/origin/master']\n").unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
     git(dir.path(), &["commit", "-m", "companion declaration"]);
     let second = resolve(dir.path(), "HEAD");
@@ -318,10 +299,7 @@ fn companion_refs_are_pinned_and_isolated_between_seats() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert_eq!(
-        receipt(&out)["companion_refs"]["refs/remotes/origin/master"],
-        first
-    );
+    assert_eq!(receipt(&out)["ship"][0]["commit"], first);
     git(dir.path(), &["update-ref", "refs/heads/companion", &second]);
     let out = run(
         dir.path(),
@@ -332,10 +310,7 @@ fn companion_refs_are_pinned_and_isolated_between_seats() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert_eq!(
-        receipt(&out)["companion_refs"]["refs/remotes/origin/master"],
-        second
-    );
+    assert_eq!(receipt(&out)["ship"][0]["commit"], second);
     for entry in fs::read_dir(dir.path().join(".ferry/local/slots")).unwrap() {
         let slot = entry.unwrap().path();
         let expected = if slot
@@ -785,8 +760,11 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
     );
 }
 
+/// A `[[ship]]` url entry is served from the place's one store at its exact
+/// commit: the recipe reaches it at its URL, and an ordinary clone of the
+/// store fetches it, since it is kept as a head (SPEC §5 objects, §10).
 #[test]
-fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
+fn a_shipped_url_is_served_from_the_store_at_its_exact_commit() {
     let dir = fixture();
     let dependency = dir.path().join("dependency");
     fs::create_dir(&dependency).unwrap();
@@ -804,10 +782,10 @@ fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
         .args(["rev-parse", "HEAD"])
         .output()
         .unwrap();
-    let sha = String::from_utf8(out.stdout).unwrap();
-    fs::write(dir.path().join("ferry.toml"), format!("version=1\n[[mirror]]\nurl='https://ferry.invalid/private.git'\npath='dependency'\ncommit='{}'\n[recipe.mirror]\ncommand=['git','ls-remote','https://ferry.invalid/private.git']\n", sha.trim())).unwrap();
+    let sha = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    fs::write(dir.path().join("ferry.toml"), format!("version=1\n[[ship]]\nurl='https://ferry.invalid/private.git'\npath='dependency'\ncommit='{sha}'\n[recipe.mirror]\ncommand=['git','ls-remote','https://ferry.invalid/private.git']\n")).unwrap();
     git(dir.path(), &["add", "ferry.toml"]);
-    git(dir.path(), &["commit", "-m", "mirror"]);
+    git(dir.path(), &["commit", "-m", "ship a dependency"]);
     let out = run(dir.path(), &["run", "mirror", "--local", "--json"]);
     assert!(
         out.status.success(),
@@ -815,16 +793,16 @@ fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(receipt(&out)["mirrors"][0]["commit"], sha.trim());
-    assert!(String::from_utf8_lossy(&out.stdout).contains(sha.trim()));
-    let key = receipt(&out)["mirrors"][0]["key"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let store = dir
-        .path()
-        .join(".ferry/local/mirrors")
-        .join(format!("{key}.git"));
+    let shipped = serde_json::json!([{"url": "https://ferry.invalid/private.git",
+        "commit": sha, "from": "dependency"}]);
+    assert_eq!(receipt(&out)["ship"], shipped);
+    // The recipe reached the URL (its output is on stderr with --json).
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!("refs/heads/ferry/ship/{sha}")),
+        "{said}"
+    );
+    let store = dir.path().join(".ferry/local/repo.git");
     let clone = dir.path().join("ordinary-clone");
     git(
         dir.path(),
@@ -835,36 +813,116 @@ fn mirrors_are_local_to_the_seat_and_record_the_exact_commit() {
             clone.to_str().unwrap(),
         ],
     );
-    git(&clone, &["cat-file", "-e", sha.trim()]);
-    let head = fs::read_to_string(store.join("HEAD")).unwrap();
-    assert!(!head.contains("refs/heads/ferry/"));
-    let pinned = store.join("refs/heads/ferry").join(sha.trim());
-    assert_eq!(fs::read_to_string(&pinned).unwrap().trim(), sha.trim());
-    // A conflicting pin refuses rather than silently moving a content address.
-    fs::write(dependency.join("value"), "changed").unwrap();
-    git(&dependency, &["commit", "-am", "changed dependency"]);
-    git(
-        dir.path(),
-        &[
-            "--git-dir",
-            store.to_str().unwrap(),
-            "fetch",
-            dependency.to_str().unwrap(),
-            "HEAD",
-        ],
+    git(&clone, &["cat-file", "-e", &sha]);
+}
+
+/// A ref a run shipped is gone from the seat when a later run there does
+/// not ship it; the seat clone's own config lists what Ferry made.
+#[test]
+fn a_ref_no_longer_shipped_is_removed_from_the_seat() {
+    let dir = fixture();
+    git(dir.path(), &["branch", "companion"]);
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[[ship]]\nref='refs/remotes/origin/master'\nfrom='companion'\n[recipe.pass]\ncommand=['true']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "ship a ref"]);
+    assert!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .success()
     );
-    git(
-        dir.path(),
-        &[
-            "--git-dir",
-            store.to_str().unwrap(),
-            "update-ref",
-            &format!("refs/heads/ferry/{}", sha.trim()),
-            "FETCH_HEAD",
-        ],
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\n[recipe.pass]\ncommand=['true']\n",
+    )
+    .unwrap();
+    git(dir.path(), &["commit", "-am", "ship nothing"]);
+    assert!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .success()
     );
-    let refused = run(dir.path(), &["run", "mirror", "--local", "--json"]);
-    assert_eq!(receipt(&refused)["outcome"], "refused");
+    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let left = Command::new("git")
+        .current_dir(&slot)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/master",
+        ])
+        .output()
+        .unwrap();
+    assert!(!left.status.success(), "the old ref is still in the seat");
+}
+
+/// The keys `[[ship]]` replaced refuse, naming it, from ferry.toml and from a
+/// catalog adapter alike; entries from both are combined, and the same ref
+/// or URL declared twice refuses.
+#[test]
+fn retired_ship_keys_refuse_and_entries_from_both_owners_combine() {
+    let dir = fixture();
+    for old in [
+        "[companion_refs]\n'refs/heads/x'='HEAD'\n",
+        "[[mirror]]\nurl='u'\npath='p'\ncommit='HEAD'\n",
+    ] {
+        fs::write(
+            dir.path().join("ferry.toml"),
+            format!("version=1\n{old}[recipe.pass]\ncommand=['true']\n"),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "ferry.toml"]);
+        git(dir.path(), &["commit", "-m", "an old key"]);
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        assert_eq!(out.status.code(), Some(125));
+        let reason = receipt(&out)["reason"].as_str().unwrap().to_owned();
+        assert!(reason.contains("are retired: use [[ship]]"), "{reason}");
+    }
+    fs::write(dir.path().join("adapter"), "#!/bin/sh\ncat contract.json\n").unwrap();
+    fs::set_permissions(
+        dir.path().join("adapter"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let recipe = serde_json::json!({"pass": {"command": ["git", "rev-parse", "refs/heads/a", "refs/heads/b"]}});
+    for (emitted, combined) in [
+        (
+            serde_json::json!({"ship": [{"ref": "refs/heads/b", "from": "HEAD"}]}),
+            true,
+        ),
+        (
+            serde_json::json!({"ship": [{"ref": "refs/heads/a", "from": "HEAD"}]}),
+            false,
+        ),
+        (serde_json::json!({"mirror": []}), false),
+    ] {
+        let mut contract = emitted.clone();
+        contract["version"] = 1.into();
+        contract["recipe"] = recipe.clone();
+        fs::write(dir.path().join("contract.json"), contract.to_string()).unwrap();
+        fs::write(
+            dir.path().join("ferry.toml"),
+            "version=1\n[catalog]\nadapter='adapter'\n[[ship]]\nref='refs/heads/a'\nfrom='HEAD'\n",
+        )
+        .unwrap();
+        git(
+            dir.path(),
+            &["add", "ferry.toml", "adapter", "contract.json"],
+        );
+        git(dir.path(), &["commit", "-m", "ship from both owners"]);
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        let record = receipt(&out);
+        if combined {
+            assert_eq!(out.status.code(), Some(0), "{record}");
+            assert_eq!(record["ship"].as_array().unwrap().len(), 2, "{record}");
+        } else {
+            assert_eq!(out.status.code(), Some(125), "{emitted}: {record}");
+        }
+    }
 }
 
 #[test]
@@ -1657,7 +1715,7 @@ fn a_place_refuses_a_request_requiring_a_capability_it_lacks() {
     let request = serde_json::json!({
         "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
         "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
-        "timeout_seconds": null, "mirrors": [], "forwarded_env": {},
+        "timeout_seconds": null, "forwarded_env": {},
         "provider_requires": ["teleport"]
     });
     let (code, reply) = submit(dir.path(), &request);
@@ -1708,7 +1766,7 @@ fn a_second_submit_follows_its_own_run_and_refuses_another() {
         serde_json::json!({
             "protocol": 1, "id": id, "token": token, "commit": "0".repeat(40), "seat": "s",
             "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
-            "timeout_seconds": null, "mirrors": [], "forwarded_env": {}
+            "timeout_seconds": null, "forwarded_env": {}
         })
     };
     // A run still under way: its supervisor is a live process.
@@ -2337,7 +2395,7 @@ fn a_place_refuses_an_unvalidated_preserve_path_before_any_delete() {
     let request = serde_json::json!({
         "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
         "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
-        "timeout_seconds": null, "mirrors": [], "forwarded_env": {},
+        "timeout_seconds": null, "forwarded_env": {},
         "preserve": [victim.display().to_string()]
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
@@ -2673,5 +2731,49 @@ fn a_seat_swapped_for_a_link_after_the_walk_is_not_deleted_through() {
             .unwrap_or("")
             .contains("is behind a symbolic link: not deleted"),
         "{record}"
+    );
+}
+
+/// A place refused for its capabilities receives nothing first: no store and
+/// no shipped objects (SPEC §12.11; mirrors were pushed before the check).
+#[test]
+fn an_old_place_receives_no_objects_before_its_refusal() {
+    let dir = fixture();
+    let dependency = dir.path().join("dependency");
+    fs::create_dir(&dependency).unwrap();
+    git(&dependency, &["init"]);
+    git(&dependency, &["config", "user.name", "Ferry Test"]);
+    git(
+        &dependency,
+        &["config", "user.email", "ferry@example.invalid"],
+    );
+    fs::write(dependency.join("value"), "dep").unwrap();
+    git(&dependency, &["add", "value"]);
+    git(&dependency, &["commit", "-m", "dep"]);
+    fs::write(
+        dir.path().join(".gitignore"),
+        "dependency/\nhost/\nconfig/\nstate/\ntransport-tools/\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[[ship]]\nurl='https://ferry.invalid/dep.git'\npath='dependency'\ncommit='HEAD'\n[recipe.pass]\ncommand=['true']\nroutable=true\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "ship a dependency"]);
+    let bin = dir.path().join("host/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("old-ferry"),
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[]/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = remote_run(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(125), "{}", receipt(&out));
+    assert!(
+        !dir.path().join("host/.local/state").exists(),
+        "the refused place received state"
     );
 }
