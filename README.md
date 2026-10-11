@@ -275,7 +275,9 @@ receipts or records.
   provably gone: its name is absent from a parent directory that can be
   listed and is on the device recorded with it. Anything else (a denied
   lookup, a missing parent, an unmounted volume) is reported as `kept …
-  unknown` and never retired. The place's `retire` verb tries the seat's lock once and,
+  unknown` and never retired. So a workspace removed together with its
+  parent directory (say `~/tmp/x/` deleted whole) is never pruned: its seat
+  stays until an operator removes it on the place. The place's `retire` verb tries the seat's lock once and,
   if it is free, deletes the seat's checkout and cache, records
   `records/retired-<key>.json`, and keeps the lock file. A held seat is
   skipped (busy). A run refused meanwhile is told the seat "is being
@@ -288,12 +290,18 @@ receipts or records.
 - **Size.** With `seat_cap_bytes` set, a run measures its seat's preserve
   paths and cache under its seat lock, before the checkout, when the last
   measurement is over an hour old. Only paths proven inside the seat are
-  measured or wiped: one behind a symbolic link is skipped with a note. A
+  measured or wiped: one behind a symbolic link, or on another device (a
+  volume mounted inside the seat), is skipped with a note, and every delete
+  proves this again at its own moment. A
   run that has spent its wait budget, or a measurement over 30 s, is not
   measured (a note). Over the cap, they are wiped and the run
   starts cold: the receipt's `pruned` is `{bytes, cap}` and `reason` says so.
   The cap can be exceeded by at most an hour of runs' growth. A failed wipe is
   a note, and the run goes on with what is there.
+- **Keep `slots/` and `caches/` real directories** on the state root's disk.
+  An operator who moves either to another disk through a symbolic link makes
+  every cap and retire on that place refuse: safe, but they never act. Move
+  the whole state root instead.
 
 ## Hooks and environment
 

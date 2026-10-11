@@ -150,23 +150,23 @@ const MEASURE_EVERY_MS: u128 = 60 * 60 * 1000;
 /// this run (review P2): it runs before the recipe, inside its deadline.
 const MEASURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Bytes of regular files under `path`, never following links; 0 if absent.
-pub fn size(path: &Path) -> u64 {
-    size_until(path, None).unwrap_or(0)
-}
-
-/// As `size`, or `None` once `until` has passed.
-fn size_until(path: &Path, until: Option<std::time::Instant>) -> Option<u64> {
+/// Bytes of regular files under `path` on device `dev`, never following
+/// links nor crossing into another device (a mount); 0 if absent. `None`
+/// once `until` has passed.
+fn size_until(path: &Path, until: Option<std::time::Instant>, dev: u64) -> Option<u64> {
     if until.is_some_and(|until| std::time::Instant::now() >= until) {
         return None;
     }
     let Ok(meta) = fs::symlink_metadata(path) else {
         return Some(0);
     };
+    if meta.dev() != dev {
+        return Some(0);
+    }
     if meta.is_dir() {
         let mut total = 0;
         for entry in fs::read_dir(path).into_iter().flatten().flatten() {
-            total += size_until(&entry.path(), until)?;
+            total += size_until(&entry.path(), until, dev)?;
         }
         Some(total)
     } else if meta.is_file() {
@@ -182,6 +182,15 @@ fn size_until(path: &Path, until: Option<std::time::Instant>) -> Option<u64> {
 /// is absent, so there is nothing to touch, and that is inside. Anything
 /// that cannot be inspected is outside (slice 5 review P1-a).
 pub fn outside(root: &Path, rel: &Path) -> Option<String> {
+    match fs::metadata(root) {
+        Ok(meta) => outside_on(root, rel, meta.dev()),
+        Err(e) => Some(format!("{} cannot be inspected: {e}", root.display())),
+    }
+}
+
+/// As `outside`, with every component also on device `dev`: a volume
+/// mounted inside the seat is not the seat's (ferry-xtx.23).
+fn outside_on(root: &Path, rel: &Path, dev: u64) -> Option<String> {
     let mut at = root.to_path_buf();
     for part in rel.components() {
         let std::path::Component::Normal(name) = part else {
@@ -192,12 +201,52 @@ pub fn outside(root: &Path, rel: &Path) -> Option<String> {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Some(format!("{} is behind a symbolic link", rel.display()));
             }
+            Ok(meta) if meta.dev() != dev => {
+                return Some(format!("{} crosses into another device", rel.display()));
+            }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => return Some(format!("{} cannot be inspected: {e}", rel.display())),
         }
     }
     None
+}
+
+/// Bytes under `rel` below `root`, on `root`'s device.
+pub fn size_in(root: &Path, rel: &Path) -> u64 {
+    fs::metadata(root).map_or(0, |meta| {
+        size_until(&root.join(rel), None, meta.dev()).unwrap_or(0)
+    })
+}
+
+/// Deletes `rel` below `root`, proving containment again immediately before
+/// (so the window after any earlier check is this call), and never crossing
+/// into another device. An absent path is already deleted.
+pub fn remove(root: &Path, rel: &Path) -> Result<()> {
+    if let Some(why) = outside(root, rel) {
+        return Err(format!("{why}: not deleted").into());
+    }
+    remove_on(&root.join(rel), fs::metadata(root)?.dev())
+}
+
+fn remove_on(path: &Path, dev: u64) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.dev() != dev {
+        return Err(format!("{} is on another device: not deleted", path.display()).into());
+    }
+    if meta.is_dir() {
+        for entry in fs::read_dir(path)? {
+            remove_on(&entry?.path(), dev)?;
+        }
+        fs::remove_dir(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// Under the run's seat lock, before the checkout: when the seat was last
@@ -237,12 +286,12 @@ pub fn cap(
             }
             None => true,
         })
-        .map(|rel| root.join(rel))
         .collect();
+    let dev = fs::metadata(root)?.dev();
     let until = std::time::Instant::now() + MEASURE_LIMIT;
     let Some(bytes) = paths
         .iter()
-        .map(|path| size_until(path, Some(until)))
+        .map(|rel| size_until(&root.join(rel), Some(until), dev))
         .sum::<Option<u64>>()
     else {
         crate::run::note_after(format!(
@@ -261,12 +310,8 @@ pub fn cap(
         if crate::execution::fail_at("cap-wipe") {
             return Err("cap-wipe: injected by FERRY_FAIL_AT".into());
         }
-        for path in &paths {
-            match fs::symlink_metadata(path) {
-                Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)?,
-                Ok(_) => fs::remove_file(path)?,
-                Err(_) => {}
-            }
+        for rel in &paths {
+            remove(root, rel)?;
         }
     }
     fs::create_dir_all(root.join("caches"))?;
@@ -277,8 +322,8 @@ pub fn cap(
 
 #[cfg(test)]
 mod tests {
-    use super::{outside, size_until};
-    use std::path::Path;
+    use super::{outside, outside_on, remove_on, size_until};
+    use std::{fs, os::unix::fs::MetadataExt, os::unix::fs::symlink, path::Path};
 
     /// At the point of deletion, independently of request validation, only a
     /// plain relative path without a link on the way is inside (review S2).
@@ -286,8 +331,8 @@ mod tests {
     fn only_plain_paths_without_links_are_inside() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        std::fs::create_dir_all(root.join("slots/s/real")).unwrap();
-        std::os::unix::fs::symlink("/", root.join("slots/s/link")).unwrap();
+        fs::create_dir_all(root.join("slots/s/real")).unwrap();
+        symlink("/", root.join("slots/s/link")).unwrap();
         assert_eq!(outside(root, Path::new("slots/s/real/x")), None);
         assert_eq!(outside(root, Path::new("slots/s/absent/x")), None);
         for rel in ["/etc", "slots/s/../../x", "slots/s/link/etc"] {
@@ -300,29 +345,62 @@ mod tests {
     #[test]
     fn cap_must_not_delete_through_a_preserve_parent_symlink() {
         let owned = tempfile::tempdir().unwrap();
-        let root = owned.path().join("ferry");
-        let slot = root.join("slots/seat");
-        let outside = owned.path().join("outside");
-        std::fs::create_dir_all(&slot).unwrap();
-        std::fs::create_dir_all(outside.join("cache")).unwrap();
+        let (root, outside) = (owned.path().join("ferry"), owned.path().join("outside"));
+        fs::create_dir_all(root.join("slots/seat")).unwrap();
+        fs::create_dir_all(outside.join("cache")).unwrap();
         let sentinel = outside.join("cache/not-ferry-owned");
-        std::fs::write(&sentinel, "must survive").unwrap();
-        std::os::unix::fs::symlink(&outside, slot.join("link")).unwrap();
+        fs::write(&sentinel, "must survive").unwrap();
+        symlink(&outside, root.join("slots/seat/link")).unwrap();
         crate::config::preserve_path("link/cache").unwrap();
         let _ = super::cap(&root, "seat", &["link/cache".into()], 1, false);
-        assert!(
-            sentinel.exists(),
-            "cap deleted outside the seat through an ancestor symlink"
-        );
+        assert!(sentinel.exists(), "cap deleted through an ancestor symlink");
+    }
+
+    /// Nothing on another device is inside, measured or deleted: a volume
+    /// mounted in a seat is not the seat's. A different device stands in for
+    /// a mount, which a test cannot make (ferry-xtx.23).
+    #[test]
+    fn another_device_is_never_inside_measured_or_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let (root, mount) = (root.path(), Path::new("slots/s/mount"));
+        fs::create_dir_all(root.join(mount)).unwrap();
+        fs::write(root.join(mount).join("data"), [0u8; 16]).unwrap();
+        let dev = fs::metadata(root).unwrap().dev();
+        let other = dev.wrapping_add(1);
+        assert_eq!(outside_on(root, mount, dev), None);
+        assert!(outside_on(root, mount, other).is_some_and(|why| why.contains("another device")));
+        assert_eq!(size_until(&root.join("slots"), None, other), Some(0));
+        assert!(remove_on(&root.join(mount), other).is_err());
+        assert!(root.join(mount).join("data").exists());
+        remove_on(&root.join(mount), dev).unwrap();
+        assert!(!root.join(mount).exists());
+    }
+
+    /// A delete proves containment again at its own moment: a directory
+    /// swapped for a symbolic link after an earlier check is not followed
+    /// (ferry-xtx.23).
+    #[test]
+    fn a_delete_rechecks_containment_at_its_moment() {
+        let (root, away) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (root, build) = (root.path(), Path::new("slots/s/build"));
+        fs::create_dir_all(root.join(build)).unwrap();
+        assert_eq!(outside(root, &build.join("cache")), None);
+        fs::remove_dir(root.join(build)).unwrap();
+        symlink(away.path(), root.join(build)).unwrap();
+        fs::create_dir(away.path().join("cache")).unwrap();
+        fs::write(away.path().join("cache/sentinel"), "keep").unwrap();
+        assert!(super::remove(root, &build.join("cache")).is_err());
+        assert!(away.path().join("cache/sentinel").exists());
     }
 
     /// A measurement gives up once its time is over (review P2).
     #[test]
     fn a_measurement_past_its_time_gives_up() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("blob"), [0u8; 16]).unwrap();
-        assert_eq!(size_until(root.path(), None), Some(16));
+        fs::write(root.path().join("blob"), [0u8; 16]).unwrap();
+        let dev = fs::metadata(root.path()).unwrap().dev();
+        assert_eq!(size_until(root.path(), None, dev), Some(16));
         let past = std::time::Instant::now();
-        assert_eq!(size_until(root.path(), Some(past)), None);
+        assert_eq!(size_until(root.path(), Some(past), dev), None);
     }
 }

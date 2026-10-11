@@ -246,3 +246,29 @@ There is no daemon, no second lock protocol, and no cross-seat eviction.
     how `git clean` and the cap act on preserve paths.
 - **SPEC §12** gains these controls with this slice (§7); the coordinator
   amends SPEC.
+
+## 11. Hardening before deploy (2026-10-11, ferry-xtx.23)
+
+The critic's P2s on 655170bd (GO), by reading; evidence
+`ferry-critic-s23-evidence/5-r2/critic5.rs`. Landed before the joint 4b+5
+deploy window.
+
+1. **No mount crossing.** `outside` also requires every component to be on
+   the state root's device, so a volume mounted inside a seat is not the
+   seat's. The size walk counts nothing on another device, and the delete
+   (`admission::remove`, replacing `remove_dir_all`, which crosses mounts)
+   refuses to descend into one. A test cannot mount, so the control is a
+   unit test with a different device standing in.
+2. **The check is repeated at the delete.** `admission::remove` proves
+   containment again immediately before each delete, for the cap and for
+   `retire`. The window after the measurement (up to 30 s) is now the gap
+   inside one call. The remaining residue is §10's: a leaver swapping in a
+   link within that gap.
+3. **Documented:** a symbolic link for `slots/` or `caches/` (an operator
+   moving them to another disk) makes every cap and retire on that place
+   refuse, safe but inactive (README, SKILL).
+4. **Documented, not built:** a workspace deleted together with its parent
+   directory is never pruned ("kept … unknown"); its seat stays until an
+   operator removes it. A `--forget` for operator-confirmed retirement
+   would be a feature, so it waits for the stop rule's call.
+

@@ -121,7 +121,13 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
   by exact pid, never by pattern. There is no `ferry seat recover`: a busy
   seat clears when what holds its lock exits.
 - **Stale seats:** `ferry seats prune` retires your seats whose workspace is
-  gone; it skips busy ones and only names seats you recorded.
+  gone; it skips busy ones and only names seats you recorded. "kept …
+  unknown" means it could not prove the workspace gone (a denied lookup, a
+  missing parent directory, another device); it never deletes then. A
+  workspace deleted together with its parent stays "unknown": tell the
+  operator. A cap or retire note about a symbolic link or another device
+  means the place's `slots/` or `caches/` is not a plain directory on its
+  state disk: tell the operator.
 
 ## Waiting lines
 

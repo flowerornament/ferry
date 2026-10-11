@@ -604,24 +604,23 @@ pub fn retire(root: &Path, key: &str) -> Result<i32> {
     {
         return Ok(refuse(&format!("{why}: not retired"), "inspect the place"));
     }
-    let paths = paths.map(|rel| root.join(rel));
-    let bytes: u64 = paths.iter().map(|path| crate::admission::size(path)).sum();
-    for path in &paths {
+    let bytes: u64 = paths
+        .iter()
+        .map(|rel| crate::admission::size_in(root, rel))
+        .sum();
+    for rel in &paths {
         if execution::fail_at("retire-delete") {
             return Ok(refuse(
                 "retire-delete: injected by FERRY_FAIL_AT",
                 "prune again",
             ));
         }
-        match fs::remove_dir_all(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Ok(refuse(
-                    &format!("deleting {}: {e}", path.display()),
-                    "prune again",
-                ));
-            }
+        // Containment is proven again right before the delete.
+        if let Err(e) = crate::admission::remove(root, rel) {
+            return Ok(refuse(
+                &format!("deleting {}: {e}", rel.display()),
+                "prune again",
+            ));
         }
     }
     let retired = serde_json::json!({"key": key, "bytes": bytes, "retired_ms": receipt::now_ms()});

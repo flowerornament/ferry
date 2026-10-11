@@ -94,7 +94,7 @@ impl SessionOwner {
             // grace runs out.
             let until = Instant::now() + STOP_GRACE;
             while Instant::now() < until
-                && listed(sid).is_none_or(|members| {
+                && session_list(sid).ok().is_none_or(|members| {
                     members
                         .iter()
                         .any(|pid| u32::try_from(*pid).ok() != Some(sid))
@@ -180,10 +180,6 @@ fn session_list(sid: u32) -> Result<Vec<i32>> {
         return Err("session-list: injected by FERRY_FAIL_AT".into());
     }
     session_members(sid)
-}
-
-fn listed(sid: u32) -> Option<Vec<i32>> {
-    session_list(sid).ok()
 }
 
 pub fn session_members(sid: u32) -> Result<Vec<i32>> {
