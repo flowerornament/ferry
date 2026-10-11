@@ -138,10 +138,13 @@ streams do not.
 ```
 at end:  stop session (TERM → grace 10 s → KILL) ; Linux + systemd: stop the run's scope
 record:  custody = { tier: "scope" | "session",
-                     survivors: [{pid, start, holds: [lock…]}] | "unknown" }
+                     survivors: [{pid, start}] | "unknown" }
 ```
 
-- A survivor that still holds a lock keeps it held, so the seat stays busy.
+- A survivor that still holds a lock keeps it held, so the seat stays busy,
+  and the next run's busy refusal names the run it outlived. The record does
+  not attribute locks to survivors: the kernel lock is the evidence, and
+  attributing it would mean reading other processes' descriptors.
 - A survivor that closed its descriptors is outside Ferry's knowledge: it is
   reported where it is visible and never chased.
 
@@ -226,7 +229,8 @@ working tree.
 6. **Deadline:** `timeout` 124 even with no client; the session is stopped.
 7. **Seat busy:** immediate 125 naming the run.
 8. **Exclusive:** no other run holds `host` while it executes.
-9. **A survivor holding a lock:** the seat stays busy and the record names it.
+9. **A survivor holding a lock:** the seat stays busy; the run's record lists
+   the survivor, and the next run's refusal names the run it outlived.
 10. **A nested run on the same place:** 125.
 11. **Old caller with a new place, and a new caller with an old place:** the
     refusal (125, naming the old `source_rev`), never a mixed state root.
