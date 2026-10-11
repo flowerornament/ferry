@@ -107,8 +107,13 @@ fn reply(value: &serde_json::Value) {
     execution::emit(value.to_string().as_bytes());
 }
 
-fn refuse(why: &str) -> i32 {
-    reply(&serde_json::json!({"refused": why}));
+const SAME_FERRY: &str = "install the same ferry on the caller and the place";
+const FIX: &str = "fix what it names, then run again";
+
+/// A refusal (SPEC §6): `why` and `next` apart, and `refused` as before
+/// for callers that predate them.
+fn refuse(why: &str, next: &str) -> i32 {
+    reply(&serde_json::json!({"refused": why, "why": why, "next": next}));
     125
 }
 
@@ -118,17 +123,20 @@ pub fn submit(root: &Path) -> Result<i32> {
     std::io::stdin().lock().read_line(&mut line)?;
     let mut request: Request = match serde_json::from_str(&line) {
         Ok(request) => request,
-        Err(e) => return Ok(refuse(&format!("parsing the request: {e}"))),
+        Err(e) => {
+            return Ok(refuse(&format!("parsing the request: {e}"), SAME_FERRY));
+        }
     };
     let limit = crate::limits::MAX_TIMEOUT.as_secs();
     if request.timeout_seconds.is_some_and(|t| t > limit) {
-        return Ok(refuse(&format!(
-            "timeout above this place's maximum ({limit} s)"
-        )));
+        return Ok(refuse(
+            &format!("timeout above this place's maximum ({limit} s)"),
+            &format!("ask for at most {limit} s with --timeout-seconds"),
+        ));
     }
     request.timeout_seconds.get_or_insert(limit);
     if let Err(e) = execution::validate(&request) {
-        return Ok(refuse(&format!("validating the request: {e}")));
+        return Ok(refuse(&format!("validating the request: {e}"), FIX));
     }
     // A retried submit (same id and token) follows the run it started.
     if let Some(pid) = existing(root, &request) {
@@ -136,7 +144,10 @@ pub fn submit(root: &Path) -> Result<i32> {
         return Ok(0);
     }
     if execution::fail_at("submit-spawn") {
-        return Ok(refuse("submit-spawn: injected by FERRY_FAIL_AT"));
+        return Ok(refuse(
+            "submit-spawn: injected by FERRY_FAIL_AT",
+            "run again",
+        ));
     }
     // Paused on its stdin: nothing runs until the reservation names it.
     let mut supervisor = Command::new(std::env::current_exe()?)
@@ -176,7 +187,10 @@ pub fn submit(root: &Path) -> Result<i32> {
         // Its own child, by its handle: it never ran anything.
         let _ = supervisor.kill();
         let _ = supervisor.wait();
-        return Ok(refuse(&error.to_string()));
+        return Ok(refuse(
+            &error.to_string(),
+            &format!("ferry record {}", request.id),
+        ));
     }
     if execution::fail_at("submit-release") {
         // As if submit died here: no reply, and its supervisor reads EOF
@@ -199,7 +213,10 @@ pub fn submit(root: &Path) -> Result<i32> {
         result.reason = Some(format!("starting the supervisor: {error}"));
         result.state = Some("final".into());
         let _ = record::finalize(root, &request.id, &serde_json::to_value(&result)?);
-        return Ok(refuse(&format!("starting the supervisor: {error}")));
+        return Ok(refuse(
+            &format!("starting the supervisor: {error}"),
+            "run again",
+        ));
     }
     reply(
         &serde_json::json!({"id": request.id, "pid": pid, "deadline_ms": deadline_ms(submitted_ms, &request)}),
@@ -269,7 +286,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         crate::custody::supervise()?;
         let (seat, lease, host_lease) =
             execution::prepare(root, &request, &stop, &mut result.admission)?;
-        let locks = crate::lock::inherited(&lease, &host_lease);
+        // The work inherits both, on every platform (SPEC §3).
+        let locks: Vec<_> = std::iter::once(&lease).chain(host_lease.files()).collect();
         let finished = execution::run_released(root, &seat, &request, &stop, &locks, deadline);
         if let Some(error) = &finished.custody.error {
             note(
@@ -430,17 +448,24 @@ pub fn stop(
     ]
     .contains(&signal)
     {
-        return Ok(refuse("a stop sends INT, TERM or HUP"));
+        return Ok(refuse(
+            "a stop sends INT, TERM or HUP",
+            "stop with one of them",
+        ));
     }
     let path = root.join("records").join(format!("{id}.reserved.json"));
     let Ok(bytes) = fs::read(&path) else {
-        return Ok(refuse(&format!("run {id} is not running here")));
+        return Ok(refuse(
+            &format!("run {id} is not running here"),
+            &format!("ferry record {id}"),
+        ));
     };
     let reservation: record::Reservation = serde_json::from_slice(&bytes)?;
     if reservation.seat != seat && !other {
-        return Ok(refuse(&format!(
-            "run {id} belongs to another caller; stop it with --other --reason"
-        )));
+        return Ok(refuse(
+            &format!("run {id} belongs to another caller"),
+            &format!("ferry stop {id} --other --reason '<why>'"),
+        ));
     }
     let pid = nix::unistd::Pid::from_raw(i32::try_from(reservation.supervisor.pid)?);
     let live = match crate::seat::start_time(pid.as_raw()) {
@@ -451,7 +476,10 @@ pub fn stop(
         Err(_) => nix::sys::signal::kill(pid, None).is_ok(),
     };
     if !live {
-        return Ok(refuse(&format!("run {id}'s supervisor is gone")));
+        return Ok(refuse(
+            &format!("run {id}'s supervisor is gone"),
+            &format!("ferry record {id}"),
+        ));
     }
     let stopped = serde_json::json!({
         "who": who, "why": why, "other": other, "at_ms": receipt::now_ms(),
@@ -473,7 +501,12 @@ pub fn stop(
         Ok(()) => signal,
         Err(error) => match first_stop_signal(&run_dir(root, id)) {
             Some(first) => nix::sys::signal::Signal::try_from(first)?,
-            None => return Ok(refuse(&format!("recording the stop: {error}"))),
+            None => {
+                return Ok(refuse(
+                    &format!("recording the stop: {error}"),
+                    "stop it again; the run goes on",
+                ));
+            }
         },
     };
     nix::sys::signal::kill(pid, signal)?;

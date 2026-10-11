@@ -248,3 +248,32 @@ run <id>, submitted <n> min ago"`, `next: "ferry follow <id> or ferry stop
 when present and falls back to `refused`, so places and callers can move in
 the same window.
 
+
+## 9. As built (2026-10-11)
+
+- **Busy, by state, not timing (replaces A1's re-read; accepted by the
+  coordinator).** The synchronization it rests on: every run reserves its
+  record (`records/<id>.reserved.json`, naming its seat) before it touches
+  the seat lock, and the supervisor reconciles the seat's reservations
+  (`record::reconcile_seat`) before it tries the lock. So when the lock is
+  held, every other reservation for the seat is a live run:
+  - the lock file names a live reservation: that run holds the seat
+    (`seat busy: run <id>, submitted <n> min ago; ferry follow <id> or
+    ferry stop <id>`);
+  - it names a final run (or nothing), but a live reservation exists: that
+    run holds the lock and has not written its id yet (`held by a run that
+    is starting (<ids>)`);
+  - neither: the lock outlived the run it names (`held after run <id> ended
+    (<outcome>), by something it started; ferry record <id>`).
+- **Controls:** `a_busy_seat_refuses_at_once_naming_the_run` (§12.7);
+  `a_run_refused_while_the_holder_starts_names_it_not_the_last_run`
+  (FERRY_FAIL_AT=seat-lock-write holds the window open);
+  `a_lock_held_after_its_run_keeps_the_seat_busy` (macOS; on Linux the census
+  stops such a leaver until 4b); `a_host_refusal_before_acceptance…` now
+  checks the place's `why; next`.
+- **Size:** src +16 for the move, +87 for the behaviour. Slice 4 is measured
+  as one unit: 4b must take src below 5950, the level before 4a (coordinator,
+  2026-10-11).
+- **SPEC §6:** `refuse(why, next)` replies `{refused, why, next}`; `refused`
+  stays for older callers, and the caller joins `why; next` when both are
+  present.

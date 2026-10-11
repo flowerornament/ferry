@@ -31,16 +31,17 @@ ferry run test --on bench --json       # NDJSON events, for tools
   must exist and be described (jj) or committed (git); uncommitted edits are
   not part of the run.
 - **One seat per workspace.** `--seat <name>` (default `default`) picks your
-  private checkout. Concurrent runs in the same seat take turns; use a
-  different seat for parallel work.
+  private checkout. A seat runs one run at a time, and a second run on a
+  busy seat is refused at once (125, naming the run that holds it): use a
+  different seat for parallel work, or follow or stop the named run.
 - **Declare `--timeout-seconds`** for what the recipe needs. Without it, the
   run gets the machine's maximum, 6 h, and a hung recipe holds its seat that
   long.
 - **Every run has a deadline:** submit + `--wait-seconds` (30 min by
   default) + timeout + teardown. It ends the run even with no caller.
-- **Waits are bounded.** A run's waits for its seat and the host lease
-  together end `--wait-seconds` after it was submitted; then it is refused
-  (125) naming the run that holds the lock.
+- **Waits are bounded.** A run never waits for its seat. Its waits for the
+  host lease end `--wait-seconds` after it was submitted; then it is
+  refused (125) naming the run that holds the lease.
 - **Exclusive waits.** An exclusive run waits for in-flight runs on that
   machine and keeps new ones out. Use it only for measurements.
 - **The run is the machine's, not your terminal's.** Closing the terminal or
@@ -92,6 +93,12 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 
 ## Refusals (125) and their next step
 
+- **Seat busy:** `seat busy: run <id>, submitted <n> min ago` means your seat
+  already has a run. `ferry follow <id>` or `ferry stop <id>`, or use another
+  `--seat`. "Held after run <id> ended" means something that run started
+  still holds the seat's lock: `ferry record <id>` names the run; stop the
+  leftover process by its exact pid.
+
 - **Unmet requirement or unknown machine:** the recipe's `requires` are not
   all in a machine's features. Pick another `--on`, or run `--local` if the
   recipe allows it.
@@ -119,7 +126,7 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 ## Waiting lines
 
 `ferry: waiting for lock …: another run holds it` means another run holds
-your seat or the host lease. That is normal while another agent's exclusive
+the host lease. That is normal while another agent's exclusive
 measurement runs. Wait (at most `--wait-seconds`), or Ctrl-C (the run is then
 `stopped` 130, and nothing is left behind).
 

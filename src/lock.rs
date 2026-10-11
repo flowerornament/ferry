@@ -13,6 +13,28 @@ use std::{
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// The seat lock, tried once (SPEC §5): its file, or `None` while another
+/// run holds it. The holder writes its run id into the file once it holds
+/// it, and never clears it: a lock that outlives its run still names it.
+pub(crate) fn try_seat(path: &Path, id: &str) -> Result<Option<fs::File>> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            crate::execution::pause_at("seat-lock-write", path);
+            file.set_len(0)?;
+            (&file).write_all(id.as_bytes())?;
+            Ok(Some(file))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Polls for a lock until it is granted, `stop` is set, `waiting` (run on
 /// every contended attempt) refuses, or the run's one wait budget ends
 /// (`waits_end_ms`, else `wait` from now); then it refuses naming the holder. An exclusive holder writes its run id into
@@ -184,18 +206,6 @@ pub(crate) fn close_on_exec(file: &fs::File, close: bool) -> Result<()> {
     };
     fcntl(file, FcntlArg::F_SETFD(flags))?;
     Ok(())
-}
-
-/// The lock descriptors a session inherits: the seat lock and the host
-/// lease, only where survivors can be stopped (the Linux census). Elsewhere
-/// a survivor that kept them would hold them indefinitely, so they stay
-/// close-on-exec and a killed supervisor frees them while the recipe lives.
-pub fn inherited<'a>(seat: &'a fs::File, lease: &'a HostLease) -> Vec<&'a fs::File> {
-    if cfg!(target_os = "linux") {
-        std::iter::once(seat).chain(lease.files()).collect()
-    } else {
-        vec![]
-    }
 }
 
 #[cfg(test)]

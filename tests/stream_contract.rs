@@ -797,7 +797,7 @@ fn a_stop_during_prepare_spawns_nothing() {
             .and_then(|entries| {
                 entries
                     .flatten()
-                    .find(|e| e.path().join("paused").exists())
+                    .find(|e| e.path().join("spawn.paused").exists())
                     .map(|e| id = e.file_name().to_string_lossy().into_owned())
             })
             .is_some()
@@ -808,6 +808,9 @@ fn a_stop_during_prepare_spawns_nothing() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The stop's signal is delivered; let the run go on to its spawn.
+    thread::sleep(Duration::from_millis(200));
+    fs::write(runs.join(&id).join("spawn.go"), "").unwrap();
     let mut code = None;
     wait_until("the caller ended", || {
         code = caller.0.try_wait().unwrap().map(|status| status.code());
@@ -1024,32 +1027,165 @@ fn the_deadline_ends_a_run_with_no_client() {
     assert!(!owners.exists() || fs::read_dir(&owners).unwrap().count() == 0);
 }
 
-/// One wait budget for all of a run's locks (critic C3): seat, gate and
-/// host each held in turn for less than the wait must not add up past it.
+// --- Seat busy (SPEC §12.7) ---
+
+/// The local seat lock of the default seat, once a run has created it.
+fn seat_lock(dir: &Path) -> PathBuf {
+    fs::read_dir(dir.join(".ferry/local/locks"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with("-default"))
+        .unwrap()
+}
+
+/// A busy seat refuses at once (SPEC §12.7): 125, naming the run that
+/// holds it, its age and the next step. It never waits behind it.
+#[test]
+fn a_busy_seat_refuses_at_once_naming_the_run() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (started, release) = (
+        scratch.path().join("started"),
+        scratch.path().join("release"),
+    );
+    let dir = fixture(
+        &format!(
+            "touch {}; while [ ! -e {} ]; do sleep 0.1; done",
+            started.display(),
+            release.display()
+        ),
+        "",
+    );
+    let holder = Caller(
+        ferry(dir.path())
+            .args(["run", "probe", "--local", "--timeout-seconds", "120"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("the holder's recipe started", || started.exists());
+    let holder_id = only_receipt_file(dir.path())["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A long wait would show: the refusal must come long before it.
+    let asked = Instant::now();
+    let out = bounded_output(ferry(dir.path()).args([
+        "run",
+        "probe",
+        "--local",
+        "--json",
+        "--wait-seconds",
+        "600",
+    ]));
+    assert!(asked.elapsed() < Duration::from_secs(10) + common::slack());
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("seat busy: run {holder_id}, submitted"))
+            && reason.contains(&format!("ferry follow {holder_id}")),
+        "{reason}"
+    );
+    fs::write(&release, "").unwrap();
+    drop(holder);
+}
+
+/// Between taking the seat lock and writing its id, the lock file still
+/// names the previous, finished run (amendment A1). A run refused in that
+/// window must not blame the finished run: it names the one starting.
+#[test]
+fn a_run_refused_while_the_holder_starts_names_it_not_the_last_run() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let lock = seat_lock(dir.path());
+    let holder = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "seat-lock-write")
+            .args(["run", "probe", "--local", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("the holder took the lock", || {
+        lock.with_extension("paused").exists()
+    });
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("held by a run that is starting") && !reason.contains("ended"),
+        "{reason}"
+    );
+    fs::write(lock.with_extension("go"), "").unwrap();
+    let mut holder = holder;
+    let mut code = None;
+    wait_until("the holder ended", || {
+        code = holder.0.try_wait().unwrap().map(|status| status.code());
+        code.is_some()
+    });
+    assert_eq!(code.flatten(), Some(0));
+}
+
+/// The work inherits its locks on every platform (SPEC §3): what a run
+/// started and left running, still holding them, keeps the seat busy, and
+/// the next run's refusal names the run it outlived. On Linux the census
+/// stops such a process (custody, slice 4b), so this is the Mac's case.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_lock_held_after_its_run_keeps_the_seat_busy() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaver.pid");
+    let dir = fixture(
+        &format!(
+            "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let _leaver = Owned(pidfile.clone());
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let first = receipt(&out);
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!(
+            "seat busy: held after run {} ended (ran-pass)",
+            first["id"].as_str().unwrap()
+        )),
+        "{reason}"
+    );
+}
+
+/// One wait budget for all of a run's locks (critic C3): gate and host,
+/// each held in turn for less than the wait, must not add up past it.
 /// Every wait ends by submitted + wait, so the deadline holds by
 /// construction; the run is refused naming a holder.
 #[test]
 fn the_lock_waits_together_end_by_one_bound() {
     use fs2::FileExt;
     let dir = fixture("echo ran", "");
-    // One run to create the seat's lock and learn its name.
-    let out = ferry(dir.path())
-        .args(["run", "probe", "--local"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0));
     let locks = dir.path().join(".ferry/local/locks");
-    let seat = fs::read_dir(&locks)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with("-default")
-        })
-        .unwrap();
+    fs::create_dir_all(&locks).unwrap();
     let hold = |p: &Path| {
         let file = fs::OpenOptions::new()
             .read(true)
@@ -1061,8 +1197,7 @@ fn the_lock_waits_together_end_by_one_bound() {
         file.lock_exclusive().unwrap();
         file
     };
-    let (seat_lock, gate, host) = (
-        hold(&seat),
+    let (gate, host) = (
         hold(&locks.join("host-gate")),
         hold(&locks.join("host-exclusive")),
     );
@@ -1076,13 +1211,29 @@ fn the_lock_waits_together_end_by_one_bound() {
             .spawn()
             .unwrap(),
     );
-    // Each held 3 s, under the 4 s wait; together 9 s.
-    for lock in [seat_lock, gate, host] {
-        thread::sleep(Duration::from_secs(3));
-        drop(lock);
-    }
+    // Each is released once the run has waited 3 s on it (its supervisor
+    // says so in its log), under the 4 s wait; together over 6 s. Following
+    // the run, not the clock, keeps this true on a loaded machine. (The seat
+    // is never waited for: a held seat refuses at once.)
+    let runs = dir.path().join(".ferry/local/runs");
+    let said = |name: &str| {
+        fs::read_dir(&runs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                fs::read_to_string(e.path().join("supervisor.log"))
+                    .is_ok_and(|log| log.contains(&format!("waiting for lock {name}:")))
+            })
+    };
+    let mut locks = vec![("host-gate", Some(gate)), ("host-exclusive", Some(host))];
     let mut code = None;
     wait_until("the caller ended", || {
+        for (name, lock) in &mut locks {
+            if lock.is_some() && said(name) {
+                drop(lock.take());
+            }
+        }
         code = caller.0.try_wait().unwrap().map(|status| status.code());
         code.is_some()
     });

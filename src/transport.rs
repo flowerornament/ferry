@@ -452,7 +452,13 @@ pub fn run_on(
     let out = submit.wait_with_output()?;
     let reply = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok();
     let refused = match &reply {
-        Some(reply) => reply["refused"].as_str().map(str::to_owned),
+        // `why; next` from a place that sends them apart (SPEC §6).
+        Some(reply) => reply["refused"].as_str().map(|refused| {
+            match (reply["why"].as_str(), reply["next"].as_str()) {
+                (Some(why), Some(next)) => format!("{why}; {next}"),
+                _ => refused.to_owned(),
+            }
+        }),
         // No reply: exit 125 refused before any effect; anything else may
         // have started the run, so the receipt stays submitted.
         None if out.status.code() == Some(125) => {

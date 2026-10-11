@@ -59,7 +59,7 @@ feature refuses rather than running.
 |---|---|
 | **Recipe** | A named command (argv) the repository allows to run, with required features. Read from the commit being run. |
 | **Machine** | Where work runs: `local`, or an SSH destination with declared features. |
-| **Seat** | A private, warm checkout for one workspace (`--seat`, default `default`). One run at a time per seat. |
+| **Seat** | A private, warm checkout for one workspace (`--seat`, default `default`). One run at a time per seat: a run that finds its seat's lock held is refused at once (125), naming the run that holds it, its age and the next step. |
 | **Host lease** | Shared by every run on a machine; held alone by an exclusive run. |
 | **Run** | One attempt. It ends with exactly one receipt and one exit code. |
 | **Receipt** | `.ferry/receipts/<id>.json`: the commit, the binaries on both ends, the outcome, custody, lease and admission facts. Written at submit with every caller fact (`state: submitted`), then replaced by the final receipt (`state: final`). A refusal before submit is a final receipt. |
@@ -353,10 +353,16 @@ a quiet-host certificate, and it does not quiet:
 - other virtual machines on the same hardware;
 - Ferry binaries older than the lease.
 
-A run's lock waits (the seat's and the host lease's) share one bound: all of
-them end by its submit plus `--wait-seconds` (default 30 min), apart from
-`--timeout-seconds`. Past it the run refuses (125), naming the run that holds
-the lock exclusively, or "shared runs".
+A run never waits for its seat: a held seat lock refuses at once (125). The
+refusal names the run that holds it, or the run that is starting and holds
+it, or, when the lock outlived its run, that run ("held after run <id>
+ended"). The work inherits the seat lock and the host lease on every
+platform, so whatever a run leaves running while holding them keeps them
+held. Its waits for the host lease end by its submit plus `--wait-seconds`
+(default 30 min), apart from `--timeout-seconds`. Past it the run refuses
+(125), naming the run that holds the lease exclusively, or "shared runs".
+A place's refusal carries `why` and `next` apart (SPEC §6); the receipt's
+reason is `<why>; <next>`.
 
 ### Custody: nothing a run starts outlives it
 
@@ -394,10 +400,11 @@ is gone, checked by pid and start time. A taint that cannot be proven clear
 (no survivors named, or an unreadable record) needs the operator's explicit
 `--accept-unknown --reason '<why>'`, which the recover receipt keeps.
 
-**Locks outlive a killed supervisor (Linux).** The seat lock and host lease
-are inherited by the recipe's processes. A killed supervisor therefore frees
-them only when the processes that kept them exit, so a new run waits instead
-of starting beside live work. Release closes descriptors, never `LOCK_UN`.
+**Locks outlive a killed supervisor.** The seat lock and host lease are
+inherited by the recipe's processes, on every platform. A killed supervisor
+therefore frees them only when the processes that kept them exit, so a new
+run on the seat is refused busy instead of starting beside live work.
+Release closes descriptors, never `LOCK_UN`.
 
 **Linux and macOS differ:**
 - **Linux:** the supervisor is a child subreaper. A process that leaves the
@@ -405,8 +412,9 @@ of starting beside live work. Release closes descriptors, never `LOCK_UN`.
   counted and stopped.
 - **macOS:** there is no census yet (`unsupported`). Session teardown kills
   the recipe's session, but a descendant that leaves the session escapes.
-  Locks are not inherited there, and the seat is never recorded idle. The
-  receipt says so.
+  If it keeps the inherited locks, the seat stays busy until it exits, and
+  the next run's refusal names the run it outlived. The seat is never
+  recorded idle. The receipt says so.
 
 ### Detached runs, output and the verdict
 
@@ -466,8 +474,8 @@ supervisor's pid), then `receipt`.
 - **A supervisor killed outright** stops nothing. Its run is reconciled to
   `lost`/255 by its caller or the next run on the seat.
   - Its owner marker keeps that seat refused until `ferry seat recover`.
-  - On Linux the inherited locks keep other runs out while its work lives.
-  - On macOS an `--exclusive` run on another seat is not kept out.
+  - The inherited locks keep other runs out while its work lives, on every
+    platform.
 - **Unconfirmed session cleanup** writes a `cleanup-pending-*` marker. Further
   runs under that state root refuse until an operator confirms the session is
   gone and removes the marker; Ferry never clears it by age.

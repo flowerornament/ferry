@@ -255,6 +255,46 @@ pub fn reconcile_seat(root: &Path, seat: &str) {
     }
 }
 
+/// Why a seat is busy, from the run its lock file names and the seat's
+/// other reservations. Those were reconciled before the lock was tried, so
+/// each is a live run. Named and live: that run, its age, the next step.
+/// Otherwise a live one is starting (it holds the lock, its id not yet
+/// written). Otherwise the lock outlived the run it names.
+pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
+    let live: Vec<Reservation> = fs::read_dir(records(root))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".reserved.json"))
+        .filter_map(|e| serde_json::from_slice::<Reservation>(&fs::read(e.path()).ok()?).ok())
+        .filter(|r| r.seat == seat && r.id != own)
+        .collect();
+    if let Some(run) = live.iter().find(|r| r.id == named) {
+        let minutes = crate::receipt::now_ms().saturating_sub(run.submitted_ms) / 60_000;
+        return format!(
+            "seat busy: run {named}, submitted {minutes} min ago; ferry follow {named} or ferry stop {named}"
+        );
+    }
+    if !live.is_empty() {
+        let ids: Vec<&str> = live.iter().map(|r| r.id.as_str()).collect();
+        return format!(
+            "seat busy: held by a run that is starting ({}); ferry follow <id> or ferry stop <id>",
+            ids.join(", ")
+        );
+    }
+    let ended = (!named.is_empty())
+        .then(|| fs::read(final_path(root, named)).ok())
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    match ended {
+        Some(record) => format!(
+            "seat busy: held after run {named} ended ({}), by something it started; ferry record {named}",
+            record["outcome"].as_str().unwrap_or("unknown")
+        ),
+        None => "seat busy: held by an unknown process".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Reservation, finalize, reconcile_with, reserve};

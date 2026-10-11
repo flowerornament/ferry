@@ -205,21 +205,18 @@ pub fn warn(message: &str) {
 
 /// Debug builds only: whether a control asked this fallible point to fail
 /// (`FERRY_FAIL_AT=<point>[,<point>…]`). Release builds never read it.
-/// Debug builds, `FERRY_FAIL_AT=prepare-pause`: after the locks, before
-/// anything is spawned, mark `runs/<id>/paused` and wait (at most 60 s) for
-/// the run's stop to be recorded, so a control can stop it in that window.
-fn pause_before_spawn(root: &Path, request: &Request) {
-    if !fail_at("prepare-pause") {
+/// Debug builds, `FERRY_FAIL_AT=<point>`: mark `<at>.paused` and wait (at
+/// most 60 s) for `<at>.go`, so a control can act inside a window.
+pub fn pause_at(point: &str, at: &Path) {
+    if !fail_at(point) {
         return;
     }
-    let dir = root.join("runs").join(&request.id);
-    let _ = fs::write(dir.join("paused"), "");
+    let (paused, go) = (at.with_extension("paused"), at.with_extension("go"));
+    let _ = fs::write(&paused, "");
     let until = Instant::now() + Duration::from_secs(60);
-    while !dir.join("stop.json").exists() && Instant::now() < until {
+    while !go.exists() && Instant::now() < until {
         thread::sleep(Duration::from_millis(20));
     }
-    // The stop's signal is on its way.
-    thread::sleep(Duration::from_millis(200));
 }
 
 pub fn fail_at(point: &str) -> bool {
@@ -282,17 +279,15 @@ pub fn prepare(
     validate(request)?;
     fs::create_dir_all(root.join("locks"))?;
     let local = root.ends_with("local");
-    // A tainted seat refuses before, while and after waiting for its lock: a
-    // survivor that kept the lock would otherwise keep this run waiting.
+    // A tainted seat refuses before and after its lock is tried.
     let tainted = || crate::custody::check(root, &request.seat, local);
     tainted()?;
-    let lease = crate::lock::acquire_as(
-        &root.join("locks").join(&request.seat),
-        stop,
-        false,
-        &tainted,
-        request,
-    )?;
+    // A busy seat refuses at once, naming the run that holds it (SPEC §5).
+    let path = root.join("locks").join(&request.seat);
+    let Some(lease) = crate::lock::try_seat(&path, &request.id)? else {
+        let named = fs::read_to_string(&path).unwrap_or_default();
+        return Err(crate::record::busy(root, &request.seat, &request.id, named.trim()).into());
+    };
     crate::seat::check(root, &request.seat, local)?;
     tainted()?;
     crate::custody::begin(root, &request.seat)?;
@@ -677,7 +672,10 @@ pub fn run(
 ) -> (Result<Ended>, Option<Collection>, Output) {
     // A stop that came while the run prepared: nothing is spawned, neither
     // the recipe nor the collect hook.
-    pause_before_spawn(root, request);
+    pause_at(
+        "prepare-pause",
+        &root.join("runs").join(&request.id).join("spawn"),
+    );
     if stop.load(Ordering::SeqCst) {
         return (Ok(Ended::Stopped), None, Output::default());
     }

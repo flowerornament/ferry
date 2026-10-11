@@ -659,62 +659,43 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
             Err(e) => panic!("probing {name}: {e}"),
         }
     };
-    if !cfg!(target_os = "linux") {
-        // No census to stop survivors here, so sessions do not inherit the
-        // locks: a killed supervisor frees them while the recipe lives (the
-        // documented residue), and the owner marker refuses the seat.
-        assert!(!held(seat), "the seat lock outlived its supervisor here");
-        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-        assert_eq!(out.status.code(), Some(125));
-        assert!(
-            receipt(&out)["reason"]
-                .as_str()
-                .unwrap()
-                .contains("seat recover")
-        );
-        let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
-        assert_eq!(out.status.code(), Some(125));
-        fs::write(&release, "finish").unwrap();
-        let deadline = common::startup_deadline();
-        while !run(dir.path(), &["seat", "recover", seat, "--local"])
-            .status
-            .success()
-        {
-            assert!(Instant::now() < deadline, "session did not exit");
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!ownership.exists());
-        drop(group);
-        return;
-    }
-    // The session inherited the seat lock and host lease: they stay held
-    // while the recipe lives, though its supervisor is gone.
+    // The session inherited the seat lock and host lease, on every
+    // platform: they stay held while the recipe lives, though its
+    // supervisor is gone.
     assert!(held(seat), "the seat lock freed while the recipe lives");
     assert!(
         held("host-exclusive"),
         "the host lease freed while the recipe lives"
     );
-    // A new run on the seat waits for it rather than starting beside it.
-    let mut next = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .args(["run", "pass", "--local", "--json"])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
+    // A new run on the seat refuses at once, never starting beside it: the
+    // lock names the killed run, reconciled to lost, whose work holds it.
+    let killed = fs::read_to_string(&caller_output)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["event"] == "submitted")
+        .and_then(|event| event["id"].as_str().map(str::to_owned))
         .unwrap();
-    thread::sleep(Duration::from_millis(1000));
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    let reason = receipt(&out)["reason"].as_str().unwrap().to_owned();
     assert!(
-        next.try_wait().unwrap().is_none(),
-        "a run started beside a live recipe"
+        reason.contains(&format!("seat busy: held after run {killed} ended (lost)")),
+        "{reason}"
     );
     let out = run(dir.path(), &["seat", "recover", seat, "--local"]);
     assert_eq!(out.status.code(), Some(125));
     assert!(receipt(&out)["reason"].as_str().unwrap().contains("in use"));
     assert!(ownership.exists());
     fs::write(&release, "finish").unwrap();
-    // Once the session is gone, the waiting run takes the seat and refuses:
+    let deadline = common::startup_deadline();
+    while held(seat) {
+        assert!(Instant::now() < deadline, "the recipe kept the seat");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Once the session is gone, the next run takes the seat and refuses:
     // the dead supervisor's owner marker remains until recovery.
-    let out = next.wait_with_output().unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert_eq!(out.status.code(), Some(125));
     assert!(
         receipt(&out)["reason"]
@@ -1256,6 +1237,15 @@ fn a_host_refusal_before_acceptance_is_refused_not_lost() {
             .as_str()
             .unwrap()
             .starts_with("place refused before acceptance: reserving "),
+        "{}",
+        record["reason"]
+    );
+    // The place's why and next (SPEC §6), joined.
+    assert!(
+        record["reason"].as_str().unwrap().ends_with(&format!(
+            "; ferry record {}",
+            record["id"].as_str().unwrap()
+        )),
         "{}",
         record["reason"]
     );
