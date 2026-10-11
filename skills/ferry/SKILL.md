@@ -126,7 +126,7 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
   missing parent directory, another device); it never deletes then. A
   workspace deleted together with its parent stays "unknown": tell the
   operator. A cap or retire note about a symbolic link or another device
-  means the place's `slots/` or `caches/` is not a plain directory on its
+  means the place's `seats/` is not a plain directory on its
   state disk: tell the operator.
 
 ## Waiting lines

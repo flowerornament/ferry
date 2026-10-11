@@ -145,7 +145,6 @@ pub struct HostInfo {
     pub protocol: u32,
     pub binary_sha256: String,
     pub os_arch: String,
-    pub cores: usize,
     #[serde(default)]
     pub source_rev: Option<String>,
     #[serde(default)]
@@ -159,7 +158,6 @@ pub fn host_info() -> Result<HostInfo> {
         protocol: receipt::PROTOCOL,
         binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
         os_arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        cores: std::thread::available_parallelism()?.get(),
         source_rev: Some(receipt::source_rev()),
         exe: receipt::exe_path(),
         capabilities: receipt::capabilities(),
@@ -262,9 +260,10 @@ impl Place<'_> {
         config::identifier(id)?;
         match self {
             Place::Local(state) => Ok(fs::read(state.join("runs").join(id).join(name))?),
-            Place::Remote(machine) => repository::output(
-                ssh(&machine.ssh)?.arg(format!("cat .local/state/ferry/runs/{id}/{name}")),
-            ),
+            Place::Remote(machine) => repository::output(ssh(&machine.ssh)?.arg(format!(
+                "cat {}/runs/{id}/{name}",
+                crate::place::REMOTE_ROOT
+            ))),
         }
     }
 }
@@ -336,25 +335,21 @@ pub fn ship(
                     "reported host architecture does not meet requirements".into(),
                 );
             }
-            init_store(ssh(&machine.ssh)?.arg(
-                "mkdir -p .local/state/ferry && git init -q --bare .local/state/ferry/repo.git",
-            ))?;
+            init_store(ssh(&machine.ssh)?.arg(format!(
+                "mkdir -p {store} && git init -q --bare {store}",
+                store = *STORE
+            )))?;
             push(
                 root,
                 &machine.ssh,
-                ".local/state/ferry/repo.git",
+                &STORE,
                 &format!(
                     "{}:refs/ferry/{}/{}",
                     request.commit, request.seat, request.commit
                 ),
             )?;
             for (repo, commit) in objects {
-                push(
-                    repo,
-                    &machine.ssh,
-                    ".local/state/ferry/repo.git",
-                    &kept(commit),
-                )?;
+                push(repo, &machine.ssh, &STORE, &kept(commit))?;
             }
             Ok(())
         }
@@ -369,7 +364,7 @@ fn ship_local(
     objects: &[(PathBuf, String)],
 ) -> Result<()> {
     fs::create_dir_all(state)?;
-    let bare = state.join("repo.git");
+    let bare = state.join("store/repo.git");
     init_store(
         Command::new("git")
             .args(["init", "-q", "--bare"])
@@ -410,6 +405,10 @@ fn ship_local(
     }
     Ok(())
 }
+
+/// The place's store, relative to its home directory (SPEC §9).
+static STORE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}/store/repo.git", crate::place::REMOTE_ROOT));
 
 /// The refspec keeping a shipped object in the store, outside `refs/heads`.
 fn kept(commit: &str) -> String {
@@ -462,12 +461,10 @@ pub fn run_on(
     let out = submit.wait_with_output()?;
     let reply = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok();
     let refused = match &reply {
-        // `why; next` from a place that sends them apart (SPEC §6).
+        // `why; next` (SPEC §6), as every place past the `ship` gate sends.
         Some(reply) => reply["refused"].as_str().map(|refused| {
-            match (reply["why"].as_str(), reply["next"].as_str()) {
-                (Some(why), Some(next)) => format!("{why}; {next}"),
-                _ => refused.to_owned(),
-            }
+            let next = reply["next"].as_str().unwrap_or_default();
+            format!("{}; {next}", reply["why"].as_str().unwrap_or(refused))
         }),
         // No reply: exit 125 refused before any effect; anything else may
         // have started the run, so the receipt stays submitted.

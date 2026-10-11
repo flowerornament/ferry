@@ -95,15 +95,26 @@ impl HostResult {
     }
 }
 
-/// The state root: `~/.local/state/ferry` unless named.
+/// The place's state root under the home directory (SPEC §9). It is `v1`
+/// inside the root binaries before M1 used, which never look inside it, so
+/// old and new never share a root; the local route's is
+/// `<repo>/.ferry/local/v1`, the same rule.
+pub const REMOTE_ROOT: &str = ".local/state/ferry/v1";
+
+/// The state root: `~/` + `REMOTE_ROOT` unless named. On first use, the old
+/// root around it gets `locks/legacy-closed`, for any old binary that
+/// honours it (SPEC §6).
 pub fn root(state: Option<PathBuf>) -> Result<PathBuf> {
-    match state {
-        Some(state) => Ok(state),
-        None => Ok(
-            PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?)
-                .join(".local/state/ferry"),
-        ),
+    let root = match state {
+        Some(state) => state,
+        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?).join(REMOTE_ROOT),
+    };
+    if let Some(old) = root.parent().map(|old| old.join("locks"))
+        && old.is_dir()
+    {
+        let _ = fs::write(old.join("legacy-closed"), "closed by the M1 layout (v1)\n");
     }
+    Ok(root)
 }
 
 fn run_dir(root: &Path, id: &str) -> PathBuf {
@@ -118,8 +129,7 @@ fn reply(value: &serde_json::Value) {
 const SAME_FERRY: &str = "install the same ferry on the caller and the place";
 const FIX: &str = "fix what it names, then run again";
 
-/// A refusal (SPEC §6): `why` and `next` apart, and `refused` as before
-/// for callers that predate them.
+/// A refusal (SPEC §6): `{refused, why, next}`.
 fn refuse(why: &str, next: &str) -> i32 {
     reply(&serde_json::json!({"refused": why, "why": why, "next": next}));
     125
@@ -583,7 +593,7 @@ pub const RETIRING: &str = "retiring";
 /// run lock a fresh file of the same name beside it.
 pub fn retire(root: &Path, key: &str) -> Result<i32> {
     crate::config::identifier(key)?;
-    let lock = root.join("locks").join(key);
+    let lock = root.join("locks").join(format!("seat.{key}"));
     if !lock.exists() {
         return Ok(refuse(
             &format!("no seat {key} on this place"),
@@ -596,32 +606,21 @@ pub fn retire(root: &Path, key: &str) -> Result<i32> {
         return Ok(refuse(&why, "prune again later"));
     };
     execution::pause_at("retire-pause", &lock);
-    let paths = [Path::new("slots").join(key), Path::new("caches").join(key)];
-    // Only what is proven inside the place's root is deleted.
-    if let Some(why) = paths
-        .iter()
-        .find_map(|rel| crate::admission::outside(root, rel))
-    {
-        return Ok(refuse(&format!("{why}: not retired"), "inspect the place"));
+    // The seat's whole directory (checkout, cache, measurement stamp);
+    // `remove` proves it inside the root right before deleting it.
+    let rel = Path::new("seats").join(key);
+    let bytes = crate::admission::size_in(root, &rel);
+    if execution::fail_at("retire-delete") {
+        return Ok(refuse(
+            "retire-delete: injected by FERRY_FAIL_AT",
+            "prune again",
+        ));
     }
-    let bytes: u64 = paths
-        .iter()
-        .map(|rel| crate::admission::size_in(root, rel))
-        .sum();
-    for rel in &paths {
-        if execution::fail_at("retire-delete") {
-            return Ok(refuse(
-                "retire-delete: injected by FERRY_FAIL_AT",
-                "prune again",
-            ));
-        }
-        // Containment is proven again right before the delete.
-        if let Err(e) = crate::admission::remove(root, rel) {
-            return Ok(refuse(
-                &format!("deleting {}: {e}", rel.display()),
-                "prune again",
-            ));
-        }
+    if let Err(e) = crate::admission::remove(root, &rel) {
+        return Ok(refuse(
+            &format!("deleting {}: {e}", rel.display()),
+            "prune again",
+        ));
     }
     let retired = serde_json::json!({"key": key, "bytes": bytes, "retired_ms": receipt::now_ms()});
     let path = root.join("records").join(format!("retired-{key}.json"));
@@ -659,15 +658,4 @@ pub fn print_record(root: &Path, id: &str) -> Result<i32> {
         }
         Err(_) => Ok(4),
     }
-}
-
-/// An old caller speaks the host-run stream protocol, which this place no
-/// longer serves: it refuses, so the caller records a refusal.
-pub fn host_run() -> i32 {
-    reply(&serde_json::json!({
-        "protocol": 1,
-        "event": "refused",
-        "reason": "this place runs detached ferry: install the same ferry on the caller",
-    }));
-    125
 }

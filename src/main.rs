@@ -61,17 +61,11 @@ enum Action {
     Record {
         id: String,
     },
-    /// Refuses callers that predate detached runs.
-    #[command(hide = true)]
-    HostRun {
-        #[arg(long)]
-        state: Option<PathBuf>,
-    },
     /// The place side of a run.
     #[command(hide = true)]
     Place {
-        /// The state root (default `~/.local/state/ferry`); the local route
-        /// passes the repository's `.ferry/local`.
+        /// The state root (default `~/.local/state/ferry/v1`); the local
+        /// route passes the repository's `.ferry/local/v1`.
         #[arg(long)]
         state: Option<PathBuf>,
         #[command(subcommand)]
@@ -213,7 +207,6 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         seat: transport::seat_key(root, &options.seat)?,
         recipe: declaration.clone(),
         hooks: config.hooks,
-        caller_binary_sha256: record.caller_binary_sha256.clone(),
         timeout_seconds: options.timeout_seconds,
         forwarded_env: record.forwarded_env.clone(),
         ship: shipped
@@ -241,7 +234,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     submitted.reason = Some("submitted; no verdict yet".into());
     receipt::submit(root, &submitted)?;
     let place = match route {
-        config::Route::Local => transport::Place::Local(root.join(".ferry/local")),
+        config::Route::Local => transport::Place::Local(root.join(".ferry/local/v1")),
         config::Route::Remote(name) => transport::Place::Remote(&hosts.host[name]),
     };
     let objects: Vec<_> = shipped
@@ -259,7 +252,7 @@ fn place_of<'a>(
     hosts: &'a config::Machines,
 ) -> Result<transport::Place<'a>> {
     if record.machine == "local" {
-        return Ok(transport::Place::Local(root.join(".ferry/local")));
+        return Ok(transport::Place::Local(root.join(".ferry/local/v1")));
     }
     Ok(transport::Place::Remote(
         hosts
@@ -457,7 +450,6 @@ fn execute(cli: Cli) -> Result<i32> {
             );
             Ok(0)
         }
-        Action::HostRun { .. } => Ok(place::host_run()),
         Action::Follow { id } => attach(&id, true),
         Action::Record { id } => attach(&id, false),
         Action::Stop { id, reason, .. } => stop(&id, reason.as_deref()),

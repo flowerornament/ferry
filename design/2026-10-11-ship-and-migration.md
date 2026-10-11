@@ -283,3 +283,36 @@ Each freeze states the measured running src.
   handling, and the local route of `ship` extracted (clippy's function
   length). Isolation beats the ceiling (the coordinator); slice 7 closes it.
 
+
+## 10. Slice 7 as built (2026-10-11, on main 8eb26e17)
+
+- **Fresh root, one rule:** the place root is `v1` inside the root binaries
+  before M1 used: `~/.local/state/ferry/v1` (`place::REMOTE_ROOT`, the one
+  constant; the transport's store path derives from it), and
+  `<repo>/.ferry/local/v1` for the local route. `place::root` writes
+  `locks/legacy-closed` into the parent when an old root (its `locks/`) is
+  there, and nothing else.
+- **SPEC §9 names inside it:** `seats/<key>/checkout`, `seats/<key>/cache`,
+  `seats/<key>/measured` (the hourly stamp), `store/repo.git`, and locks
+  `seat.<key>`, `host`, `host.gate`. `retire` deletes `seats/<key>` whole,
+  so nothing of a seat is left behind (the stamp included). `remove`
+  proves it inside the root right before the delete, so retire's own
+  earlier containment check went.
+- **Deleted:** the `host-run` shim and its CLI (SPEC §6: no shim);
+  `migrate_legacy`, its call and the legacy-checkout refusal (a fresh root
+  has none); the preserve re-check in prepare and the reserved-environment
+  re-check in `execute_session` (both done by `validate`); the old-binary
+  interlock name `host-exclusive`; `HostInfo.cores` (never read); the
+  caller's reading of a pre-SPEC refusal without `why`/`next`;
+  `Request.caller_binary_sha256` (never read by the place; not in SPEC §6's
+  request; the receipt keeps it); stale "hosts that predate" comments.
+- **Not taken:** a 40-hex helper (four one-line copies remain; a helper
+  adds lines); `Machine.cores` (documented `machines.toml` field, and
+  `Machine` refuses unknown fields: removing it would break every config).
+- **Tests:** the layout paths moved (a helper `only_checkout`); the legacy
+  migration test and the host-run assertion are gone; ferry-xtx.25: the
+  three "the member survived" assertions treat a zombie as gone (`gone`).
+  New controls: `an_old_root_is_closed_and_never_shared`, and the prune
+  control asserts the whole seat directory is gone.
+- **Size:** src 6043 → 5949, below 5950 (measured: the layout +11, the
+  deletions −105).

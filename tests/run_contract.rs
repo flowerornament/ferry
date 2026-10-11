@@ -46,6 +46,17 @@ impl Drop for OwnedCaller {
     }
 }
 
+/// The local route's one seat checkout (SPEC §9: `seats/<key>/checkout`).
+fn only_checkout(repo: &Path) -> std::path::PathBuf {
+    fs::read_dir(repo.join(".ferry/local/v1/seats"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("checkout")
+}
+
 fn fixture() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init"]);
@@ -140,9 +151,9 @@ fn published_companion_uses_tracking_ref_on_git_jj_and_worktree_callers() {
         let out = run(&caller, &["run", "pass", "--local", "--json"]);
         assert_eq!(out.status.code(), Some(125));
         assert_eq!(receipt(&out)["ship"], serde_json::json!([]));
-        for entry in fs::read_dir(caller.join(".ferry/local/slots")).unwrap() {
+        for entry in fs::read_dir(caller.join(".ferry/local/v1/seats")).unwrap() {
             let output = Command::new("git")
-                .current_dir(entry.unwrap().path())
+                .current_dir(entry.unwrap().path().join("checkout"))
                 .args(["rev-parse", "refs/remotes/origin/master"])
                 .output()
                 .unwrap();
@@ -218,8 +229,7 @@ fn preserved_ignored_directories_survive_but_tracked_files_reset() {
         String::from_utf8_lossy(&first.stdout)
     );
     assert_eq!(receipt(&first)["preserve"], serde_json::json!(["cache"]));
-    let state = dir.path().join(".ferry/local/slots");
-    let slot = fs::read_dir(state).unwrap().next().unwrap().unwrap().path();
+    let slot = only_checkout(dir.path());
     fs::write(slot.join("ferry.toml"), "tracked tampering").unwrap();
     let second = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert!(
@@ -232,44 +242,6 @@ fn preserved_ignored_directories_survive_but_tracked_files_reset() {
         fs::read_to_string(slot.join("ferry.toml")).unwrap(),
         "tracked tampering"
     );
-}
-
-#[test]
-fn legacy_worktree_seats_migrate_under_the_existing_lease() {
-    let dir = fixture();
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert!(out.status.success());
-    let state = dir.path().join(".ferry/local");
-    let slot = fs::read_dir(state.join("slots"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    // Recreate the old Ferry-owned layout, not an unrelated user checkout.
-    fs::remove_dir_all(&slot).unwrap();
-    let bare = state.join("repo.git");
-    git(
-        dir.path(),
-        &[
-            "--git-dir",
-            bare.to_str().unwrap(),
-            "worktree",
-            "add",
-            "--detach",
-            slot.to_str().unwrap(),
-            "FETCH_HEAD",
-        ],
-    );
-    assert!(slot.join(".git").is_file());
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    assert_eq!(receipt(&out)["outcome"], "ran-pass");
-    assert!(slot.join(".git").is_dir());
 }
 
 #[test]
@@ -311,9 +283,10 @@ fn companion_refs_are_pinned_and_isolated_between_seats() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert_eq!(receipt(&out)["ship"][0]["commit"], second);
-    for entry in fs::read_dir(dir.path().join(".ferry/local/slots")).unwrap() {
-        let slot = entry.unwrap().path();
-        let expected = if slot
+    for entry in fs::read_dir(dir.path().join(".ferry/local/v1/seats")).unwrap() {
+        let seat = entry.unwrap().path();
+        let slot = seat.join("checkout");
+        let expected = if seat
             .file_name()
             .unwrap()
             .to_str()
@@ -443,12 +416,7 @@ fn collection_runs_after_recipe_failure_timeout_and_prepare_refusal() {
             String::from_utf8_lossy(&out.stdout)
         );
         assert_eq!(record["collection"]["exit_code"], 0);
-        let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let slot = only_checkout(dir.path());
         assert_eq!(
             fs::read_to_string(slot.join("collected")).unwrap(),
             "collected\n"
@@ -585,7 +553,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     }
     let recipe: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
     let group = OwnedGroup(getsid(Some(Pid::from_raw(recipe))).unwrap().as_raw());
-    let seat_lock = fs::read_dir(dir.path().join(".ferry/local/locks"))
+    let seat_lock = fs::read_dir(dir.path().join(".ferry/local/v1/locks"))
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -607,7 +575,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     )
     .unwrap();
     caller.child.as_mut().unwrap().wait().unwrap();
-    let locks = dir.path().join(".ferry/local/locks");
+    let locks = dir.path().join(".ferry/local/v1/locks");
     let held = |name: &str| {
         let probe = fs::File::open(locks.join(name)).unwrap();
         match fs2::FileExt::try_lock_exclusive(&probe) {
@@ -620,10 +588,7 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     // platform: they stay held while the recipe lives, though its
     // supervisor is gone.
     assert!(held(seat), "the seat lock freed while the recipe lives");
-    assert!(
-        held("host-exclusive"),
-        "the host lease freed while the recipe lives"
-    );
+    assert!(held("host"), "the host lease freed while the recipe lives");
     // A new run on the seat refuses at once, never starting beside it: the
     // lock names the killed run, reconciled to lost, whose work holds it.
     let killed = fs::read_to_string(&caller_output)
@@ -804,12 +769,7 @@ fn a_shipped_url_is_served_from_the_store_at_its_exact_commit() {
     );
     // The run's own served repository: an ordinary clone of it fetches the
     // commit, borrowing the store's objects.
-    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let slot = only_checkout(dir.path());
     let store = slot.join(".ferry/ship.git");
     let clone = dir.path().join("ordinary-clone");
     git(
@@ -849,12 +809,7 @@ fn a_ref_no_longer_shipped_is_removed_from_the_seat() {
             .status
             .success()
     );
-    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let slot = only_checkout(dir.path());
     let left = Command::new("git")
         .current_dir(&slot)
         .args([
@@ -1065,12 +1020,7 @@ fn hidden_index_flags_refuse_before_resetting_the_seat() {
     let dir = fixture();
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert!(out.status.success());
-    let seat = fs::read_dir(dir.path().join(".ferry/local/slots"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let seat = only_checkout(dir.path());
     git(&seat, &["update-index", "--assume-unchanged", "ferry.toml"]);
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert_eq!(receipt(&out)["outcome"], "refused");
@@ -1123,7 +1073,7 @@ fn malformed_or_partial_adapter_contract_never_runs_a_valid_subset() {
     assert_eq!(receipt(&out)["outcome"], "refused");
     assert!(receipt(&out)["adapter_sha256"].is_string());
     assert!(receipt(&out)["contract_sha256"].is_string());
-    assert!(!dir.path().join(".ferry/local").exists());
+    assert!(!dir.path().join(".ferry/local/v1").exists());
 }
 #[test]
 fn nondeterministic_adapter_is_a_refusal() {
@@ -1239,15 +1189,19 @@ fn a_signal_during_the_push_stops_the_run_before_dispatch() {
         "the host was asked to run: {stdout}"
     );
     assert!(!stdout.contains("committed"));
-    assert!(!dir.path().join("host/.local/state/ferry/records").exists());
+    assert!(
+        !dir.path()
+            .join("host/.local/state/ferry/v1/records")
+            .exists()
+    );
 }
 
 #[test]
 fn a_host_refusal_before_acceptance_is_refused_not_lost() {
     let dir = fixture();
     // A file where the host keeps its run records: it cannot reserve the id.
-    fs::create_dir_all(dir.path().join("host/.local/state/ferry")).unwrap();
-    fs::write(dir.path().join("host/.local/state/ferry/records"), "").unwrap();
+    fs::create_dir_all(dir.path().join("host/.local/state/ferry/v1")).unwrap();
+    fs::write(dir.path().join("host/.local/state/ferry/v1/records"), "").unwrap();
     let out = remote_run(
         dir.path(),
         ".local/bin/ferry",
@@ -1370,7 +1324,7 @@ fn assert_lease_windows(receipts: &[serde_json::Value], held_for: std::time::Dur
     assert!(at(0, "released_ms") <= at(1, "acquired_ms"));
     assert!(at(1, "released_ms") <= at(2, "acquired_ms"));
     // Older binaries used this name for their exclusive lock.
-    assert!(dir.join(".ferry/local/locks/host-exclusive").exists());
+    assert!(dir.join(".ferry/local/v1/locks/host").exists());
     assert!(
         receipts[1]["requirements"]
             .as_array()
@@ -1410,7 +1364,7 @@ fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
     wait_for(&runs, "first-start");
     let alone = runs.spawn(dir.path(), "alone", true);
     // Observe, rather than assume, that the exclusive run now holds the gate.
-    let gate = dir.path().join(".ferry/local/locks/host-gate");
+    let gate = dir.path().join(".ferry/local/v1/locks/host.gate");
     let deadline = common::startup_deadline();
     loop {
         // The first run already passed the gate, so it must exist. Only a
@@ -1551,7 +1505,9 @@ fn ferry_record_completes_a_run_whose_record_has_the_old_shapes() {
         "available_before": 7, "evicted": [], "skipped": {"busy": 0},
         "available_after": 7, "result": "admitted",
     });
-    let place = dir.path().join(format!(".ferry/local/records/{id}.json"));
+    let place = dir
+        .path()
+        .join(format!(".ferry/local/v1/records/{id}.json"));
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&place).unwrap()).unwrap();
     record["custody"] = old_custody.clone();
     record["admission"] = old_admission.clone();
@@ -1713,7 +1669,11 @@ fn a_new_caller_refuses_a_place_without_detach_naming_its_revision() {
     assert!(reason.contains("lacks detach"), "{reason}");
     assert!(reason.contains("0ld-place-rev"), "{reason}");
     assert!(reason.contains("install this caller's ferry"), "{reason}");
-    assert!(!dir.path().join("host/.local/state/ferry/records").exists());
+    assert!(
+        !dir.path()
+            .join("host/.local/state/ferry/v1/records")
+            .exists()
+    );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("\"submitted\""));
 }
 
@@ -1722,7 +1682,7 @@ fn a_place_refuses_a_request_requiring_a_capability_it_lacks() {
     let dir = tempfile::tempdir().unwrap();
     let request = serde_json::json!({
         "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
-        "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
+        "recipe": {"command": ["true"]}, "hooks": {},
         "timeout_seconds": null, "forwarded_env": {},
         "provider_requires": ["teleport"]
     });
@@ -1730,14 +1690,6 @@ fn a_place_refuses_a_request_requiring_a_capability_it_lacks() {
     assert_eq!(code, Some(125), "{reply}");
     assert!(reply.contains("teleport"), "{reply}");
     assert!(!dir.path().join("records").exists());
-    // A caller from before detached runs is refused, not half served.
-    let old = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .arg("host-run")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(old.status.code(), Some(125));
-    assert!(String::from_utf8_lossy(&old.stdout).contains("\"event\":\"refused\""));
 }
 
 /// Submits `request` to `ferry place --state <state> submit`; its exit code
@@ -1773,7 +1725,7 @@ fn a_second_submit_follows_its_own_run_and_refuses_another() {
     let request = |id: &str, token: &str| {
         serde_json::json!({
             "protocol": 1, "id": id, "token": token, "commit": "0".repeat(40), "seat": "s",
-            "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
+            "recipe": {"command": ["true"]}, "hooks": {},
             "timeout_seconds": null, "forwarded_env": {}
         })
     };
@@ -1917,7 +1869,7 @@ fn an_unreachable_place_leaves_the_receipt_submitted_until_ferry_record() {
     let id = record["id"].as_str().unwrap();
     let host_record = dir
         .path()
-        .join(format!("host/.local/state/ferry/records/{id}.json"));
+        .join(format!("host/.local/state/ferry/v1/records/{id}.json"));
     let deadline = common::startup_deadline();
     while !host_record.exists() {
         assert!(std::time::Instant::now() < deadline, "{id} never final");
@@ -2002,20 +1954,25 @@ fn seats_prune_retires_a_gone_workspaces_seat_and_spares_a_live_one() {
     let live = key_of(dir.path(), dir.path());
     let retired = key_of(dir.path(), &gone);
     assert_ne!(live, retired);
-    let place = dir.path().join("host/.local/state/ferry");
-    assert!(place.join("slots").join(&retired).exists());
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    assert!(place.join("seats").join(&retired).join("checkout").exists());
     fs::remove_dir_all(&gone).unwrap();
     let (code, said) = prune(dir.path(), ".local/bin/ferry");
     assert_eq!(code, Some(0), "{said}");
     assert!(said.contains("retired"), "{said}");
-    assert!(!place.join("slots").join(&retired).exists(), "{said}");
-    assert!(place.join("locks").join(&retired).exists());
+    assert!(
+        !place.join("seats").join(&retired).join("checkout").exists(),
+        "{said}"
+    );
+    // Nothing of the seat is left: checkout, cache and measurement stamp.
+    assert!(!place.join("seats").join(&retired).exists(), "{said}");
+    assert!(place.join("locks").join(format!("seat.{retired}")).exists());
     assert!(
         place
             .join(format!("records/retired-{retired}.json"))
             .exists()
     );
-    assert!(place.join("slots").join(&live).exists());
+    assert!(place.join("seats").join(&live).join("checkout").exists());
     assert!(
         seats_book(dir.path())
             .iter()
@@ -2042,8 +1999,8 @@ fn seats_prune_never_names_another_callers_seat() {
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
-    let place = dir.path().join("host/.local/state/ferry");
-    assert!(place.join("slots").join(&key).exists());
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    assert!(place.join("seats").join(&key).join("checkout").exists());
 }
 
 /// While a retire holds a seat: a second prune skips it as busy, a run on
@@ -2060,7 +2017,10 @@ fn a_seat_being_retired_is_busy_and_the_book_keeps_concurrent_appends() {
     assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
     let key = key_of(dir.path(), &gone);
     fs::remove_dir_all(&gone).unwrap();
-    let lock = dir.path().join("host/.local/state/ferry/locks").join(&key);
+    let lock = dir
+        .path()
+        .join("host/.local/state/ferry/v1/locks")
+        .join(format!("seat.{key}"));
     let first = remote_command(dir.path(), ".local/bin/ferry", &["seats", "prune"])
         .env("FERRY_FAIL_AT", "retire-pause")
         .stdout(std::process::Stdio::piped())
@@ -2134,8 +2094,8 @@ fn seats_prune_refuses_a_place_without_retire_naming_its_revision() {
         said.contains("lacks retire") && said.contains("0ld-place-rev"),
         "{said}"
     );
-    let place = dir.path().join("host/.local/state/ferry");
-    assert!(place.join("slots").join(&key).exists());
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    assert!(place.join("seats").join(&key).join("checkout").exists());
 }
 
 /// The release points of retire: a failed delete or record is reported and
@@ -2167,7 +2127,7 @@ fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
         let (code, said) = prune(dir.path(), ".local/bin/ferry");
         assert_eq!(code, Some(0), "{point}: {said}");
         assert!(said.contains("retired"), "{said}");
-        let place = dir.path().join("host/.local/state/ferry");
+        let place = dir.path().join("host/.local/state/ferry/v1");
         assert!(place.join(format!("records/retired-{key}.json")).exists());
     }
 }
@@ -2220,18 +2180,8 @@ fn a_seat_over_its_cap_starts_cold_with_pruned() {
     let second = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert!(String::from_utf8_lossy(&second.stderr).contains("warm"));
     assert!(receipt(&second)["pruned"].is_null());
-    let caches = dir.path().join(".ferry/local/caches");
-    for entry in fs::read_dir(&caches).unwrap() {
-        let path = entry.unwrap().path();
-        if path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(".measured-")
-        {
-            fs::remove_file(path).unwrap();
-        }
-    }
+    let slot = only_checkout(dir.path());
+    fs::remove_file(slot.parent().unwrap().join("measured")).unwrap();
     let third = run(dir.path(), &["run", "pass", "--local", "--json"]);
     let record = receipt(&third);
     assert_eq!(record["outcome"], "ran-pass", "{record}");
@@ -2245,12 +2195,7 @@ fn a_seat_over_its_cap_starts_cold_with_pruned() {
         record["reason"].as_str().unwrap().contains("started cold"),
         "{record}"
     );
-    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let slot = only_checkout(dir.path());
     assert!(
         slot.join("ferry.toml").exists(),
         "tracked source was touched"
@@ -2275,17 +2220,8 @@ fn a_failed_cap_wipe_is_a_note_and_the_run_goes_on() {
         "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
     );
     run(dir.path(), &["run", "pass", "--local", "--json"]);
-    for entry in fs::read_dir(dir.path().join(".ferry/local/caches")).unwrap() {
-        let path = entry.unwrap().path();
-        if path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(".measured-")
-        {
-            fs::remove_file(path).unwrap();
-        }
-    }
+    let measured = only_checkout(dir.path()).parent().unwrap().join("measured");
+    fs::remove_file(measured).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -2321,7 +2257,11 @@ fn seats_prune_keeps_a_workspace_it_cannot_inspect() {
     fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(code, Some(0), "{said}");
     assert!(said.contains("kept") && said.contains("unknown"), "{said}");
-    let slot = dir.path().join("host/.local/state/ferry/slots").join(&key);
+    let slot = dir
+        .path()
+        .join("host/.local/state/ferry/v1/seats")
+        .join(&key)
+        .join("checkout");
     assert!(slot.exists(), "{said}");
 }
 
@@ -2338,7 +2278,11 @@ fn seats_prune_keeps_a_workspace_whose_parent_is_missing() {
     let (code, said) = prune(dir.path(), ".local/bin/ferry");
     assert_eq!(code, Some(0), "{said}");
     assert!(said.contains("kept") && said.contains("unknown"), "{said}");
-    let slot = dir.path().join("host/.local/state/ferry/slots").join(&key);
+    let slot = dir
+        .path()
+        .join("host/.local/state/ferry/v1/seats")
+        .join(&key)
+        .join("checkout");
     assert!(slot.exists(), "{said}");
 }
 
@@ -2358,12 +2302,7 @@ fn the_cap_never_follows_a_symbolic_link_out_of_the_seat() {
     git(dir.path(), &["commit", "-m", "nested preserve"]);
     let first = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert_eq!(first.status.code(), Some(0), "{}", receipt(&first));
-    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let slot = only_checkout(dir.path());
     let outside = tempfile::tempdir().unwrap();
     fs::create_dir(outside.path().join("cache")).unwrap();
     let sentinel = outside.path().join("cache/sentinel");
@@ -2402,7 +2341,7 @@ fn a_place_refuses_an_unvalidated_preserve_path_before_any_delete() {
     let state = dir.path().join("state");
     let request = serde_json::json!({
         "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
-        "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
+        "recipe": {"command": ["true"]}, "hooks": {},
         "timeout_seconds": null, "forwarded_env": {},
         "preserve": [victim.display().to_string()]
     });
@@ -2474,7 +2413,11 @@ fn seats_prune_keeps_a_workspace_whose_parent_changed_device() {
     let (code, said) = prune(dir.path(), ".local/bin/ferry");
     assert_eq!(code, Some(0), "{said}");
     assert!(said.contains("kept") && said.contains("device"), "{said}");
-    let slot = dir.path().join("host/.local/state/ferry/slots").join(&key);
+    let slot = dir
+        .path()
+        .join("host/.local/state/ferry/v1/seats")
+        .join(&key)
+        .join("checkout");
     assert!(slot.exists(), "{said}");
 }
 
@@ -2487,13 +2430,13 @@ fn retire_never_follows_a_symbolic_link_out_of_the_place() {
     assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
     let key = key_of(dir.path(), &gone);
     fs::remove_dir_all(&gone).unwrap();
-    let place = dir.path().join("host/.local/state/ferry");
+    let place = dir.path().join("host/.local/state/ferry/v1");
     let outside = tempfile::tempdir().unwrap();
     fs::create_dir_all(outside.path().join(&key)).unwrap();
     let sentinel = outside.path().join(&key).join("sentinel");
     fs::write(&sentinel, "keep").unwrap();
-    let _ = fs::remove_dir_all(place.join("caches"));
-    std::os::unix::fs::symlink(outside.path(), place.join("caches")).unwrap();
+    let _ = fs::remove_dir_all(place.join("seats"));
+    std::os::unix::fs::symlink(outside.path(), place.join("seats")).unwrap();
     let (code, said) = prune(dir.path(), ".local/bin/ferry");
     assert_eq!(code, Some(125), "{said}");
     assert!(said.contains("symbolic link"), "{said}");
@@ -2521,8 +2464,9 @@ fn consumer_prune_must_not_treat_permission_denied_as_workspace_gone() {
     assert!(live.exists(), "the caller workspace still exists");
     assert!(
         dir.path()
-            .join("host/.local/state/ferry/slots")
+            .join("host/.local/state/ferry/v1/seats")
             .join(key)
+            .join("checkout")
             .exists(),
         "prune deleted a live workspace's seat: code={code:?}, {said}"
     );
@@ -2547,17 +2491,18 @@ fn a_link_swapped_in_during_a_wipe_is_never_followed() {
         "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
     );
     run(dir.path(), &["run", "pass", "--local", "--json"]);
-    let state = dir.path().join(".ferry/local");
-    let slot = fs::read_dir(state.join("slots"))
+    let state = dir.path().join(".ferry/local/v1");
+    let slot = only_checkout(dir.path());
+    let key = slot
+        .parent()
         .unwrap()
-        .next()
+        .file_name()
         .unwrap()
-        .unwrap()
-        .path();
-    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
-    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
+        .to_string_lossy()
+        .into_owned();
+    fs::remove_file(state.join(format!("seats/{key}/measured"))).unwrap();
     // The cache's own delete is not held.
-    fs::write(state.join(format!("caches/{key}.go")), "").unwrap();
+    fs::write(state.join(format!("seats/{key}/cache.go")), "").unwrap();
     let victim = tempfile::tempdir().unwrap();
     fs::write(victim.path().join("precious"), "keep").unwrap();
     let wipe = Command::new(env!("CARGO_BIN_EXE_ferry"))
@@ -2599,18 +2544,19 @@ fn a_wipe_that_cannot_inspect_its_tree_deletes_nothing() {
         "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
     );
     run(dir.path(), &["run", "pass", "--local", "--json"]);
-    let state = dir.path().join(".ferry/local");
-    let slot = fs::read_dir(state.join("slots"))
+    let state = dir.path().join(".ferry/local/v1");
+    let slot = only_checkout(dir.path());
+    let key = slot
+        .parent()
         .unwrap()
-        .next()
+        .file_name()
         .unwrap()
-        .unwrap()
-        .path();
-    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
-    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
+        .to_string_lossy()
+        .into_owned();
+    fs::remove_file(state.join(format!("seats/{key}/measured"))).unwrap();
     fs::write(slot.join("big/other/keep"), "keep").unwrap();
     // After the preserve path fails, the wipe still reaches the cache.
-    let cache = state.join(format!("caches/{key}"));
+    let cache = state.join(format!("seats/{key}/cache"));
     fs::create_dir_all(&cache).unwrap();
     fs::write(cache.join("blob"), "x").unwrap();
     let locked = slot.join("big/locked");
@@ -2655,16 +2601,17 @@ fn a_file_at_a_wipe_path_is_deleted() {
         "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
     );
     run(dir.path(), &["run", "pass", "--local", "--json"]);
-    let state = dir.path().join(".ferry/local");
-    let slot = fs::read_dir(state.join("slots"))
+    let state = dir.path().join(".ferry/local/v1");
+    let slot = only_checkout(dir.path());
+    let key = slot
+        .parent()
         .unwrap()
-        .next()
+        .file_name()
         .unwrap()
-        .unwrap()
-        .path();
-    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
-    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
-    let cache = state.join(format!("caches/{key}"));
+        .to_string_lossy()
+        .into_owned();
+    fs::remove_file(state.join(format!("seats/{key}/measured"))).unwrap();
+    let cache = state.join(format!("seats/{key}/cache"));
     let _ = fs::remove_dir_all(&cache);
     fs::write(&cache, "a file where a directory belongs").unwrap();
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
@@ -2699,16 +2646,17 @@ fn a_seat_swapped_for_a_link_after_the_walk_is_not_deleted_through() {
         "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
     );
     run(dir.path(), &["run", "pass", "--local", "--json"]);
-    let state = dir.path().join(".ferry/local");
-    let slot = fs::read_dir(state.join("slots"))
+    let state = dir.path().join(".ferry/local/v1");
+    let slot = only_checkout(dir.path());
+    let key = slot
+        .parent()
         .unwrap()
-        .next()
+        .file_name()
         .unwrap()
-        .unwrap()
-        .path();
-    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
-    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
-    fs::write(state.join(format!("caches/{key}.go")), "").unwrap();
+        .to_string_lossy()
+        .into_owned();
+    fs::remove_file(state.join(format!("seats/{key}/measured"))).unwrap();
+    fs::write(state.join(format!("seats/{key}/cache.go")), "").unwrap();
     let victim = tempfile::tempdir().unwrap();
     fs::create_dir_all(victim.path().join("big")).unwrap();
     fs::write(victim.path().join("big/precious"), "keep").unwrap();
@@ -2901,4 +2849,26 @@ fn concurrent_first_runs_shipping_one_object_never_refuse() {
             assert_eq!(record["outcome"], "ran-pass", "round {round}: {record}");
         }
     }
+}
+
+/// M1 keeps its state in `v1` inside the old root, which pre-M1 binaries
+/// never look into, and closes an old root it finds with
+/// `locks/legacy-closed`, touching nothing else there; a repository with no
+/// old root gets no sentinel (SPEC §6, §9, §12.11).
+#[test]
+fn an_old_root_is_closed_and_never_shared() {
+    let dir = fixture();
+    let old = dir.path().join(".ferry/local");
+    fs::create_dir_all(old.join("locks")).unwrap();
+    fs::create_dir_all(old.join("slots/old-seat")).unwrap();
+    fs::write(old.join("slots/old-seat/kept"), "an old binary's").unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success(), "{}", receipt(&out));
+    assert!(old.join("locks/legacy-closed").exists());
+    assert!(old.join("slots/old-seat/kept").exists());
+    assert!(only_checkout(dir.path()).join("ferry.toml").exists());
+    let fresh = fixture();
+    let out = run(fresh.path(), &["run", "pass", "--local", "--json"]);
+    assert!(out.status.success(), "{}", receipt(&out));
+    assert!(!fresh.path().join(".ferry/local/locks").exists());
 }

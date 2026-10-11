@@ -84,8 +84,8 @@ ferry seats prune [--on <machine>]  retire this caller's seats whose workspace
 ```
 
 `ferry place`, `host-info` and `execute-session` are internal: the caller
-runs them on the machine. `ferry host-run` only refuses callers from before
-detached runs.
+runs them on the machine. A caller older than its place is not served (SPEC
+§6): callers are never installed before their places.
 
 ### Outcomes and exit codes
 
@@ -321,8 +321,8 @@ receipts or records.
   (a path it could not delete, each a note) less than that was removed.
   The cap can be exceeded by at most an hour of runs' growth. A failed wipe is
   a note, and the run goes on with what is there.
-- **Keep `slots/` and `caches/` real directories** on the state root's disk.
-  An operator who moves either to another disk through a symbolic link makes
+- **Keep `seats/` a real directory** on the state root's disk.
+  An operator who moves it to another disk through a symbolic link makes
   every cap and retire on that place refuse: safe, but they never act. Move
   the whole state root instead.
 
@@ -340,7 +340,7 @@ or prepares its seat) runs none of them, collect included: nothing ran.
   run's identity or the seat-local git configuration that serves shipped
   URLs.
 - **`FERRY_CACHE_DIR`** is a per-seat directory Ferry owns
-  (`<state>/caches/<seat>`, mode 0700). Put regenerable build output there,
+  (`<state>/seats/<seat>/cache`, mode 0700). Put regenerable build output there,
   for example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`.
 - **The `environment` declaration** has three lists:
   - `forwards`: caller variables sent to the recipe, recorded in the receipt,
@@ -371,7 +371,7 @@ or prepares its seat) runs none of them, collect included: nothing ran.
 - **The checkout is checked:** a seat lock protects a detached checkout, and
   HEAD, a clean tree and hidden index flags are checked before execution.
 - **Local runs** use the same mechanism, in a clean checkout of the commit
-  under `.ferry/local`, not the caller's working tree.
+  under `.ferry/local/v1`, not the caller's working tree.
 
 ### The host lease
 
@@ -388,7 +388,7 @@ before its record is final; the locks themselves close after the record
 (SPEC §5).
 
 **Scope.** "Exclusive" means no other Ferry run under the same state root:
-one user's Ferry on one machine, or one repository's `.ferry/local`. It is not
+one user's Ferry on one machine, or one repository's `.ferry/local/v1`. It is not
 a quiet-host certificate, and it does not quiet:
 - processes started outside Ferry;
 - other users;

@@ -294,7 +294,7 @@ pub fn cap(
     cap: u64,
     spent: bool,
 ) -> Result<Option<Pruned>> {
-    let stamp = root.join("caches").join(format!(".measured-{seat}"));
+    let stamp = root.join("seats").join(seat).join("measured");
     let now = crate::receipt::now_ms();
     let last = fs::read(&stamp)
         .ok()
@@ -310,8 +310,8 @@ pub fn cap(
     // Only paths proven inside the seat are measured or wiped.
     let paths: Vec<_> = preserve
         .iter()
-        .map(|path| Path::new("slots").join(seat).join(path))
-        .chain(std::iter::once(Path::new("caches").join(seat)))
+        .map(|path| Path::new("seats").join(seat).join("checkout").join(path))
+        .chain(std::iter::once(Path::new("seats").join(seat).join("cache")))
         .filter(|rel| match outside(root, rel) {
             Some(why) => {
                 crate::run::note_after(format!("seat cap: {why}: not measured or wiped"));
@@ -331,7 +331,7 @@ pub fn cap(
             "seat cap: not measured: over {MEASURE_LIMIT:?}; not wiped"
         ));
         // Stamped all the same, so the next try is an hour away.
-        fs::create_dir_all(root.join("caches"))?;
+        fs::create_dir_all(root.join("seats").join(seat))?;
         fs::write(
             &stamp,
             serde_json::json!({"ms": now, "bytes": null}).to_string(),
@@ -350,7 +350,7 @@ pub fn cap(
             }
         }
     }
-    fs::create_dir_all(root.join("caches"))?;
+    fs::create_dir_all(root.join("seats").join(seat))?;
     let measured = serde_json::json!({"ms": now, "bytes": if over { 0 } else { bytes }});
     fs::write(&stamp, measured.to_string())?;
     Ok(over.then_some(Pruned { bytes, cap }))
@@ -382,11 +382,11 @@ mod tests {
     fn cap_must_not_delete_through_a_preserve_parent_symlink() {
         let owned = tempfile::tempdir().unwrap();
         let (root, outside) = (owned.path().join("ferry"), owned.path().join("outside"));
-        fs::create_dir_all(root.join("slots/seat")).unwrap();
+        fs::create_dir_all(root.join("seats/seat/checkout")).unwrap();
         fs::create_dir_all(outside.join("cache")).unwrap();
         let sentinel = outside.join("cache/not-ferry-owned");
         fs::write(&sentinel, "must survive").unwrap();
-        symlink(&outside, root.join("slots/seat/link")).unwrap();
+        symlink(&outside, root.join("seats/seat/checkout/link")).unwrap();
         crate::config::preserve_path("link/cache").unwrap();
         let _ = super::cap(&root, "seat", &["link/cache".into()], 1, false);
         assert!(sentinel.exists(), "cap deleted through an ancestor symlink");

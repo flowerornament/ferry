@@ -708,7 +708,7 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         .ok_or("invalid request path")?;
     let workdir = std::env::current_dir()?;
     // A Ferry-owned, per-seat cache directory for regenerable build output.
-    let cache = root.join("caches").join(&request.seat);
+    let cache = root.join("seats").join(&request.seat).join("cache");
     fs::create_dir_all(&cache)?;
     fs::set_permissions(&cache, fs::Permissions::from_mode(0o700))?;
     let mut env = BTreeMap::from([
@@ -719,13 +719,6 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         ("FERRY_ID".to_owned(), request.id.clone()),
         ("FERRY_REQUEST_FILE".to_owned(), spec.display().to_string()),
     ]);
-    if request
-        .forwarded_env
-        .keys()
-        .any(|name| name.starts_with("FERRY_") || name == "GIT_CONFIG_GLOBAL")
-    {
-        return Err("reserved forwarded environment".into());
-    }
     env.extend(request.forwarded_env.clone());
     if request.ship.iter().any(|shipped| shipped.url.is_some()) {
         env.insert(

@@ -170,10 +170,8 @@ impl HostLease {
         partial: &mut Vec<fs::File>,
     ) -> Result<Self> {
         let started = std::time::Instant::now();
-        let gate = root.join("locks/host-gate");
-        // The name earlier binaries used for their exclusive lock, so an old and
-        // a new exclusive run on one state root still exclude each other.
-        let host = root.join("locks/host-exclusive");
+        let gate = root.join("locks/host.gate");
+        let host = root.join("locks/host");
         let exclusive = request.recipe.requires.contains("exclusive");
         let held = if exclusive {
             partial.push(acquire_as(&gate, stop, false, request)?);

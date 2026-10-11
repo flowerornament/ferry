@@ -152,7 +152,7 @@ fn only_receipt_file(dir: &Path) -> serde_json::Value {
 
 /// The names in a run-records directory, sorted.
 fn record_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<_> = fs::read_dir(dir.join(".ferry/local/records"))
+    let mut names: Vec<_> = fs::read_dir(dir.join(".ferry/local/v1/records"))
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -163,7 +163,7 @@ fn record_names(dir: &Path) -> Vec<String> {
 
 /// A run's output log.
 fn output_log(dir: &Path, id: &str) -> Vec<u8> {
-    fs::read(dir.join(format!(".ferry/local/runs/{id}/output.log"))).unwrap()
+    fs::read(dir.join(format!(".ferry/local/v1/runs/{id}/output.log"))).unwrap()
 }
 
 /// The supervisor's pid, from the caller's `submitted` event in `events`.
@@ -243,7 +243,7 @@ fn concurrent_readers_complete_the_same_submitted_receipt() {
     caller.0.kill().unwrap();
     caller.0.wait().unwrap();
     assert_eq!(
-        only_record(&dir.path().join(".ferry/local/records"))["outcome"],
+        only_record(&dir.path().join(".ferry/local/v1/records"))["outcome"],
         "ran-pass"
     );
     let submitted = only_receipt_file(dir.path());
@@ -292,7 +292,7 @@ fn a_killed_caller_leaves_the_run_to_finish_and_ferry_record_completes_it() {
     caller.kill().unwrap();
     caller.wait().unwrap();
     // The run is not the connection's: it reaches its own end.
-    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let host = only_record(&dir.path().join(".ferry/local/v1/records"));
     assert_eq!(host["outcome"], "ran-pass", "{host}");
     let submitted = only_receipt_file(dir.path());
     assert_eq!(submitted["state"], "submitted", "{submitted}");
@@ -330,7 +330,7 @@ fn a_kill_of_the_callers_group_spares_the_supervisor() {
     nix::sys::signal::killpg(group, Signal::SIGKILL).unwrap();
     caller.wait().unwrap();
     // The supervisor lives in its own session: the run completes.
-    let record = only_record(&dir.path().join(".ferry/local/records"));
+    let record = only_record(&dir.path().join(".ferry/local/v1/records"));
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     assert!(!record["custody"].is_null(), "{record}");
 }
@@ -373,7 +373,7 @@ fn a_killed_callers_place_follow_ends_and_the_run_goes_on() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    let records = dir.path().join(".ferry/local/records");
+    let records = dir.path().join(".ferry/local/v1/records");
     assert!(
         record_names(dir.path())
             .iter()
@@ -519,7 +519,7 @@ fn a_signal_stops_a_run_whose_consumer_stalls() {
             .unwrap(),
     );
     // Signal once the stall is real: the log has passed what a pipe holds.
-    let runs = dir.path().join(".ferry/local/runs");
+    let runs = dir.path().join(".ferry/local/v1/runs");
     wait_until("output backed up behind the stalled consumer", || {
         fs::read_dir(&runs)
             .into_iter()
@@ -607,7 +607,7 @@ fn a_caller_whose_stop_fails_or_that_is_signalled_twice_leaves_the_receipt_submi
         if signals == 2 {
             let stop = dir
                 .path()
-                .join(".ferry/local/runs")
+                .join(".ferry/local/v1/runs")
                 .join(&id)
                 .join("stop.json");
             wait_until("the stop was delivered", || stop.exists());
@@ -626,7 +626,7 @@ fn a_caller_whose_stop_fails_or_that_is_signalled_twice_leaves_the_receipt_submi
         assert!(said.contains(next) && said.contains(&id), "{said}");
         let final_record = dir
             .path()
-            .join(".ferry/local/records")
+            .join(".ferry/local/v1/records")
             .join(format!("{id}.json"));
         wait_until("the run finished", || final_record.exists());
         let out = ferry(dir.path()).args(["record", &id]).output().unwrap();
@@ -658,7 +658,7 @@ fn a_signal_after_the_run_is_final_keeps_its_verdict_and_every_byte() {
             .unwrap(),
     );
     // Nobody reads its stdout yet: a slow consumer.
-    let records = dir.path().join(".ferry/local/records");
+    let records = dir.path().join(".ferry/local/v1/records");
     only_record(&records);
     thread::sleep(Duration::from_millis(500));
     kill(
@@ -725,7 +725,7 @@ fn a_signal_after_a_lost_verdict_keeps_the_places_code() {
         .to_owned();
     let log = dir
         .path()
-        .join(format!(".ferry/local/runs/{id}/output.log"));
+        .join(format!(".ferry/local/v1/runs/{id}/output.log"));
     wait_until("the output was written", || {
         fs::metadata(&log).is_ok_and(|m| m.len() >= 4_000_000)
     });
@@ -735,7 +735,7 @@ fn a_signal_after_a_lost_verdict_keeps_the_places_code() {
         Signal::SIGKILL,
     )
     .unwrap();
-    let state = dir.path().join(".ferry/local");
+    let state = dir.path().join(".ferry/local/v1");
     let record = state.join(format!("records/{id}.json"));
     wait_until("the run was reconciled to lost", || {
         let _ = Command::new(env!("CARGO_BIN_EXE_ferry"))
@@ -793,7 +793,7 @@ fn a_stop_during_prepare_spawns_nothing() {
             .spawn()
             .unwrap(),
     );
-    let runs = dir.path().join(".ferry/local/runs");
+    let runs = dir.path().join(".ferry/local/v1/runs");
     let mut id = String::new();
     wait_until("the run paused before its spawn", || {
         fs::read_dir(&runs)
@@ -820,7 +820,7 @@ fn a_stop_during_prepare_spawns_nothing() {
         code = caller.0.try_wait().unwrap().map(|status| status.code());
         code.is_some()
     });
-    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let host = only_record(&dir.path().join(".ferry/local/v1/records"));
     assert_eq!(host["outcome"], "stopped", "{host}");
     assert!(!ran.exists(), "the recipe was spawned");
     assert!(!collected.exists(), "the collect hook ran");
@@ -854,7 +854,7 @@ fn a_second_stop_changes_nothing() {
         .as_str()
         .unwrap()
         .to_owned();
-    let state = dir.path().join(".ferry/local");
+    let state = dir.path().join(".ferry/local/v1");
     let stop = |who: &str, signal: &str| {
         Command::new(env!("CARGO_BIN_EXE_ferry"))
             .args(["place", "--state"])
@@ -908,7 +908,7 @@ fn ferry_stop_stops_its_own_run_and_refuses_anothers_without_a_reason() {
         .as_str()
         .unwrap()
         .to_owned();
-    let state = dir.path().join(".ferry/local");
+    let state = dir.path().join(".ferry/local/v1");
     let place_stop = |extra: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_ferry"))
             .arg("place")
@@ -1003,7 +1003,7 @@ fn the_deadline_ends_a_run_with_no_client() {
     wait_until("the recipe started", || started.exists());
     caller.kill().unwrap();
     caller.wait().unwrap();
-    let records = dir.path().join(".ferry/local/records");
+    let records = dir.path().join(".ferry/local/v1/records");
     let bound = Instant::now() + Duration::from_secs(30) + common::slack();
     let host = loop {
         let host = fs::read_dir(&records).ok().and_then(|entries| {
@@ -1027,7 +1027,7 @@ fn the_deadline_ends_a_run_with_no_client() {
         "{host}"
     );
     // The session was stopped with it.
-    let owners = dir.path().join(".ferry/local/owners");
+    let owners = dir.path().join(".ferry/local/v1/owners");
     assert!(!owners.exists() || fs::read_dir(&owners).unwrap().count() == 0);
 }
 
@@ -1035,7 +1035,7 @@ fn the_deadline_ends_a_run_with_no_client() {
 
 /// The local seat lock of the default seat, once a run has created it.
 fn seat_lock(dir: &Path) -> PathBuf {
-    fs::read_dir(dir.join(".ferry/local/locks"))
+    fs::read_dir(dir.join(".ferry/local/v1/locks"))
         .unwrap()
         .flatten()
         .map(|e| e.path())
@@ -1129,7 +1129,7 @@ fn a_run_refused_while_the_holder_starts_names_both_possible_holders() {
     let record = receipt(&out);
     assert_eq!(out.status.code(), Some(125), "{record}");
     let reason = record["reason"].as_str().unwrap();
-    let starting = fs::read_dir(dir.path().join(".ferry/local/records"))
+    let starting = fs::read_dir(dir.path().join(".ferry/local/v1/records"))
         .unwrap()
         .flatten()
         .filter_map(|e| {
@@ -1215,7 +1215,7 @@ fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
             .spawn()
             .unwrap(),
     );
-    let runs = dir.path().join(".ferry/local/runs");
+    let runs = dir.path().join(".ferry/local/v1/runs");
     let mut paused = PathBuf::new();
     wait_until("the contender reserved, before trying the seat", || {
         fs::read_dir(&runs)
@@ -1376,7 +1376,7 @@ fn a_run_holds_its_seat_until_its_record_is_final() {
             .spawn()
             .unwrap(),
     );
-    let (id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let (id, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize");
     let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
     fs::write(paused.with_extension("go"), "").unwrap();
     wait_until("the first run ended", || {
@@ -1408,7 +1408,7 @@ fn an_exclusive_run_holds_the_host_until_its_record_is_final() {
             .spawn()
             .unwrap(),
     );
-    let (id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let (id, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize");
     let out = bounded_output(ferry(dir.path()).args([
         "run",
         "probe",
@@ -1461,7 +1461,7 @@ fn a_dead_exclusive_run_is_reconciled_before_it_is_named() {
     let id = receipt(&out)["id"].as_str().unwrap().to_owned();
     let reserved = dir
         .path()
-        .join(format!(".ferry/local/records/{id}.reserved.json"));
+        .join(format!(".ferry/local/v1/records/{id}.reserved.json"));
     let reservation: serde_json::Value =
         serde_json::from_slice(&fs::read(&reserved).unwrap()).unwrap();
     let supervisor =
@@ -1575,7 +1575,7 @@ fn a_prepare_refusal_keeps_its_acquired_seat_until_finalization() {
         return;
     }
     let dir = fixture("echo ran", "");
-    let locks = dir.path().join(".ferry/local/locks");
+    let locks = dir.path().join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
     fs::write(locks.join("cleanup-pending-review"), "unconfirmed").unwrap();
     let mut first = Caller(
@@ -1587,7 +1587,7 @@ fn a_prepare_refusal_keeps_its_acquired_seat_until_finalization() {
             .spawn()
             .unwrap(),
     );
-    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize");
     let held = seat_held(dir.path());
     // Release the rendezvous before asserting, so a failure cleans up.
     fs::write(paused.with_extension("go"), "").unwrap();
@@ -1609,14 +1609,14 @@ fn a_host_wait_refusal_keeps_its_seat_until_finalization() {
         return;
     }
     let dir = fixture("echo ran", "");
-    let locks = dir.path().join(".ferry/local/locks");
+    let locks = dir.path().join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
     let host = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(locks.join("host-exclusive"))
+        .open(locks.join("host"))
         .unwrap();
     host.lock_exclusive().unwrap();
     let mut first = Caller(
@@ -1628,7 +1628,7 @@ fn a_host_wait_refusal_keeps_its_seat_until_finalization() {
             .spawn()
             .unwrap(),
     );
-    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize");
     let held = seat_held(dir.path());
     fs::write(paused.with_extension("go"), "").unwrap();
     wait_until("the refused run ended", || {
@@ -1651,14 +1651,14 @@ fn a_partly_taken_host_lease_keeps_its_gate_until_finalization() {
         return;
     }
     let dir = fixture("echo ran", "");
-    let locks = dir.path().join(".ferry/local/locks");
+    let locks = dir.path().join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
     let host = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(locks.join("host-exclusive"))
+        .open(locks.join("host"))
         .unwrap();
     host.lock_exclusive().unwrap();
     let mut first = Caller(
@@ -1678,8 +1678,8 @@ fn a_partly_taken_host_lease_keeps_its_gate_until_finalization() {
             .spawn()
             .unwrap(),
     );
-    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
-    let gate = fs::File::open(locks.join("host-gate")).unwrap();
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize");
+    let gate = fs::File::open(locks.join("host.gate")).unwrap();
     let held = gate
         .try_lock_exclusive()
         .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock);
@@ -1711,7 +1711,7 @@ fn a_failed_finalize_keeps_the_locks_until_the_supervisor_exits() {
             .spawn()
             .unwrap(),
     );
-    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize-failed");
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize-failed");
     let held = seat_held(dir.path());
     fs::write(paused.with_extension("go"), "").unwrap();
     wait_until("the caller ended", || first.0.try_wait().unwrap().is_some());
@@ -1731,7 +1731,7 @@ fn an_exclusive_holder_released_between_probes_is_not_claimed_as_shared() {
         return;
     }
     let dir = fixture("echo ran", "");
-    let root = dir.path().join(".ferry/local");
+    let root = dir.path().join(".ferry/local/v1");
     let locks = root.join("locks");
     fs::create_dir_all(&locks).unwrap();
     let host = fs::OpenOptions::new()
@@ -1739,7 +1739,7 @@ fn an_exclusive_holder_released_between_probes_is_not_claimed_as_shared() {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(locks.join("host-exclusive"))
+        .open(locks.join("host"))
         .unwrap();
     host.lock_exclusive().unwrap();
     let caller = Caller(
@@ -1782,7 +1782,7 @@ fn a_successor_cannot_take_a_seat_whose_finalize_failed() {
             .spawn()
             .unwrap(),
     );
-    let (old_id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize-failed");
+    let (old_id, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize-failed");
     let lock = seat_lock(dir.path());
     let out = bounded_output(
         ferry(dir.path())
@@ -1829,7 +1829,7 @@ fn a_supervisor_panic_keeps_its_locks_until_finalization() {
             .spawn()
             .unwrap(),
     );
-    let (id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize");
+    let (id, paused) = paused_at(&dir.path().join(".ferry/local/v1/runs"), "finalize");
     let held = seat_held(dir.path());
     fs::write(paused.with_extension("go"), "").unwrap();
     wait_until("the run ended", || first.0.try_wait().unwrap().is_some());
@@ -1838,7 +1838,11 @@ fn a_supervisor_panic_keeps_its_locks_until_finalization() {
         "a panic dropped the locks before the record was final"
     );
     let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(dir.path().join(format!(".ferry/local/records/{id}.json"))).unwrap(),
+        &fs::read(
+            dir.path()
+                .join(format!(".ferry/local/v1/records/{id}.json")),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(
@@ -1855,14 +1859,14 @@ fn a_supervisor_panic_keeps_its_locks_until_finalization() {
 /// and the pause marker.
 fn paused_at_the_host_probe(dir: &Path) -> (Caller, fs::File, PathBuf) {
     use fs2::FileExt;
-    let locks = dir.join(".ferry/local/locks");
+    let locks = dir.join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
     let host = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(locks.join("host-exclusive"))
+        .open(locks.join("host"))
         .unwrap();
     host.lock_exclusive().unwrap();
     let caller = Caller(
@@ -1874,7 +1878,7 @@ fn paused_at_the_host_probe(dir: &Path) -> (Caller, fs::File, PathBuf) {
             .spawn()
             .unwrap(),
     );
-    let (_, paused) = paused_at(&dir.join(".ferry/local/runs"), "probe");
+    let (_, paused) = paused_at(&dir.join(".ferry/local/v1/runs"), "probe");
     (caller, host, paused)
 }
 
@@ -1922,7 +1926,7 @@ fn a_host_lock_that_cannot_be_probed_names_no_holder() {
     }
     let dir = fixture("echo ran", "");
     let (caller, host, paused) = paused_at_the_host_probe(dir.path());
-    let file = dir.path().join(".ferry/local/locks/host-exclusive");
+    let file = dir.path().join(".ferry/local/v1/locks/host");
     fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
     let (code, record) = released(caller, &paused);
     fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1943,7 +1947,7 @@ fn a_host_lock_that_cannot_be_probed_names_no_holder() {
 fn the_lock_waits_together_end_by_one_bound() {
     use fs2::FileExt;
     let dir = fixture("echo ran", "");
-    let locks = dir.path().join(".ferry/local/locks");
+    let locks = dir.path().join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
     let hold = |p: &Path| {
         let file = fs::OpenOptions::new()
@@ -1956,10 +1960,7 @@ fn the_lock_waits_together_end_by_one_bound() {
         file.lock_exclusive().unwrap();
         file
     };
-    let (gate, host) = (
-        hold(&locks.join("host-gate")),
-        hold(&locks.join("host-exclusive")),
-    );
+    let (gate, host) = (hold(&locks.join("host.gate")), hold(&locks.join("host")));
     let scratch = tempfile::tempdir().unwrap();
     let stdout = scratch.path().join("out");
     let mut caller = Caller(
@@ -1974,7 +1975,7 @@ fn the_lock_waits_together_end_by_one_bound() {
     // says so in its log), under the 4 s wait; together over 6 s. Following
     // the run, not the clock, keeps this true on a loaded machine. (The seat
     // is never waited for: a held seat refuses at once.)
-    let runs = dir.path().join(".ferry/local/runs");
+    let runs = dir.path().join(".ferry/local/v1/runs");
     let said = |name: &str| {
         fs::read_dir(&runs)
             .into_iter()
@@ -1985,7 +1986,7 @@ fn the_lock_waits_together_end_by_one_bound() {
                     .is_ok_and(|log| log.contains(&format!("waiting for lock {name}:")))
             })
     };
-    let mut locks = vec![("host-gate", Some(gate)), ("host-exclusive", Some(host))];
+    let mut locks = vec![("host.gate", Some(gate)), ("host", Some(host))];
     let mut code = None;
     wait_until("the caller ended", || {
         for (name, lock) in &mut locks {
@@ -2077,7 +2078,11 @@ fn a_host_lease_wait_past_its_bound_refuses_naming_the_holder() {
     // submitted + wait + timeout (the place's 6 h maximum) + teardown.
     let id = record["id"].as_str().unwrap();
     let ran: serde_json::Value = serde_json::from_slice(
-        &fs::read(dir.path().join(format!(".ferry/local/records/{id}.json"))).unwrap(),
+        &fs::read(
+            dir.path()
+                .join(format!(".ferry/local/v1/records/{id}.json")),
+        )
+        .unwrap(),
     )
     .unwrap();
     let wait_timeout_ms = (2 + limits::MAX_TIMEOUT.as_secs()) * 1000;
@@ -2156,7 +2161,7 @@ fn a_survivor_holding_the_output_pipe_cannot_keep_the_run() {
         "{record}"
     );
     // Teardown and the drain, from the lease to the record.
-    let host = only_record(&dir.path().join(".ferry/local/records"));
+    let host = only_record(&dir.path().join(".ferry/local/v1/records"));
     let took = since_acquired(&host);
     let bound = limits::STOP_GRACE * 2 + limits::DRAIN * 2 + common::slack();
     assert!(took < bound, "{took:?} >= {bound:?}");
@@ -2328,6 +2333,21 @@ fn locks_reach_the_recipe_but_not_the_supervisors_other_children() {
     );
 }
 
+/// Whether `pid` is gone: no such process, or a zombie (dead, not yet
+/// reaped by its new parent; `kill(pid, 0)` still succeeds on one). Bench
+/// once caught a zombie here (ferry-xtx.25: a test artifact).
+fn gone(pid: i32) -> bool {
+    if kill(Pid::from_raw(pid), None).is_err() {
+        return true;
+    }
+    let state = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+    state.is_empty() || state.starts_with('Z')
+}
+
 /// A session member that ignores TERM is killed after the grace (SPEC §7,
 /// `STOP_GRACE`), and is not left as a survivor.
 #[test]
@@ -2365,10 +2385,7 @@ fn a_session_member_that_ignores_term_is_killed_after_the_grace() {
         .trim()
         .parse()
         .unwrap();
-    assert!(
-        kill(Pid::from_raw(pid), None).is_err(),
-        "the member survived"
-    );
+    assert!(gone(pid), "the member survived");
 }
 
 /// The stop never gives up early (4b review R4): when the session cannot
@@ -2420,10 +2437,7 @@ fn a_stop_that_cannot_list_its_session_still_kills_it() {
         .trim()
         .parse()
         .unwrap();
-    assert!(
-        kill(Pid::from_raw(pid), None).is_err(),
-        "the member survived"
-    );
+    assert!(gone(pid), "the member survived");
 }
 
 /// The stop never gives up early (4b review R4): one failed KILL is kept
@@ -2474,10 +2488,7 @@ fn a_failed_kill_to_one_member_still_empties_the_session() {
         .trim()
         .parse()
         .unwrap();
-    assert!(
-        kill(Pid::from_raw(pid), None).is_err(),
-        "the member survived"
-    );
+    assert!(gone(pid), "the member survived");
 }
 
 /// A survivor whose start cannot be read, though it is alive, is reported
@@ -2725,7 +2736,7 @@ fn a_crashed_supervisor_is_reconciled_to_lost_by_its_caller() {
         let id = only_receipt_file(dir.path())["id"].as_str()?.to_owned();
         let log = dir
             .path()
-            .join(format!(".ferry/local/runs/{id}/output.log"));
+            .join(format!(".ferry/local/v1/runs/{id}/output.log"));
         fs::read(log).ok().filter(|log| log.starts_with(b"started"))
     };
     wait_until("the recipe started", || {
@@ -2777,7 +2788,9 @@ fn a_record_left_unfinalized_is_reconciled_exactly_once() {
     assert_eq!(first["outcome"], "lost", "{first}");
     let id = first["id"].as_str().unwrap().to_owned();
     // The next run on the seat reconciles it, once.
-    let path = dir.path().join(format!(".ferry/local/records/{id}.json"));
+    let path = dir
+        .path()
+        .join(format!(".ferry/local/v1/records/{id}.json"));
     let mut bytes = None;
     for _ in 0..2 {
         let next = ferry(dir.path())
@@ -2823,7 +2836,7 @@ fn a_failed_reconcile_leaves_the_receipt_submitted_until_the_next_reader() {
     let reservation: serde_json::Value = serde_json::from_slice(
         &fs::read(
             dir.path()
-                .join(format!(".ferry/local/records/{id}.reserved.json")),
+                .join(format!(".ferry/local/v1/records/{id}.reserved.json")),
         )
         .unwrap(),
     )
@@ -2865,7 +2878,7 @@ fn a_submit_that_dies_after_reserving_leaves_a_lost_run_and_a_submitted_receipt(
     assert_eq!(record["outcome"], "lost", "{record}");
     assert!(
         !dir.path()
-            .join(format!(".ferry/local/runs/{id}/output.log"))
+            .join(format!(".ferry/local/v1/runs/{id}/output.log"))
             .exists(),
         "the recipe never ran"
     );
@@ -2894,7 +2907,7 @@ fn a_failed_reservation_or_spawn_refuses_before_anything_runs() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!stdout.contains("\"submitted\""), "{stdout}");
         assert!(
-            !dir.path().join(".ferry/local/records").exists()
+            !dir.path().join(".ferry/local/v1/records").exists()
                 || record_names(dir.path()).is_empty()
         );
     }

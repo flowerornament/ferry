@@ -30,18 +30,14 @@ pub struct Request {
     pub seat: String,
     pub recipe: Recipe,
     pub hooks: Hooks,
-    pub caller_binary_sha256: String,
     pub timeout_seconds: Option<u64>,
     pub forwarded_env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ship: Vec<Shipped>,
     #[serde(default)]
     pub preserve: Vec<String>,
-    // Omitted when empty so argument-free runs still reach hosts that predate
-    // arguments; such hosts refuse a request that carries them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    // Omitted when empty, like args; a host that predates it refuses it.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub provider_requires: BTreeSet<String>,
     /// How long the run may wait for its locks, all together; the place's
@@ -99,7 +95,7 @@ pub fn validate(request: &Request) -> Result<()> {
     // Before anything touches the disk: the cap deletes under these paths
     // (slice 5 review S2; checked again where it deletes).
     for path in &request.preserve {
-        crate::config::preserve_path(path)?;
+        preserve_path(path)?;
     }
     crate::receipt::provides(&request.provider_requires, &crate::receipt::capabilities())?;
     if request.args.iter().any(|arg| arg.contains('\0')) {
@@ -221,7 +217,7 @@ pub fn prepare(
         "seat-try",
         &root.join("runs").join(&request.id).join("seat"),
     );
-    let path = root.join("locks").join(&request.seat);
+    let path = root.join("locks").join(format!("seat.{}", request.seat));
     let Some(lease) = crate::lock::try_seat(&path, &request.id)? else {
         let named = fs::read_to_string(&path).unwrap_or_default();
         return Err(crate::record::busy(root, &request.seat, &request.id, named.trim()).into());
@@ -259,18 +255,14 @@ pub fn prepare(
             Err(error) => crate::run::note_after(format!("seat cap: {error}")),
         }
     }
-    let bare = root.join("repo.git");
+    let bare = root.join("store/repo.git");
     repository::output(Command::new("git").arg("--git-dir").arg(&bare).args([
         "cat-file",
         "-e",
         &format!("{}^{{commit}}", request.commit),
     ]))?;
-    let seat = root.join("slots").join(&request.seat);
-    fs::create_dir_all(root.join("slots"))?;
-    for path in &request.preserve {
-        preserve_path(path)?;
-    }
-    migrate_legacy(&bare, &seat)?;
+    let seat = root.join("seats").join(&request.seat).join("checkout");
+    fs::create_dir_all(seat.parent().ok_or("invalid seat")?)?;
     if !seat.exists() {
         repository::output(
             Command::new("git")
@@ -278,9 +270,6 @@ pub fn prepare(
                 .arg(&bare)
                 .arg(&seat),
         )?;
-    }
-    if !seat.join(".git").is_dir() {
-        return Err("seat has a legacy shared-ref checkout; select a new --seat".into());
     }
     reset_checkout(&seat, request)?;
     present_ship(&bare, &seat, request)?;
@@ -340,54 +329,6 @@ fn reset_checkout(seat: &Path, request: &Request) -> Result<()> {
     if String::from_utf8(head)?.trim() != request.commit || !status.is_empty() {
         return Err("checkout integrity failed".into());
     }
-    Ok(())
-}
-
-fn migrate_legacy(bare: &Path, seat: &Path) -> Result<()> {
-    if !seat.join(".git").is_file() {
-        return Ok(());
-    }
-    let common = repository::output(Command::new("git").current_dir(seat).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-    ]))?;
-    if fs::canonicalize(String::from_utf8(common)?.trim())? != fs::canonicalize(bare)? {
-        return Err("legacy seat belongs to another repository".into());
-    }
-    let status = repository::output(Command::new("git").current_dir(seat).args([
-        "status",
-        "--porcelain",
-        "--untracked-files=all",
-    ]))?;
-    let index = repository::output(
-        Command::new("git")
-            .current_dir(seat)
-            .args(["ls-files", "-v"]),
-    )?;
-    if !status.is_empty()
-        || index.split(|b| *b == b'\n').any(|line| {
-            line.first()
-                .is_some_and(|b| b.is_ascii_lowercase() || *b == b'S')
-        })
-    {
-        return Err("legacy seat has changed or hidden entries".into());
-    }
-    // This is Ferry-owned state, checked under its lease and durable owner gate.
-    // Ignored build outputs have the same disposable contract as clean -ffdx.
-    repository::output(
-        Command::new("git")
-            .arg("--git-dir")
-            .arg(bare)
-            .args(["worktree", "remove", "--force"])
-            .arg(seat),
-    )?;
-    repository::output(
-        Command::new("git")
-            .arg("--git-dir")
-            .arg(bare)
-            .args(["worktree", "prune"]),
-    )?;
     Ok(())
 }
 

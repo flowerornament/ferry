@@ -75,6 +75,17 @@ So even a failed first install leaves a working launcher.
 One `flock` serializes every activation and rollback. Only full commit ids
 reachable from `main` install on the live root.
 
+**The M1 state root.** From slice 7, runs keep their state in
+`~/.local/state/ferry/v1` (SPEC §9), a fresh root that binaries before M1
+never look into; a local run uses `<repo>/.ferry/local/v1`. The first M1 run
+writes `locks/legacy-closed` in an old root it finds. Every seat starts cold
+once. Install generations (`installs/`, `current`, `previous` and the
+install `repo.git`) stay where they are. After the joint window, an
+operator removes the old runtime state once, by hand, on each place:
+`~/.local/state/ferry/{locks,slots,caches,runs,records,mirrors,companion-refs}`
+(and `.ferry/local/{locks,slots,caches,runs,records,mirrors,companion-refs,repo.git}`
+in each repository). Nothing in `v1/` and no install state is touched.
+
 **What this guarantees and what it does not.**
 
 - The source commit and the flake's locked inputs are fixed by commit id and

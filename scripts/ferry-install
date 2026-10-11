@@ -21,7 +21,8 @@
 #
 # Host layout, under FERRY_INSTALL_ROOT (relative to the host's $HOME, default
 # .local/state/ferry):
-#   repo.git              bare repository, shared with Ferry's run transport
+#   repo.git              bare repository for install commits (runs use
+#                         v1/store/repo.git since the M1 layout)
 #   installs/<rev>        one Nix out-link (an indirect GC root) per generation
 #   current, previous     symlinks to installs/<rev>; flipped by rename
 #   install.lock          flock held across every activation and rollback

@@ -171,10 +171,7 @@ pub fn prune(only: Option<&str>, hosts: &config::Machines) -> Result<i32> {
                 })?;
             }
             Ok(reply) => {
-                let why = reply["why"]
-                    .as_str()
-                    .or(reply["refused"].as_str())
-                    .unwrap_or("");
+                let why = reply["why"].as_str().unwrap_or_default();
                 println!("skipped {} on {}: {why}", line.seat, line.place);
                 if !why.starts_with("seat busy") {
                     code = code.max(125);
