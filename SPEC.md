@@ -131,8 +131,11 @@ depends on the client being present.
   There is no legacy `host-run` shim: a caller is never installed before
   its places, and both move in one announced window (decided 2026-10-10
   on ferry-ljc.3; it supersedes the shim in ferry-minimal §7).
-- **Version skew:** old and new binaries never share a state root; the
-  sentinel `locks/legacy-closed` makes old binaries refuse.
+- **Version skew:** old and new binaries never share a state root: the M1
+  root is a new path (`…/ferry/v1`) that pre-M1 binaries never read. A new
+  caller refuses a place without `detach`/`ship` (125, naming its revision)
+  before pushing anything; an old caller meets a place that still answers
+  its host-info and is refused at parse (125, naming the place's revision).
 
 **Why:** short idempotent calls survive dropped connections; long-lived
 streams do not.
@@ -186,13 +189,15 @@ records" impossible.
 ## 9. State (per machine, one root)
 
 ```
-<state>/ (default ~/.local/state/ferry)       lifetime
+<state>/ (default ~/.local/state/ferry/v1)    lifetime
   locks/      seat.<key> host host.gate       —
   seats/<key>/checkout/ seats/<key>/cache/    cache  (bounded by Ferry: see below)
+  seats/<key>/measured                        cache  (the cap's last measurement)
   runs/<id>/  request.json output.log artifacts/  record
   records/    <id>.reserved.json <id>.json    record (operator retention)
   store/      repo.git                        cache
 <repo>/.ferry/receipts/                       record (the caller's)
+<repo>/.ferry/local/v1/                       the local route's <state>
 ```
 
 Nothing else is written; Ferry writes nowhere outside these.
