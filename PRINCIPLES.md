@@ -14,8 +14,11 @@ file.
    lifetime and lives under Ferry's roots:
    - **run** (scratch `FERRY_TMP`, request files): removed at release, so
      nothing is left behind;
-   - **cache** (seat checkouts, `caches/<seat>/`): regenerable, removed only
-     under host policy;
+   - **cache** (seat checkouts, `caches/<seat>/`): regenerable. Ferry
+     bounds what it created: a seat is retired when its caller's workspace
+     is gone, and a seat's caches are wiped at the start of a run, under its
+     lock, when they exceed the place's cap. Anything beyond that is host
+     policy;
    - **record** (receipts, host records, run output): kept until the
      operator's retention says otherwise.
 
@@ -68,8 +71,12 @@ Requests in this list go to the layer that owns them, not into Ferry:
   provisioning is the operator's;
 - **a sandbox or security boundary:** runs execute as the user;
 - **a deployment or publication tool:** it never pushes to forges;
-- **a cache manager:** a floor check that refuses; reclaiming disk is the
-  operator's (a script or timer), not logic inside a run;
+- **a cache manager:** Ferry bounds only its own state (seats retired with
+  their caller's workspace; a per-seat cap enforced under the seat lock). It
+  never shares, ranks or evicts caches across seats; anything cleverer is
+  the operator's. Why: M1 is done only when no Ferry state is left to clean
+  by hand, and only Ferry holds the seat lock and only the caller knows
+  whether its workspace still exists;
 - **a quiet-host certifier:** exclusive means "no other Ferry run here", plus
   named observations.
 
