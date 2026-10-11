@@ -24,7 +24,9 @@ below (OS/operator)  flock · sessions · systemd scope (opt.) · services · di
 ```
 
 Ferry never schedules, queues, retries, supervises services, sandboxes,
-publishes, reclaims disk, or proves that nothing survived (PRINCIPLES).
+publishes, reclaims disk beyond its own bounds, or proves that nothing
+survived (PRINCIPLES). Its own bounds: a seat is retired when its caller's
+workspace is gone, and a seat's caches are capped (§9).
 
 ## 3. Concepts
 
@@ -47,6 +49,7 @@ ferry stop <run> [--other --reason <why>]
 ferry record [<run> | last] [--json]
 ferry status [--on <place>] [--json]
 ferry check  [--on <place>]
+ferry seats prune [--on <place>]        retire this caller's seats whose workspace is gone
 ferry recipes · ferry places
 ```
 
@@ -118,6 +121,7 @@ depends on the client being present.
 | `describe` | — | `{protocol, source_rev, exe, capabilities, boot_id, os, arch}` |
 | `submit` | request JSON (`id`, `token`, `commit`, `seat`, `recipe`, `args`, `env`, `hooks`, `deadline`) | `{id}` or `{refused, why, next}` |
 | `follow` | `id`, `offset` | output bytes from that offset; ends when the record is final |
+| `retire` | seat `key` | `{retired, bytes}` (under the seat lock, try only) or `{refused: busy}` |
 | `stop` | `id`, `who`, `why` | `{accepted}` or `{refused}` |
 | `record` | `id` | the final or reserved record |
 
@@ -184,7 +188,7 @@ records" impossible.
 ```
 <state>/ (default ~/.local/state/ferry)       lifetime
   locks/      seat.<key> host host.gate       —
-  seats/<key>/checkout/ seats/<key>/cache/    cache  (operator reclaims; never inside a run)
+  seats/<key>/checkout/ seats/<key>/cache/    cache  (bounded by Ferry: see below)
   runs/<id>/  request.json output.log artifacts/  record
   records/    <id>.reserved.json <id>.json    record (operator retention)
   store/      repo.git                        cache
@@ -192,6 +196,26 @@ records" impossible.
 ```
 
 Nothing else is written; Ferry writes nowhere outside these.
+
+**Bounds on seats (Ferry's own state):**
+
+- **Count:** a seat lives while its caller's workspace does. Each run
+  appends `{key, place, repo_path, seat}` to the caller's `seats.jsonl`.
+  `ferry seats prune` retires, through the place's `retire` verb, each seat
+  whose `repo_path` no longer exists. `retire` only tries the seat lock: a
+  busy seat is skipped and reported. It deletes the slot and its cache and
+  writes `records/retired-<key>.json`. A caller retires only seats it
+  recorded, never another caller's.
+- **Size:** at the start of a run, while the run holds the seat lock, if the
+  seat's preserve paths plus its cache exceed `seat_cap_bytes`, they are
+  wiped and the run starts cold. The record says so (`pruned: {bytes, cap}`).
+  Source, logs, receipts and records are never touched.
+- **Floor:** below `min_free_bytes` a run refuses with 125, as before.
+  Anything cleverer (shared caches, cross-seat eviction) is the operator's.
+
+**Why:** only the caller knows whether a workspace still exists, and only a
+run holds its seat's lock. Each bound is enforced by the party that can
+prove it, with no daemon and no second lock protocol.
 
 **Why:** files follow lifetime (PRINCIPLES 1), and nothing lands inside a
 working tree.
@@ -202,7 +226,10 @@ working tree.
   `[hooks]`, `[environment] forwards/watches/local`, `[ship]` extra refs
   (companion refs and mirrors), `[provider] requires`.
 - **`machines.toml`** (caller): `[host.<name>] ssh, features`.
-- **`host.toml`** (place, operator): `min_free_bytes`, `max_timeout`.
+- **`host.toml`** (place, operator): `min_free_bytes`, `max_timeout`,
+  `seat_cap_bytes`.
+- **`seats.jsonl`** (caller state, `~/.local/state/ferry/`): one line per seat
+  this caller used: `{key, place, repo_path, seat, last_used_ms}`.
 - **Hook environment:** `FERRY_ID FERRY_SEAT FERRY_COMMIT FERRY_WORKDIR
   FERRY_CACHE_DIR FERRY_TMP`, plus `FERRY_EXIT_CODE` for collect.
 
