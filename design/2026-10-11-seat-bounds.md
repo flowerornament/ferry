@@ -211,5 +211,38 @@ There is no daemon, no second lock protocol, and no cross-seat eviction.
   - `a_seat_over_its_cap_starts_cold_with_pruned` (not measured again
     within the hour; source untouched);
   - `a_failed_cap_wipe_is_a_note_and_the_run_goes_on`.
+- **Review of ccafe4ad** (murail-4a RETURN, critic RETURN; folded into one
+  refreeze). Deletion is held to "provably inside, provably dead":
+  - **P1-a, the cap followed a symlink ancestor** of a preserve path and
+    deleted outside the seat. Now `admission::outside` walks each path from
+    the state root, component by component, with `lstat`: only plain names
+    and no symbolic link on the way. Anything else, including what cannot
+    be inspected, is neither measured nor wiped, with a note. `retire`
+    checks its two paths the same way and refuses otherwise. The notes
+    prepare leaves reach the record even when the checkout then refuses.
+  - **P1-b, prune took any stat error for "gone".** Now gone is proven: the
+    name is absent (`NotFound`) from a parent that can be listed and is on
+    the device recorded with the seat (`parent_device`, new in the book
+    line; it tells an unmounted volume's empty mount point apart). Anything
+    else is "kept … unknown", reported, never retired.
+  - **S2 (P0), an unvalidated preserve path reached the cap's delete.** Now
+    `execution::validate` checks `preserve` at submit and again in prepare,
+    before anything touches the disk; and `outside` refuses any component
+    that is not a plain name at the point of deletion. Two independent
+    checks.
+  - **P2, the measurement had no bound.** It is skipped, as a note, when
+    the run's wait budget is spent, or once it takes over 30 s (stamped all
+    the same, so the next try is an hour away). The wipe of what was
+    measured is not separately bounded.
+  - **Local seats** are no longer recorded (the coordinator's ruling): they
+    live inside their workspace and go with it. Prune's local branch is
+    deleted.
+  - **Residue:** the containment check and the delete are two steps; a
+    process that swaps a directory for a symbolic link between them (a
+    leaver of an earlier run, holding no lock) is not excluded. The scope
+    tier (ferry-xtx.20) removes leavers.
+  - Not taken: moving the cap after `reset_checkout` (the critic's optional
+    S1 hardening). The walk is the required fix, and moving it would change
+    how `git clean` and the cap act on preserve paths.
 - **SPEC §12** gains these controls with this slice (§7); the coordinator
   amends SPEC.

@@ -88,6 +88,11 @@ pub fn validate(request: &Request) -> Result<()> {
     if request.recipe.command.is_empty() {
         return Err("empty command".into());
     }
+    // Before anything touches the disk: the cap deletes under these paths
+    // (slice 5 review S2; checked again where it deletes).
+    for path in &request.preserve {
+        crate::config::preserve_path(path)?;
+    }
     crate::receipt::provides(&request.provider_requires, &crate::receipt::capabilities())?;
     if request.args.iter().any(|arg| arg.contains('\0')) {
         return Err("invalid recipe argument".into());
@@ -234,7 +239,12 @@ pub fn prepare(
     // failure to wipe is a note, and the run goes on with what is there.
     let admitted = admission.get_or_insert_with(Default::default);
     if let Some(cap) = admitted.seat_cap_bytes {
-        match crate::admission::cap(root, &request.seat, &request.preserve, cap) {
+        // Not when the run has spent its wait budget: measuring would eat
+        // into its recipe's time (review P2).
+        let spent = request
+            .waits_end_ms
+            .is_some_and(|end| receipt::now_ms() >= end);
+        match crate::admission::cap(root, &request.seat, &request.preserve, cap, spent) {
             Ok(wiped) => {
                 if let Some(wiped) = &wiped {
                     crate::run::note_after(format!(

@@ -146,32 +146,72 @@ pub struct Pruned {
 /// by at most this long of runs (coordinator, ferry-xtx.10 Q3).
 const MEASURE_EVERY_MS: u128 = 60 * 60 * 1000;
 
+/// The longest a seat's measurement may take before the cap gives up for
+/// this run (review P2): it runs before the recipe, inside its deadline.
+const MEASURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Bytes of regular files under `path`, never following links; 0 if absent.
 pub fn size(path: &Path) -> u64 {
+    size_until(path, None).unwrap_or(0)
+}
+
+/// As `size`, or `None` once `until` has passed.
+fn size_until(path: &Path, until: Option<std::time::Instant>) -> Option<u64> {
+    if until.is_some_and(|until| std::time::Instant::now() >= until) {
+        return None;
+    }
     let Ok(meta) = fs::symlink_metadata(path) else {
-        return 0;
+        return Some(0);
     };
     if meta.is_dir() {
-        fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| size(&entry.path()))
-            .sum()
+        let mut total = 0;
+        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+            total += size_until(&entry.path(), until)?;
+        }
+        Some(total)
     } else if meta.is_file() {
-        meta.len()
+        Some(meta.len())
     } else {
-        0
+        Some(0)
     }
+}
+
+/// Why `rel` (below `root`) may not be measured or deleted, or `None` when it
+/// provably lies inside: every component a plain name, and none on the way a
+/// symbolic link, by `lstat`, never following one. A path that ends early
+/// is absent, so there is nothing to touch, and that is inside. Anything
+/// that cannot be inspected is outside (slice 5 review P1-a).
+pub fn outside(root: &Path, rel: &Path) -> Option<String> {
+    let mut at = root.to_path_buf();
+    for part in rel.components() {
+        let std::path::Component::Normal(name) = part else {
+            return Some(format!("{} is not a plain relative path", rel.display()));
+        };
+        at.push(name);
+        match fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Some(format!("{} is behind a symbolic link", rel.display()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => return Some(format!("{} cannot be inspected: {e}", rel.display())),
+        }
+    }
+    None
 }
 
 /// Under the run's seat lock, before the checkout: when the seat was last
 /// measured over an hour ago, measures its preserve paths and its cache;
 /// over `cap`, wipes them and returns what was pruned. Source, logs,
-/// receipts and records are never touched.
-pub fn cap(root: &Path, seat: &str, preserve: &[String], cap: u64) -> Result<Option<Pruned>> {
-    let slot = root.join("slots").join(seat);
-    let cache = root.join("caches").join(seat);
+/// receipts and records are never touched. A measurement that would eat
+/// into the recipe's time is skipped, as a note.
+pub fn cap(
+    root: &Path,
+    seat: &str,
+    preserve: &[String],
+    cap: u64,
+    spent: bool,
+) -> Result<Option<Pruned>> {
     let stamp = root.join("caches").join(format!(".measured-{seat}"));
     let now = crate::receipt::now_ms();
     let last = fs::read(&stamp)
@@ -181,12 +221,41 @@ pub fn cap(root: &Path, seat: &str, preserve: &[String], cap: u64) -> Result<Opt
     if last.is_some_and(|ms| now.saturating_sub(ms) < MEASURE_EVERY_MS) {
         return Ok(None);
     }
+    if spent {
+        crate::run::note_after("seat cap: not measured: the run's wait budget is spent".into());
+        return Ok(None);
+    }
+    // Only paths proven inside the seat are measured or wiped.
     let paths: Vec<_> = preserve
         .iter()
-        .map(|path| slot.join(path))
-        .chain(std::iter::once(cache.clone()))
+        .map(|path| Path::new("slots").join(seat).join(path))
+        .chain(std::iter::once(Path::new("caches").join(seat)))
+        .filter(|rel| match outside(root, rel) {
+            Some(why) => {
+                crate::run::note_after(format!("seat cap: {why}: not measured or wiped"));
+                false
+            }
+            None => true,
+        })
+        .map(|rel| root.join(rel))
         .collect();
-    let bytes: u64 = paths.iter().map(|path| size(path)).sum();
+    let until = std::time::Instant::now() + MEASURE_LIMIT;
+    let Some(bytes) = paths
+        .iter()
+        .map(|path| size_until(path, Some(until)))
+        .sum::<Option<u64>>()
+    else {
+        crate::run::note_after(format!(
+            "seat cap: not measured: over {MEASURE_LIMIT:?}; not wiped"
+        ));
+        // Stamped all the same, so the next try is an hour away.
+        fs::create_dir_all(root.join("caches"))?;
+        fs::write(
+            &stamp,
+            serde_json::json!({"ms": now, "bytes": null}).to_string(),
+        )?;
+        return Ok(None);
+    };
     let over = bytes > cap;
     if over {
         if crate::execution::fail_at("cap-wipe") {
@@ -204,4 +273,56 @@ pub fn cap(root: &Path, seat: &str, preserve: &[String], cap: u64) -> Result<Opt
     let measured = serde_json::json!({"ms": now, "bytes": if over { 0 } else { bytes }});
     fs::write(&stamp, measured.to_string())?;
     Ok(over.then_some(Pruned { bytes, cap }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{outside, size_until};
+    use std::path::Path;
+
+    /// At the point of deletion, independently of request validation, only a
+    /// plain relative path without a link on the way is inside (review S2).
+    #[test]
+    fn only_plain_paths_without_links_are_inside() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("slots/s/real")).unwrap();
+        std::os::unix::fs::symlink("/", root.join("slots/s/link")).unwrap();
+        assert_eq!(outside(root, Path::new("slots/s/real/x")), None);
+        assert_eq!(outside(root, Path::new("slots/s/absent/x")), None);
+        for rel in ["/etc", "slots/s/../../x", "slots/s/link/etc"] {
+            assert!(outside(root, Path::new(rel)).is_some(), "{rel}");
+        }
+    }
+
+    /// herald-1b's diagnostic (eedc813a): a preserve path whose ancestor in
+    /// the slot is a symbolic link is never deleted through it.
+    #[test]
+    fn cap_must_not_delete_through_a_preserve_parent_symlink() {
+        let owned = tempfile::tempdir().unwrap();
+        let root = owned.path().join("ferry");
+        let slot = root.join("slots/seat");
+        let outside = owned.path().join("outside");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::create_dir_all(outside.join("cache")).unwrap();
+        let sentinel = outside.join("cache/not-ferry-owned");
+        std::fs::write(&sentinel, "must survive").unwrap();
+        std::os::unix::fs::symlink(&outside, slot.join("link")).unwrap();
+        crate::config::preserve_path("link/cache").unwrap();
+        let _ = super::cap(&root, "seat", &["link/cache".into()], 1, false);
+        assert!(
+            sentinel.exists(),
+            "cap deleted outside the seat through an ancestor symlink"
+        );
+    }
+
+    /// A measurement gives up once its time is over (review P2).
+    #[test]
+    fn a_measurement_past_its_time_gives_up() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("blob"), [0u8; 16]).unwrap();
+        assert_eq!(size_until(root.path(), None), Some(16));
+        let past = std::time::Instant::now();
+        assert_eq!(size_until(root.path(), Some(past)), None);
+    }
 }

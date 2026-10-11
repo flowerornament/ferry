@@ -271,19 +271,26 @@ receipts or records.
   `~/.local/state/ferry/seats.jsonl` (`{key, place, repo_path, seat,
   last_used_ms}`; one `O_APPEND` write, never rewritten). A failed append is
   retried when the run completes, and a failure then is a note. `ferry seats
-  prune [--on <machine>]` retires each recorded seat whose `repo_path` no
-  longer exists: the place's `retire` verb tries the seat's lock once and,
+  prune [--on <machine>]` retires each recorded seat whose workspace is
+  provably gone: its name is absent from a parent directory that can be
+  listed and is on the device recorded with it. Anything else (a denied
+  lookup, a missing parent, an unmounted volume) is reported as `kept …
+  unknown` and never retired. The place's `retire` verb tries the seat's lock once and,
   if it is free, deletes the seat's checkout and cache, records
   `records/retired-<key>.json`, and keeps the lock file. A held seat is
   skipped (busy). A run refused meanwhile is told the seat "is being
   retired". Prune prints one line per seat and appends a tombstone for each
-  one retired; a later run on the same workspace revives it. Exit 0 when
+  one retired; a later run on the same workspace revives it. Local seats live
+  inside their workspace and go with it, so they are not recorded. Exit 0 when
   every candidate was retired or busy, 125 if a place refused otherwise
   (including a place without the `retire` capability, named by revision),
   255 if a place was unreachable. Prune only ever names this caller's seats.
 - **Size.** With `seat_cap_bytes` set, a run measures its seat's preserve
   paths and cache under its seat lock, before the checkout, when the last
-  measurement is over an hour old. Over the cap, they are wiped and the run
+  measurement is over an hour old. Only paths proven inside the seat are
+  measured or wiped: one behind a symbolic link is skipped with a note. A
+  run that has spent its wait budget, or a measurement over 30 s, is not
+  measured (a note). Over the cap, they are wiped and the run
   starts cold: the receipt's `pruned` is `{bytes, cap}` and `reason` says so.
   The cap can be exceeded by at most an hour of runs' growth. A failed wipe is
   a note, and the run goes on with what is there.

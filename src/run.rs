@@ -321,6 +321,14 @@ pub(crate) fn note_after(note: String) {
     }
 }
 
+/// The notes so far, taken once.
+pub(crate) fn take_notes() -> Vec<String> {
+    NOTES
+        .lock()
+        .map(|mut notes| std::mem::take(&mut *notes))
+        .unwrap_or_default()
+}
+
 /// What a supervised run came to. Custody is always present once a session
 /// may have been spawned (S8).
 pub struct Finished {
@@ -368,10 +376,7 @@ pub fn run_released(
         collection,
         custody,
         output,
-        notes: NOTES
-            .lock()
-            .map(|mut n| std::mem::take(&mut *n))
-            .unwrap_or_default(),
+        notes: take_notes(),
     }
 }
 

@@ -2189,6 +2189,8 @@ fn a_seat_over_its_cap_starts_cold_with_pruned() {
         slot.join("ferry.toml").exists(),
         "tracked source was touched"
     );
+    // A local seat lives inside its workspace: the book does not record it.
+    assert_eq!(seats_book(dir.path()), Vec::<serde_json::Value>::new());
 }
 
 /// A failed wipe is a note, and the run goes on with what is there.
@@ -2235,5 +2237,227 @@ fn a_failed_cap_wipe_is_a_note_and_the_run_goes_on() {
             .unwrap()
             .contains("seat cap: cap-wipe"),
         "{record}"
+    );
+}
+
+/// A live workspace prune cannot inspect is kept and reported, never
+/// retired: unknown is not gone (slice 5 review P1-b; murail-4a's repro).
+#[test]
+fn seats_prune_keeps_a_workspace_it_cannot_inspect() {
+    let dir = fixture();
+    let hidden = dir.path().join("hidden");
+    fs::create_dir(&hidden).unwrap();
+    let live = workspace(dir.path(), "hidden/live");
+    assert_eq!(remote_pass(dir.path(), &live).status.code(), Some(0));
+    let key = key_of(dir.path(), &live);
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("kept") && said.contains("unknown"), "{said}");
+    let slot = dir.path().join("host/.local/state/ferry/slots").join(&key);
+    assert!(slot.exists(), "{said}");
+}
+
+/// A workspace whose parent directory is missing, as under an unmounted
+/// volume, is unknown and kept.
+#[test]
+fn seats_prune_keeps_a_workspace_whose_parent_is_missing() {
+    let dir = fixture();
+    fs::create_dir(dir.path().join("volume")).unwrap();
+    let live = workspace(dir.path(), "volume/live");
+    assert_eq!(remote_pass(dir.path(), &live).status.code(), Some(0));
+    let key = key_of(dir.path(), &live);
+    fs::remove_dir_all(dir.path().join("volume")).unwrap();
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("kept") && said.contains("unknown"), "{said}");
+    let slot = dir.path().join("host/.local/state/ferry/slots").join(&key);
+    assert!(slot.exists(), "{said}");
+}
+
+/// The cap measures and wipes only what is proven inside the seat: a
+/// preserve path behind a symbolic link is neither, and its target survives
+/// (slice 5 review P1-a; murail-4a's repro).
+#[test]
+fn the_cap_never_follows_a_symbolic_link_out_of_the_seat() {
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "build/\nconfig/\nstate/\n").unwrap();
+    fs::write(
+        dir.path().join("ferry.toml"),
+        "version=1\npreserve=['build/cache']\n[recipe.pass]\ncommand=['sh','-c','echo committed']\n",
+    )
+    .unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "nested preserve"]);
+    let first = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(first.status.code(), Some(0), "{}", receipt(&first));
+    let slot = fs::read_dir(dir.path().join(".ferry/local/slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir(outside.path().join("cache")).unwrap();
+    let sentinel = outside.path().join("cache/sentinel");
+    fs::write(&sentinel, vec![1u8; 4096]).unwrap();
+    std::os::unix::fs::symlink(outside.path(), slot.join("build")).unwrap();
+    with_host_policy(
+        dir.path(),
+        "version=1\nmin_free_bytes=1\nseat_cap_bytes=1000\n",
+    );
+    let second = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let record = receipt(&second);
+    assert!(sentinel.exists(), "{record}");
+    assert!(record["pruned"].is_null(), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("is behind a symbolic link: not measured or wiped"),
+        "{record}"
+    );
+}
+
+/// A place validates `preserve` before anything touches the disk: an
+/// absolute path is refused at submit, and its target survives a cap of 0
+/// (slice 5 review S2; the critic's s2).
+#[test]
+fn a_place_refuses_an_unvalidated_preserve_path_before_any_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    fs::create_dir_all(&victim).unwrap();
+    fs::write(victim.join("precious"), "do not delete").unwrap();
+    with_host_policy(
+        dir.path(),
+        "version=1\nmin_free_bytes=1\nseat_cap_bytes=0\n",
+    );
+    let state = dir.path().join("state");
+    let request = serde_json::json!({
+        "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
+        "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
+        "timeout_seconds": null, "mirrors": [], "forwarded_env": {},
+        "preserve": [victim.display().to_string()]
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .args(["place", "--state"])
+        .arg(&state)
+        .arg("submit")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        child.stdin.as_mut().unwrap(),
+        format!("{request}\n").as_bytes(),
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let reply = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(125), "{reply}");
+    assert!(victim.join("precious").exists(), "{reply}");
+    assert!(!state.join("records/1-aa.json").exists());
+}
+
+/// Measuring runs before the recipe, inside its deadline: a run that has
+/// spent its wait budget is not measured, and says so (slice 5 review P2).
+#[test]
+fn a_run_with_its_wait_budget_spent_is_not_measured() {
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "big/\nconfig/\nstate/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['big']\n[recipe.pass]\ncommand=['sh','-c','mkdir -p big; head -c 4096 /dev/zero > big/blob']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "a preserved path that grows"]);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
+    );
+    let out = run(
+        dir.path(),
+        &["run", "pass", "--local", "--json", "--wait-seconds", "0"],
+    );
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not measured: the run's wait budget is spent"),
+        "{record}"
+    );
+}
+
+/// A workspace whose parent is now on another device than the one recorded
+/// (an unmounted volume's empty mount point) is unknown and kept.
+#[test]
+fn seats_prune_keeps_a_workspace_whose_parent_changed_device() {
+    let dir = fixture();
+    let gone = workspace(dir.path(), "gone");
+    assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
+    let key = key_of(dir.path(), &gone);
+    fs::remove_dir_all(&gone).unwrap();
+    // The same seat as recorded from another device.
+    let mut line = seats_book(dir.path()).pop().unwrap();
+    line["parent_device"] = (line["parent_device"].as_u64().unwrap() + 1).into();
+    let book = dir.path().join("state/ferry/seats.jsonl");
+    let mut text = fs::read_to_string(&book).unwrap();
+    writeln!(text, "{line}").unwrap();
+    fs::write(&book, text).unwrap();
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("kept") && said.contains("device"), "{said}");
+    let slot = dir.path().join("host/.local/state/ferry/slots").join(&key);
+    assert!(slot.exists(), "{said}");
+}
+
+/// Retire deletes only what is proven inside the place's root: through a
+/// symbolic link it refuses, and the link's target survives (review P1-a).
+#[test]
+fn retire_never_follows_a_symbolic_link_out_of_the_place() {
+    let dir = fixture();
+    let gone = workspace(dir.path(), "gone");
+    assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
+    let key = key_of(dir.path(), &gone);
+    fs::remove_dir_all(&gone).unwrap();
+    let place = dir.path().join("host/.local/state/ferry");
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir_all(outside.path().join(&key)).unwrap();
+    let sentinel = outside.path().join(&key).join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    let _ = fs::remove_dir_all(place.join("caches"));
+    std::os::unix::fs::symlink(outside.path(), place.join("caches")).unwrap();
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    assert_eq!(code, Some(125), "{said}");
+    assert!(said.contains("symbolic link"), "{said}");
+    assert!(sentinel.exists(), "{said}");
+}
+
+/// herald-1b's diagnostic (eedc813a): a workspace whose lookup is denied is
+/// unknown, not gone, and its seat survives.
+#[test]
+fn consumer_prune_must_not_treat_permission_denied_as_workspace_gone() {
+    let dir = fixture();
+    fs::create_dir(dir.path().join("private")).unwrap();
+    let live = workspace(dir.path(), "private/live");
+    assert_eq!(remote_pass(dir.path(), &live).status.code(), Some(0));
+    let key = key_of(dir.path(), &live);
+    let parent = dir.path().join("private");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+    let observation = live.try_exists();
+    let (code, said) = prune(dir.path(), ".local/bin/ferry");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        observation.is_err(),
+        "fixture must establish unknown, not absence"
+    );
+    assert!(live.exists(), "the caller workspace still exists");
+    assert!(
+        dir.path()
+            .join("host/.local/state/ferry/slots")
+            .join(key)
+            .exists(),
+        "prune deleted a live workspace's seat: code={code:?}, {said}"
     );
 }

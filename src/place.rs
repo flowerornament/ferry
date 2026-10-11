@@ -265,8 +265,12 @@ fn existing(root: &Path, request: &Request) -> Option<u32> {
 
 /// Runs a submitted request to its final record, detached from any client.
 /// Records admission and what the cap pruned as JSON, as the place writes
-/// them (an older shape must always parse: 4b's review R3).
+/// them (an older shape must always parse: 4b's review R3), and the notes
+/// prepare left when no run took them (a refusal after the cap).
 fn record_admission(result: &mut HostResult, admission: Option<crate::admission::Admission>) {
+    for after in crate::run::take_notes() {
+        note(&mut result.reason, after);
+    }
     let mut admission = admission;
     result.pruned = admission
         .as_mut()
@@ -592,7 +596,15 @@ pub fn retire(root: &Path, key: &str) -> Result<i32> {
         return Ok(refuse(&why, "prune again later"));
     };
     execution::pause_at("retire-pause", &lock);
-    let paths = [root.join("slots").join(key), root.join("caches").join(key)];
+    let paths = [Path::new("slots").join(key), Path::new("caches").join(key)];
+    // Only what is proven inside the place's root is deleted.
+    if let Some(why) = paths
+        .iter()
+        .find_map(|rel| crate::admission::outside(root, rel))
+    {
+        return Ok(refuse(&format!("{why}: not retired"), "inspect the place"));
+    }
+    let paths = paths.map(|rel| root.join(rel));
     let bytes: u64 = paths.iter().map(|path| crate::admission::size(path)).sum();
     for path in &paths {
         if execution::fail_at("retire-delete") {

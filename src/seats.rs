@@ -8,6 +8,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -24,6 +25,10 @@ pub struct Line {
     pub seat: String,
     #[serde(default)]
     pub last_used_ms: u128,
+    /// The device of the workspace's parent directory when it was used: an
+    /// unmounted volume leaves an empty mount point on another device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_device: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_ms: Option<u128>,
 }
@@ -54,16 +59,49 @@ fn append(line: &Line) -> Result<()> {
     Ok(())
 }
 
-/// Records that a run on `place` used seat `key` of `repo_path`.
+/// Records that a run on `place` used seat `key` of `repo_path`. A local
+/// seat lives inside its workspace and goes with it: it is not recorded.
 pub fn record(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()> {
+    if place == "local" {
+        return Ok(());
+    }
+    let parent = repo_path
+        .parent()
+        .ok_or("the workspace has no parent directory")?;
     append(&Line {
         key: key.to_owned(),
         place: place.to_owned(),
         repo_path: repo_path.display().to_string(),
         seat: seat.to_owned(),
         last_used_ms: crate::receipt::now_ms(),
+        parent_device: Some(fs::metadata(parent)?.dev()),
         retired_ms: None,
     })
+}
+
+/// Whether the workspace is provably gone: its name is absent from a parent
+/// directory that can be listed and is on the device recorded with it.
+/// Anything else (a denied or failed lookup, a missing parent, another
+/// device) cannot prove it, and the seat is kept (slice 5 review P1-b).
+fn gone(line: &Line) -> std::result::Result<bool, String> {
+    let path = Path::new(&line.repo_path);
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    let parent = path.parent().ok_or("no parent directory")?;
+    let listed = fs::read_dir(parent).and_then(|_| fs::metadata(parent));
+    let device = listed
+        .map_err(|e| format!("parent {}: {e}", parent.display()))?
+        .dev();
+    if line.parent_device != Some(device) {
+        return Err(format!(
+            "parent {} is not on the device recorded with the workspace (unmounted?)",
+            parent.display()
+        ));
+    }
+    Ok(true)
 }
 
 /// Records the seat unless the book already has it live: a completion
@@ -102,17 +140,21 @@ fn latest() -> Result<BTreeMap<String, Line>> {
 pub fn prune(only: Option<&str>, hosts: &config::Machines) -> Result<i32> {
     let mut code = 0;
     for line in latest()?.into_values() {
-        if line.retired_ms.is_some()
-            || only.is_some_and(|place| place != line.place)
-            || Path::new(&line.repo_path).exists()
-        {
+        if line.retired_ms.is_some() || only.is_some_and(|place| place != line.place) {
             continue;
         }
-        let said = if line.place == "local" {
-            // A local seat lives in its workspace's .ferry/local: it went
-            // with the workspace.
-            Ok(serde_json::json!({"retired": line.key, "bytes": 0}))
-        } else if let Some(machine) = hosts.host.get(&line.place) {
+        match gone(&line) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(why) => {
+                println!(
+                    "kept {} on {}: workspace {} unknown: {why}",
+                    line.seat, line.place, line.repo_path
+                );
+                continue;
+            }
+        }
+        let said = if let Some(machine) = hosts.host.get(&line.place) {
             transport::retire(&transport::Place::Remote(machine), &line.key)
         } else {
             Err(format!("unknown place {}", line.place).into())
