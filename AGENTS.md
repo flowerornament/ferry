@@ -96,7 +96,9 @@ its own reviewed change.
 
 - **Living documents** are at the root in capitals and are kept true to the
   code: README, AGENTS, PRINCIPLES, RELEASE (later REFERENCE and
-  ARCHITECTURE). Change them in the same commit as the behaviour they
+  ARCHITECTURE). `SPEC.md` is the normative end state that M1 converges
+  on: every slice cites the SPEC sections it implements, and a change to the
+  target amends SPEC first, in its own reviewed change. Change them in the same commit as the behaviour they
   describe.
 - **Dated design documents** are in `design/` as `YYYY-MM-DD-topic.md`. Each
   references its beads, reviews and evidence. They are amended or superseded

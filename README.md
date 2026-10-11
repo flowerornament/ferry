@@ -468,7 +468,8 @@ just land            # gate exactly the described change, then move main (one la
 - `PRINCIPLES.md`: what Ferry is and is not, and how design questions are
   decided.
 - `design/`: dated design documents, with their reviews and evidence.
-- **Current plan:** `design/2026-10-09-ferry-minimal.md`: Ferry does one
+- **Target:** `SPEC.md` (normative end state, terse). **Rationale:**
+  `design/2026-10-09-ferry-minimal.md`: Ferry does one
   thing (an exact commit's recipe on your machine, warm, alone if asked, with
   an honest record) and pushes containment strength to the OS and scheduling
   to repositories and CI. A run becomes a bounded, detached job:
