@@ -5,6 +5,7 @@ mod config;
 mod custody;
 mod execution;
 mod limits;
+mod lock;
 mod place;
 mod receipt;
 mod record;

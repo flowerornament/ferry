@@ -118,7 +118,7 @@ pub struct Receipt {
     pub custody: Option<crate::custody::Release>,
     /// The host lease the session held: `shared` or `exclusive`, and its wait.
     #[serde(default)]
-    pub lease: Option<crate::execution::Lease>,
+    pub lease: Option<crate::lock::Lease>,
     /// The host's disk admission: policy, measurements, evictions, verdict.
     #[serde(default)]
     pub admission: Option<crate::admission::Admission>,

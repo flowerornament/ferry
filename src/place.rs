@@ -44,7 +44,7 @@ pub struct HostResult {
     #[serde(default)]
     pub custody: Option<crate::custody::Release>,
     #[serde(default)]
-    pub lease: Option<execution::Lease>,
+    pub lease: Option<crate::lock::Lease>,
     #[serde(default)]
     pub admission: Option<crate::admission::Admission>,
     /// What reached `output.log`.
@@ -269,7 +269,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         crate::custody::supervise()?;
         let (seat, lease, host_lease) =
             execution::prepare(root, &request, &stop, &mut result.admission)?;
-        let locks = execution::inherited(&lease, &host_lease);
+        let locks = crate::lock::inherited(&lease, &host_lease);
         let finished = execution::run_released(root, &seat, &request, &stop, &locks, deadline);
         if let Some(error) = &finished.custody.error {
             note(
