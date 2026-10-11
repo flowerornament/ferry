@@ -244,7 +244,7 @@ fn working_copy_edits_cannot_change_the_recipe() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(receipt(&out)["outcome"], "ran-pass");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("committed"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("committed"));
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn preserved_ignored_directories_survive_but_tracked_files_reset() {
         "{}",
         String::from_utf8_lossy(&second.stdout)
     );
-    assert!(String::from_utf8_lossy(&second.stdout).contains("warm"));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("warm"));
     assert_ne!(
         fs::read_to_string(slot.join("ferry.toml")).unwrap(),
         "tracked tampering"
@@ -400,11 +400,11 @@ fn recipe_arguments_follow_the_command_and_are_recorded() {
     let out = run(dir.path(), &command_line);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
-    let printed: Vec<String> = stdout
+    // With --json, the recipe's output is on stderr, exactly as written.
+    let printed: Vec<&str> = std::str::from_utf8(&out.stderr)
+        .unwrap()
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|event| event["event"] == "output")
-        .map(|event| event["text"].as_str().unwrap().to_owned())
+        .filter(|line| line.starts_with('<'))
         .collect();
     assert_eq!(
         printed,
@@ -555,7 +555,7 @@ fn caller_environment_is_declared_forwarded_and_recorded() {
         receipt(&out)["forwarded_env"],
         serde_json::json!({"APP_ALLOWED":"selected"})
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("forwarded-selected"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("forwarded-selected"));
     let out = command()
         .env("APP_UNLISTED", "hidden-input")
         .output()
@@ -657,15 +657,15 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
     let owner: serde_json::Value = serde_json::from_slice(&fs::read(&ownership).unwrap()).unwrap();
     let group = OwnedGroup(i32::try_from(owner["session"].as_u64().unwrap()).unwrap());
     let seat = ownership.file_stem().unwrap().to_str().unwrap();
-    // Kill the supervisor itself: the host-run the caller spawned, named by
-    // its `accepted` event. The caller then ends without a result.
+    // Kill the supervisor itself: the run's, named by
+    // its `submitted` event. Its run reconciles to lost.
     let supervisor = fs::read_to_string(&caller_output)
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|event| event["event"] == "accepted")
+        .find(|event| event["event"] == "submitted")
         .and_then(|event| event["pid"].as_i64())
-        .expect("the accepted event names the supervisor");
+        .expect("the submitted event names the supervisor");
     kill(
         Pid::from_raw(i32::try_from(supervisor).unwrap()),
         Signal::SIGKILL,
@@ -857,7 +857,7 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
         receipt(&out)["forwarded_env"],
         serde_json::json!({"APP_ALLOWED":"selected"})
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("remote-selected [a b --seat]"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("remote-selected [a b --seat]"));
     assert_eq!(receipt(&out)["args"], serde_json::json!(["a b", "--seat"]));
     assert_eq!(receipt(&out)["host_source_rev"], SOURCE_REV);
     assert_eq!(
@@ -1026,9 +1026,11 @@ fn interrupted_caller_kills_children_and_exits_128_plus_signal(
         "sibling process-group child survived"
     );
     let output = caller.child.take().unwrap().wait_with_output().unwrap();
+    // The caller asked the place to stop the run with its own signal.
     assert_eq!(output.status.code(), Some(code));
-    assert_eq!(receipt(&output)["outcome"], "lost");
+    assert_eq!(receipt(&output)["outcome"], "stopped");
     assert_eq!(receipt(&output)["exit_code"], code);
+    assert!(receipt(&output)["stopped_by"]["why"].is_string());
 }
 
 #[test]
@@ -1125,7 +1127,7 @@ fn adapter_runs_from_the_pinned_commit_and_records_both_digests() {
     let record = receipt(&out);
     assert_eq!(record["adapter_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(record["contract_sha256"].as_str().unwrap().len(), 64);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("adapter-commit"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("adapter-commit"));
 }
 #[test]
 fn malformed_or_partial_adapter_contract_never_runs_a_valid_subset() {
@@ -1168,7 +1170,8 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     fs::create_dir_all(&tools).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
     // FERRY_TEST_SLOW_PUSH names a marker: a git push touches it, then stalls.
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    // A file `unreachable` on the host fails every follow, as a dead link.
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
@@ -1243,7 +1246,7 @@ fn a_signal_during_the_push_stops_the_run_before_dispatch() {
             .contains("before dispatch")
     );
     assert!(
-        !stdout.contains("\"accepted\""),
+        !stdout.contains("\"submitted\""),
         "the host was asked to run: {stdout}"
     );
     assert!(!stdout.contains("committed"));
@@ -1273,7 +1276,7 @@ fn a_host_refusal_before_acceptance_is_refused_not_lost() {
         record["reason"]
             .as_str()
             .unwrap()
-            .starts_with("host refused before acceptance: reserving "),
+            .starts_with("place refused before acceptance: reserving "),
         "{}",
         record["reason"]
     );
@@ -1283,11 +1286,11 @@ fn a_host_refusal_before_acceptance_is_refused_not_lost() {
 }
 
 #[test]
-fn an_older_host_exiting_125_before_acceptance_is_refused_not_lost() {
+fn a_place_exiting_125_before_replying_is_refused_not_lost() {
     let dir = fixture();
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
-    // An older host-run says nothing on the protocol and exits 125.
+    // A place whose submit fails before replying, exiting 125.
     fs::write(
         bin.join("old-ferry"),
         "#!/bin/sh\ncase \"$1\" in host-info) exec \"$HOME/.local/bin/ferry\" host-info;; *) echo 'ferry: File exists (os error 17)' >&2; exit 125;; esac\n",
@@ -1299,7 +1302,12 @@ fn an_older_host_exiting_125_before_acceptance_is_refused_not_lost() {
         ".local/bin/old-ferry",
         &["run", "pass", "--on", "test-host", "--json"],
     );
-    assert_eq!(out.status.code(), Some(125));
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let record = receipt(&out);
     assert_eq!(record["outcome"], "refused");
     assert_eq!(record["exit_code"], 125);
@@ -2065,10 +2073,10 @@ fn a_host_without_a_required_capability_is_refused_before_acceptance() {
     git(dir.path(), &["commit", "-m", "requires admission"]);
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
-    // A host from before capabilities: its host-info names none.
+    // A host that can detach, without the required capability.
     fs::write(
         bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed 's/,\"capabilities\":\\[[^]]*\\]//';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\"]/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
     )
     .unwrap();
     fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -2089,11 +2097,40 @@ fn a_host_without_a_required_capability_is_refused_before_acceptance() {
         record["reason"]
     );
     assert_eq!(record["host_binary_sha256"].as_str().unwrap().len(), 64);
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("\"accepted\""));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("\"submitted\""));
 }
 
 #[test]
-fn host_run_refuses_a_request_requiring_a_capability_it_lacks() {
+fn a_new_caller_refuses_a_place_without_detach_naming_its_revision() {
+    // SPEC §12.11: an old place is refused before anything is shipped or
+    // submitted, so no state root is ever shared by old and new binaries.
+    let dir = fixture();
+    let bin = dir.path().join("host/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("old-ferry"),
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = remote_run(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(125));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(reason.contains("lacks detach"), "{reason}");
+    assert!(reason.contains("0ld-place-rev"), "{reason}");
+    assert!(reason.contains("install this caller's ferry"), "{reason}");
+    assert!(!dir.path().join("host/.local/state/ferry/records").exists());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("\"submitted\""));
+}
+
+#[test]
+fn a_place_refuses_a_request_requiring_a_capability_it_lacks() {
     let dir = tempfile::tempdir().unwrap();
     let request = serde_json::json!({
         "protocol": 1, "id": "1-aa", "token": "tok", "commit": "0".repeat(40), "seat": "s",
@@ -2101,25 +2138,18 @@ fn host_run_refuses_a_request_requiring_a_capability_it_lacks() {
         "timeout_seconds": null, "mirrors": [], "forwarded_env": {},
         "provider_requires": ["teleport"]
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+    let (code, reply) = submit(dir.path(), &request);
+    assert_eq!(code, Some(125), "{reply}");
+    assert!(reply.contains("teleport"), "{reply}");
+    assert!(!dir.path().join("records").exists());
+    // A caller from before detached runs is refused, not half served.
+    let old = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("host-run")
-        .env("HOME", dir.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
+        .stdin(std::process::Stdio::null())
+        .output()
         .unwrap();
-    std::io::Write::write_all(
-        child.stdin.as_mut().unwrap(),
-        format!("{request}\n").as_bytes(),
-    )
-    .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(125));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("\"event\":\"refused\""), "{stdout}");
-    assert!(stdout.contains("teleport"), "{stdout}");
-    assert!(!stdout.contains("\"accepted\""));
-    assert!(!dir.path().join(".local/state/ferry/records").exists());
+    assert_eq!(old.status.code(), Some(125));
+    assert!(String::from_utf8_lossy(&old.stdout).contains("\"event\":\"refused\""));
 }
 
 // Only Linux adopts descendants; Apple's ps cannot run in the Darwin Nix sandbox.
@@ -2174,13 +2204,14 @@ exit 1
     assert_eq!(receipt(&out)["exit_code"], 7);
 }
 
-/// Submits `request` to `ferry host-run --state <state>`; its exit code and
-/// event stream.
+/// Submits `request` to `ferry place --state <state> submit`; its exit code
+/// and reply.
 fn submit(state: &Path, request: &serde_json::Value) -> (Option<i32>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .arg("host-run")
+        .arg("place")
         .arg("--state")
         .arg(state)
+        .arg("submit")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -2198,14 +2229,14 @@ fn submit(state: &Path, request: &serde_json::Value) -> (Option<i32>, String) {
 }
 
 #[test]
-fn a_second_submit_of_an_id_is_refused_and_a_live_supervisor_kept() {
+fn a_second_submit_follows_its_own_run_and_refuses_another() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let records = state.join("records");
     fs::create_dir_all(&records).unwrap();
-    let request = |id: &str| {
+    let request = |id: &str, token: &str| {
         serde_json::json!({
-            "protocol": 1, "id": id, "token": "tok", "commit": "0".repeat(40), "seat": "s",
+            "protocol": 1, "id": id, "token": token, "commit": "0".repeat(40), "seat": "s",
             "recipe": {"command": ["true"]}, "hooks": {}, "caller_binary_sha256": "x",
             "timeout_seconds": null, "mirrors": [], "forwarded_env": {}
         })
@@ -2219,24 +2250,93 @@ fn a_second_submit_of_an_id_is_refused_and_a_live_supervisor_kept() {
     });
     let reserved = records.join("1-live.reserved.json");
     fs::write(&reserved, reservation.to_string()).unwrap();
-    let (code, events) = submit(&state, &request("1-live"));
-    assert_eq!(code, Some(125), "{events}");
-    assert!(events.contains("already submitted"), "{events}");
-    assert!(!events.contains("\"accepted\""), "{events}");
+    // Another caller's request with the same id: refused.
+    let (code, reply) = submit(&state, &request("1-live", "other"));
+    assert_eq!(code, Some(125), "{reply}");
+    assert!(reply.contains("already submitted"), "{reply}");
+    // Its own caller retrying: the run it started, not a second one.
+    let (code, reply) = submit(&state, &request("1-live", "tok"));
+    assert_eq!(code, Some(0), "{reply}");
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["pid"], live.id());
     // Another run on the seat reconciles gone supervisors, never a live one.
-    let (_, events) = submit(&state, &request("2-next"));
-    assert!(events.contains("\"accepted\""), "{events}");
-    assert!(records.join("2-next.json").exists(), "{events}");
+    let (code, reply) = submit(&state, &request("2-next", "tok"));
+    assert_eq!(code, Some(0), "{reply}");
+    let deadline = common::startup_deadline();
+    while !records.join("2-next.json").exists() {
+        assert!(std::time::Instant::now() < deadline, "2-next never final");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert_eq!(
         fs::read_to_string(&reserved).unwrap(),
         reservation.to_string()
     );
     assert!(!records.join("1-live.json").exists());
-    // A finished run is refused just the same: no second run.
-    let (code, events) = submit(&state, &request("2-next"));
-    assert_eq!(code, Some(125), "{events}");
-    assert!(events.contains("already finished"), "{events}");
+    // A finished run: its caller gets it back, another is refused.
+    let (code, reply) = submit(&state, &request("2-next", "tok"));
+    assert_eq!(code, Some(0), "{reply}");
+    let (code, reply) = submit(&state, &request("2-next", "other"));
+    assert_eq!(code, Some(125), "{reply}");
+    assert!(reply.contains("already finished"), "{reply}");
     // The test's own child, by its handle.
     live.kill().unwrap();
     live.wait().unwrap();
+}
+
+#[test]
+fn an_unreachable_place_leaves_the_receipt_submitted_until_ferry_record() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    // While this file exists the place cannot be followed (ssh fails, 255).
+    let unreachable = dir.path().join("host/unreachable");
+    fs::create_dir_all(dir.path().join("host")).unwrap();
+    fs::write(&unreachable, "").unwrap();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_UNREACHABLE_MS", "2000")
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    // The run may go on: no verdict is claimed.
+    assert_eq!(out.status.code(), Some(255), "{record}");
+    assert_eq!(record["state"], "submitted", "{record}");
+    assert_eq!(record["outcome"], "lost", "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains("ferry record"),
+        "{record}"
+    );
+    // Once the place answers, the receipt follows its final record, which
+    // names the binary that ran even after an install replaced it.
+    fs::remove_file(&unreachable).unwrap();
+    let id = record["id"].as_str().unwrap();
+    let host_record = dir
+        .path()
+        .join(format!("host/.local/state/ferry/records/{id}.json"));
+    let deadline = common::startup_deadline();
+    while !host_record.exists() {
+        assert!(std::time::Instant::now() < deadline, "{id} never final");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut ran: serde_json::Value =
+        serde_json::from_slice(&fs::read(&host_record).unwrap()).unwrap();
+    ran["binary_sha256"] = "e".repeat(64).into();
+    fs::write(&host_record, ran.to_string()).unwrap();
+    let out = remote_command(dir.path(), ".local/bin/ferry", &["record", id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["state"], "final", "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["host_binary_sha256"], "e".repeat(64), "{record}");
 }
