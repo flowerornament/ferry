@@ -75,6 +75,7 @@ ferry follow <id>                   re-attach: the run's output, then its receip
 ferry stop <id> [--other --reason '<why>']
                                     stop your run (another caller's needs a reason)
 ferry record <id>                   the receipt, completed once the run is final
+                                    (exit 3 while it has no verdict yet)
 ferry recipes                       the recipes at this commit
 ferry machines                      the configured machines
 ferry receipt <id>                  print a receipt
@@ -90,6 +91,12 @@ detached runs.
 
 Read the receipt's `outcome`, not the recipe's printed text, to tell a Ferry
 refusal from a recipe failure. A recipe may itself exit 125.
+
+`ferry record <id>` exits with the final record's code, or 3 while the run
+has no verdict yet (`state: submitted`): poll again, or `ferry follow <id>`.
+Exit codes are for people. A recipe's own code can be 3, 124, 125 or 255,
+so a program decides by the `--json` receipt: `state` first, then
+`outcome` (SPEC §4).
 
 | outcome | exit | meaning |
 |---|---|---|
@@ -283,6 +290,8 @@ inside an admitting run.
 
 Hooks are committed executables, with paths relative to the checkout. They run
 inside the run's own session, in this order: prepare, env, the recipe, collect.
+A run stopped before its session is spawned (a stop while it waits for locks
+or prepares its seat) runs none of them, collect included: nothing ran.
 
 - **env** prints a JSON object of environment strings, never shell code.
 - **Inputs:** `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, `FERRY_WORKDIR`,

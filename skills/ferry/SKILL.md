@@ -64,9 +64,14 @@ The exit code and the receipt's `outcome` decide what a red result means:
 **Exit codes only.** A recipe can itself exit 125, so read `outcome` from the
 receipt, never the printed text.
 
+**`ferry record <id>` exits 3 while the run has no verdict yet:** poll again,
+or `ferry follow <id>`. A recipe's own code can be 3, 124, 125 or 255 too, so
+a program decides by the `--json` receipt, `state` first, then `outcome`,
+never by the exit code alone (SPEC §4).
+
 ```bash
 ferry receipt <id>                     # the stored receipt (JSON)
-ferry record <id>                      # the receipt, completed once the run is final
+ferry record <id>                      # the receipt once final; exit 3 = no verdict yet
 ferry follow <id>                      # re-attach: the run's output, then its receipt
 ferry stop <id>                        # stop your run (another's: --other --reason '<why>')
 ```

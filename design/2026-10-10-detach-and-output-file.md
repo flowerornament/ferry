@@ -290,6 +290,23 @@ each now a control with a knockout:
 - The stored submitted receipt keeps "submitted; no verdict yet"; the
   caller's next step is on stderr and in the `--json` event (R5).
 
+**Re-attack on 8d51879c (2026-10-11): returned for C7, fixed.** A caller
+signal after a place verdict other than pass, fail, timeout or stopped (for
+example lost/255 from a reconciled supervisor) rewrote the final receipt
+to lost/128+n, beyond `ferry record`'s repair. Now the verdict's source
+decides: once the receipt holds the place's final record or its refusal,
+a signal is only noted. Only a signal before the place decided anything
+is lost/128+n (ferry-xtx.14). Also: a stop before the spawn now skips the
+collect hook too, so "spawns nothing" is true.
+
+**Residues accepted at the re-attack:**
+
+- When the deadline itself ends the recipe, teardown (session stop, the
+  drain, collect, release) runs after `deadline_ms`. Under the real formula
+  that happens only if prepare outlasts the teardown margin.
+- The lock refusal names "shared runs" when a process outside Ferry holds
+  the gate exclusively; only foreign holders cause that.
+
 **Not here:** the exit code of a signal before dispatch (lost 128+n against
 SPEC §4's lost 255) is ferry-xtx.14, a consumer-visible decision. SPEC §6's
 `{refused, why, next}` goes to slice 4a.

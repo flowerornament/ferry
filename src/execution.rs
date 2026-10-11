@@ -206,6 +206,23 @@ pub fn warn(message: &str) {
 
 /// Debug builds only: whether a control asked this fallible point to fail
 /// (`FERRY_FAIL_AT=<point>[,<point>…]`). Release builds never read it.
+/// Debug builds, `FERRY_FAIL_AT=prepare-pause`: after the locks, before
+/// anything is spawned, mark `runs/<id>/paused` and wait (at most 60 s) for
+/// the run's stop to be recorded, so a control can stop it in that window.
+fn pause_before_spawn(root: &Path, request: &Request) {
+    if !fail_at("prepare-pause") {
+        return;
+    }
+    let dir = root.join("runs").join(&request.id);
+    let _ = fs::write(dir.join("paused"), "");
+    let until = Instant::now() + Duration::from_secs(60);
+    while !dir.join("stop.json").exists() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The stop's signal is on its way.
+    thread::sleep(Duration::from_millis(200));
+}
+
 pub fn fail_at(point: &str) -> bool {
     #[cfg(debug_assertions)]
     {
@@ -844,6 +861,12 @@ pub fn run(
     locks: &[&fs::File],
     deadline_ms: u128,
 ) -> (Result<Ended>, Option<Collection>, Output) {
+    // A stop that came while the run prepared: nothing is spawned, neither
+    // the recipe nor the collect hook.
+    pause_before_spawn(root, request);
+    if stop.load(Ordering::SeqCst) {
+        return (Ok(Ended::Stopped), None, Output::default());
+    }
     // One log for the run, shared by every session's writer.
     let log = match open_log(root, request) {
         Ok(log) => log,
@@ -1034,10 +1057,6 @@ fn run_session(
     let spec = run_dir.join("request.json");
     fs::write(&spec, serde_json::to_vec(request)?)?;
     let result_path = run_dir.join("result.json");
-    // A stop that came while the run prepared: nothing is spawned.
-    if stop.load(Ordering::SeqCst) {
-        return Ok(Ended::Stopped);
-    }
     crate::seat::reserve(root, request)?;
     let (reader, writer) = std::io::pipe()?;
     let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks, writer)?;

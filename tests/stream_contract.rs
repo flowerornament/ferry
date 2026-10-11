@@ -723,6 +723,137 @@ fn a_signal_after_the_run_is_final_keeps_its_verdict_and_every_byte() {
     assert_eq!(receipt["outcome"], "ran-pass", "{receipt}");
 }
 
+/// A signal after the place's verdict keeps it, whatever its outcome
+/// (critic C7): here the supervisor is killed and reconciled to lost/255,
+/// and a later SIGINT must not turn the final receipt into lost/130.
+#[test]
+fn a_signal_after_a_lost_verdict_keeps_the_places_code() {
+    let scratch = tempfile::tempdir().unwrap();
+    let events = scratch.path().join("events");
+    // Far more than a pipe's worth, then a short wait: the recipe outlives
+    // its killed supervisor by at most 4 s and ends on its own.
+    let dir = fixture("head -c 4000000 /dev/zero; sleep 4", "");
+    let mut caller = Caller(
+        ferry(dir.path())
+            .args([
+                "run",
+                "probe",
+                "--local",
+                "--json",
+                "--timeout-seconds",
+                "60",
+            ])
+            .stdout(fs::File::create(&events).unwrap())
+            // The output, unread: a slow consumer.
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("submitted", || submitted_pid(&events).is_some());
+    let id = only_receipt_file(dir.path())["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let log = dir
+        .path()
+        .join(format!(".ferry/local/runs/{id}/output.log"));
+    wait_until("the output was written", || {
+        fs::metadata(&log).is_ok_and(|m| m.len() >= 4_000_000)
+    });
+    // The supervisor this control's caller started, by its exact pid.
+    kill(
+        Pid::from_raw(submitted_pid(&events).unwrap()),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    let state = dir.path().join(".ferry/local");
+    let record = state.join(format!("records/{id}.json"));
+    wait_until("the run was reconciled to lost", || {
+        let _ = Command::new(env!("CARGO_BIN_EXE_ferry"))
+            .args(["place", "--state"])
+            .arg(&state)
+            .args(["record", &id])
+            .output();
+        record.exists()
+    });
+    let place: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_eq!(place["outcome"], "lost", "{place}");
+    // Its caller has read the verdict by now, or reads it soon.
+    thread::sleep(Duration::from_millis(500));
+    kill(
+        Pid::from_raw(i32::try_from(caller.0.id()).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+    let mut stderr = caller.0.stderr.take().unwrap();
+    let drain = thread::spawn(move || {
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+    });
+    let mut code = None;
+    wait_until("the caller ended", || {
+        code = caller.0.try_wait().unwrap().map(|status| status.code());
+        code.is_some()
+    });
+    let _ = drain.join();
+    let receipt = only_receipt_file(dir.path());
+    assert_eq!(receipt["state"], "final", "{receipt}");
+    assert_eq!(receipt["outcome"], "lost", "{receipt}");
+    assert_eq!(receipt["exit_code"], place["exit_code"], "{receipt}");
+    assert_eq!(code.flatten(), Some(255), "{receipt}");
+}
+
+/// A stop while the run prepares spawns nothing: neither the recipe nor
+/// the collect hook runs.
+#[test]
+fn a_stop_during_prepare_spawns_nothing() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let (ran, collected) = (scratch.path().join("ran"), scratch.path().join("collected"));
+    let dir = with_collect(
+        &format!("touch {}", collected.display()),
+        &format!("touch {}", ran.display()),
+    );
+    let mut caller = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "prepare-pause")
+            .args(["run", "probe", "--local", "--timeout-seconds", "60"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let runs = dir.path().join(".ferry/local/runs");
+    let mut id = String::new();
+    wait_until("the run paused before its spawn", || {
+        fs::read_dir(&runs)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .flatten()
+                    .find(|e| e.path().join("paused").exists())
+                    .map(|e| id = e.file_name().to_string_lossy().into_owned())
+            })
+            .is_some()
+    });
+    let out = ferry(dir.path()).args(["stop", &id]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut code = None;
+    wait_until("the caller ended", || {
+        code = caller.0.try_wait().unwrap().map(|status| status.code());
+        code.is_some()
+    });
+    let host = only_record(&dir.path().join(".ferry/local/records"));
+    assert_eq!(host["outcome"], "stopped", "{host}");
+    assert!(!ran.exists(), "the recipe was spawned");
+    assert!(!collected.exists(), "the collect hook ran");
+}
+
 /// The first stop decides (critic C2): a later stop with another signal is
 /// accepted and changes nothing, neither the signal nor `stopped_by`.
 #[test]

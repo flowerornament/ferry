@@ -141,7 +141,8 @@ struct Run {
     json: bool,
     #[arg(long)]
     timeout_seconds: Option<u64>,
-    /// The most the run may wait for each lock (default 30 min).
+    /// How long the run may wait for its locks, all together: every wait
+    /// ends this long after submit (default 30 min).
     #[arg(long)]
     wait_seconds: Option<u64>,
     /// Hold the host alone: wait for in-flight runs, keep new ones out.
@@ -336,24 +337,22 @@ fn run(options: &Run) -> Result<i32> {
     if let Err(error) = dispatch(&root, options, &mut record) {
         record.reason = Some(error.to_string());
     }
-    // The place's verdict stands (a stop is its own verdict); a caller
-    // signal after it is only noted. A run the caller left keeps its
-    // submitted receipt. Anything else a signal interrupted is lost 128+n.
+    // The place's verdict stands, whatever its outcome (a stop is its own
+    // verdict); a caller signal after it is only noted. A run the caller
+    // left keeps its submitted receipt. Only a signal before the place
+    // decided anything is lost 128+n (ferry-xtx.14).
     let submitted = record.state.as_deref() == Some("submitted");
+    let decided = record.state.as_deref() == Some("final");
     if let Some(signal) = execution::caught_signal()
         && !submitted
     {
-        use receipt::Outcome;
         let cause = format!("caller received {}", execution::signal_name(signal));
-        if matches!(
-            record.outcome,
-            Outcome::RanPass | Outcome::RanFail | Outcome::Timeout | Outcome::Stopped
-        ) {
-            if record.outcome != Outcome::Stopped {
+        if decided {
+            if record.outcome != receipt::Outcome::Stopped {
                 note(&mut record.reason, format!("after the verdict: {cause}"));
             }
         } else {
-            record.outcome = Outcome::Lost;
+            record.outcome = receipt::Outcome::Lost;
             record.exit_code = 128 + signal;
             record.reason = Some(match record.reason.take() {
                 Some(reason) if reason.starts_with(&cause) => reason,

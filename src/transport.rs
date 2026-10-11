@@ -477,6 +477,8 @@ pub fn run_on(
         if let Ok(info) = place.info() {
             refused_by(record, &info);
         }
+        // The place's own answer: final, like its record.
+        record.state = Some("final".into());
         record.outcome = Outcome::Refused;
         record.exit_code = 125;
         record.reason = Some(format!("place refused before acceptance: {why}"));
