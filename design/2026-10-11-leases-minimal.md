@@ -375,4 +375,29 @@ the same window.
   order removes.
 - **`lease.released_ms`** is when the run's use of the lease ended, stamped
   just before the record is final. The descriptors close after the record.
+- **Two probes are two observations (herald-1b on 4e88f5a1).** Exclusive
+  fails, then the holder releases, then shared succeeds on a free lock, so
+  "held by shared runs" could be false. A shared success now says only
+  what it proves: "no exclusive holder at the probe: held by shared runs,
+  or just released; retry". Control: herald-1b's
+  `exclusive_only_contention_never_proves_shared_holders` (11cfa73e).
+- **A failed finalize (murail-4a on 4e88f5a1).** `drop(held)` followed a
+  finalize error, so the locks closed while the supervisor lived with a
+  live reservation. A successor could take the seat, and a third caller
+  would name the old run. Now, in one place: `Ok` → `drop(held)`; `Err` →
+  warn, then `process::exit` with `held` still open, so it closes with the
+  process. The invariant reads: locks close only after the record is final,
+  or at process death. Control:
+  `a_failed_finalize_keeps_the_locks_until_the_supervisor_exits`, with
+  FERRY_FAIL_AT finalize-link and the new finalize-failed pause. The
+  existing finalize-link control (the seat is freed once the supervisor
+  exits) still passes.
+- **Interim residue, Linux only, until 4b (critic on 4e88f5a1).**
+  `admission::reclaim`, and `ferry seat recover`, briefly take an idle
+  seat's lock. With the seat tried once, a run that starts in that moment is
+  refused, and named as "held after run X ended" (X being the last run that
+  wrote the file), though the holder is reclaim. 4b deletes both, and
+  nothing deploys between 4a and 4b, so there is no code here. Slice 5's
+  `retire` writes its own name into the lock file, and busy then says "seat
+  being retired" (ferry-xtx.10, with a control).
 

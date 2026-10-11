@@ -357,12 +357,21 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     let stored = serde_json::to_value(&result)
         .map_err(Into::into)
         .and_then(|value| record::finalize(root, id, &value));
-    if let Err(error) = stored {
-        execution::warn(&format!("ferry: host record: {error}"));
+    // The locks close only after the record is final, or at process death:
+    // never while this supervisor lives with its record unwritten, since
+    // its live reservation would then name a lock it no longer holds.
+    match stored {
+        Ok(()) => {
+            drop(held);
+            Ok(result.exit_code)
+        }
+        Err(error) => {
+            execution::warn(&format!("ferry: host record: {error}"));
+            execution::pause_at("finalize-failed", &dir.join("finalize-failed"));
+            // `held` closes with the process; reconcile then proves it lost.
+            std::process::exit(255)
+        }
     }
-    // Only now: the record is final before the locks close.
-    drop(held);
-    Ok(result.exit_code)
 }
 
 /// Archives the recipe's declared artifacts. A failure, the digest's

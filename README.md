@@ -365,8 +365,9 @@ platform, so whatever a run leaves running while holding them keeps them
 held. Its waits for the host lease end by its submit plus `--wait-seconds`
 (default 30 min), apart from `--timeout-seconds`. Past it the run refuses
 (125), saying what a probe of the lock proves. If it is free now: "released
-as the wait ended; retry". If only shared runs hold it: "held by shared
-runs". Otherwise it names the exclusive run that took it, reconciled first:
+as the wait ended; retry". If an exclusive probe fails but a shared one then
+succeeds, that proves only that no exclusive holder remained: "held by shared
+runs, or just released; retry". Otherwise it names the exclusive run that took it, reconciled first:
 a live one holds it; an ended one means something it started holds it, or
 an exclusive run that is starting. An error while probing names no holder
 ("holder unknown"). No holder's name
@@ -375,7 +376,9 @@ is ever cleared: the work inherits the lock and may outlive its run.
 A run's record is final before its locks close (SPEC §5), on every path: each
 lock passes to the supervisor as it is taken, a refusal after that keeps it
 until the refusal is final, and a panic in the supervisor is caught so the
-record is still written first. So a named run that is still live holds the
+record is still written first. If the record cannot be written, the locks
+close only when the supervisor exits, and a reconcile then proves the run
+lost. So a named run that is still live holds the
 lock it names, and a free lock's last holder is always already final.
 A place's refusal carries `why` and `next` apart (SPEC §6); the receipt's
 reason is `<why>; <next>`.

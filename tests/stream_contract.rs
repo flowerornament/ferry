@@ -1557,7 +1557,9 @@ fn a_host_held_by_shared_runs_says_so_alone() {
     assert_eq!(out.status.code(), Some(125), "{record}");
     let reason = record["reason"].as_str().unwrap();
     assert!(
-        reason.ends_with(": held by shared runs") && !reason.contains("exclusive run"),
+        reason.ends_with(
+            ": no exclusive holder at the probe: held by shared runs, or just released; retry"
+        ) && !reason.contains("exclusive run"),
         "{reason}"
     );
 }
@@ -1693,6 +1695,126 @@ fn a_partly_taken_host_lease_keeps_its_gate_until_finalization() {
     });
     drop(host);
     assert!(held, "the gate closed before the refusal was final");
+}
+
+/// A finalize that fails leaves the locks to the supervisor's exit, never
+/// closed while it lives with its record unwritten (murail-4a on 4e88f5a1):
+/// paused after the failed finalize, it still holds its seat.
+#[test]
+fn a_failed_finalize_keeps_the_locks_until_the_supervisor_exits() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let mut first = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "finalize-link,finalize-failed")
+            .env("FERRY_UNREACHABLE_MS", "2000")
+            .args(["run", "probe", "--local", "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (_, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize-failed");
+    let held = seat_held(dir.path());
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the caller ended", || first.0.try_wait().unwrap().is_some());
+    assert!(
+        held,
+        "the locks closed while the supervisor lived, its record unwritten"
+    );
+}
+
+/// murail-4a's 27ca72a5, case 1: the exclusive holder releases between the
+/// two probes, so the shared probe succeeds on a free lock. The reason says
+/// only what that proves, never "held by shared runs" alone.
+#[test]
+fn an_exclusive_holder_released_between_probes_is_not_claimed_as_shared() {
+    use fs2::FileExt;
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let root = dir.path().join(".ferry/local");
+    let locks = root.join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(locks.join("host-exclusive"))
+        .unwrap();
+    host.lock_exclusive().unwrap();
+    let caller = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "between-probes")
+            .args(["run", "pass", "--local", "--json", "--wait-seconds", "1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let paused = root.join("probe-gap.paused");
+    wait_until("the exclusive probe failed", || paused.exists());
+    drop(host);
+    let (code, record) = released(caller, &paused);
+    assert_eq!(code, Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        !reason.ends_with(": held by shared runs") && reason.contains("or just released"),
+        "{reason}"
+    );
+}
+
+/// murail-4a's 27ca72a5, case 2, under the fix: a run whose finalize
+/// failed still holds its seat until it exits, so a successor cannot take
+/// the seat in that window, and its refusal names the old run truthfully.
+#[test]
+fn a_successor_cannot_take_a_seat_whose_finalize_failed() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let mut old = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "finalize-link,finalize-failed")
+            .env("FERRY_UNREACHABLE_MS", "2000")
+            .args(["run", "pass", "--local", "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (old_id, paused) = paused_at(&dir.path().join(".ferry/local/runs"), "finalize-failed");
+    let lock = seat_lock(dir.path());
+    let out = bounded_output(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "seat-lock-write")
+            .args(["run", "pass", "--local", "--json"]),
+    );
+    let took_the_seat = lock.with_extension("paused").exists();
+    if took_the_seat {
+        fs::write(lock.with_extension("go"), "").unwrap();
+    }
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the old caller ended", || {
+        old.0.try_wait().unwrap().is_some()
+    });
+    assert!(
+        !took_the_seat,
+        "a successor took the seat while the old supervisor lived"
+    );
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("seat busy: run {old_id}, submitted")),
+        "{record}"
+    );
 }
 
 /// A panic in the supervisor after its locks are taken is caught: the

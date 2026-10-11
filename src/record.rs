@@ -329,8 +329,14 @@ pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
         Err(e) if !busy(&e) => return format!("holder unknown ({e})"),
         Err(_) => {}
     }
+    crate::execution::pause_at("between-probes", &root.join("probe-gap"));
     match FileExt::try_lock_shared(&probe) {
-        Ok(()) => return "held by shared runs".into(),
+        // Two probes are two observations: a shared success after a failed
+        // exclusive one proves only that no exclusive holder remained.
+        Ok(()) => {
+            return "no exclusive holder at the probe: held by shared runs, or just released; retry"
+                .into();
+        }
         Err(e) if !busy(&e) => return format!("holder unknown ({e})"),
         Err(_) => drop(probe),
     }
@@ -389,6 +395,44 @@ mod tests {
                 old.id
             )),
             "{reason}"
+        );
+    }
+
+    /// herald-1b's 11cfa73e: with only exclusive holders coming and going,
+    /// the probes never claim shared holders.
+    #[test]
+    fn exclusive_only_contention_never_proves_shared_holders() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host-lock");
+        fs::File::create(&path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
+        let worker = {
+            let (stop, ready, path) = (stop.clone(), ready.clone(), path.clone());
+            std::thread::spawn(move || {
+                let file = fs::File::open(path).unwrap();
+                ready.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    if fs2::FileExt::try_lock_exclusive(&file).is_ok() {
+                        fs2::FileExt::unlock(&file).unwrap();
+                    }
+                }
+            })
+        };
+        ready.wait();
+        let wrong = (0..10_000).find_map(|_| {
+            let reason = super::host_holder(dir.path(), &path, "");
+            (reason == "held by shared runs").then_some(reason)
+        });
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(
+            wrong.is_none(),
+            "only an exclusive holder existed: {wrong:?}"
         );
     }
 
