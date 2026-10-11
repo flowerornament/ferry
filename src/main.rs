@@ -5,7 +5,7 @@ mod config;
 mod custody;
 mod execution;
 mod limits;
-mod output;
+mod place;
 mod receipt;
 mod record;
 mod repository;
@@ -13,6 +13,7 @@ mod seat;
 mod transport;
 
 use clap::{Args, Parser, Subcommand};
+use receipt::note;
 use std::{
     collections::BTreeMap,
     fs,
@@ -41,11 +42,37 @@ enum Action {
     Receipt {
         id: String,
     },
+    /// Follow a run's output from any terminal until it ends.
+    Follow {
+        id: String,
+    },
+    /// Stop a run: your own, or another caller's with --other --reason.
+    Stop {
+        id: String,
+        #[arg(long, requires = "reason")]
+        other: bool,
+        #[arg(long, requires = "other")]
+        reason: Option<String>,
+    },
+    /// Print a run's receipt, completing it from the place once it is final.
+    Record {
+        id: String,
+    },
+    /// Refuses callers that predate detached runs.
+    #[command(hide = true)]
     HostRun {
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
+    /// The place side of a run.
+    #[command(hide = true)]
+    Place {
         /// The state root (default `~/.local/state/ferry`); the local route
         /// passes the repository's `.ferry/local`.
-        #[arg(long, hide = true)]
+        #[arg(long)]
         state: Option<PathBuf>,
+        #[command(subcommand)]
+        verb: PlaceVerb,
     },
     #[command(hide = true)]
     HostInfo,
@@ -71,6 +98,33 @@ enum SeatAction {
         reason: Option<String>,
     },
 }
+#[derive(Subcommand)]
+enum PlaceVerb {
+    Submit,
+    Supervise {
+        id: String,
+    },
+    Follow {
+        id: String,
+        offset: u64,
+    },
+    Stop {
+        id: String,
+        #[arg(long)]
+        seat: String,
+        #[arg(long)]
+        who: String,
+        #[arg(long)]
+        why: String,
+        #[arg(long)]
+        other: bool,
+        #[arg(long, default_value_t = 15)]
+        signal: i32,
+    },
+    Record {
+        id: String,
+    },
+}
 #[derive(Args)]
 struct Run {
     #[arg(allow_hyphen_values = true)]
@@ -87,6 +141,9 @@ struct Run {
     json: bool,
     #[arg(long)]
     timeout_seconds: Option<u64>,
+    /// The most the run may wait for each lock (default 30 min).
+    #[arg(long)]
+    wait_seconds: Option<u64>,
     /// Hold the host alone: wait for in-flight runs, keep new ones out.
     #[arg(long)]
     exclusive: bool,
@@ -115,7 +172,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     record.adapter_sha256 = evidence.adapter_sha256;
     record.contract_sha256 = evidence.contract_sha256;
     let declared = declared?;
-    interrupted()?;
+    execution::interrupted()?;
     let config = declared.config;
     for path in &config.preserve {
         config::preserve_path(path)?;
@@ -151,24 +208,12 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         name.clone_into(&mut record.machine);
         record.machine_features = hosts.host[name].capabilities().into_iter().collect();
     }
-    let caller = String::from_utf8(repository::output(&mut std::process::Command::new(
-        "hostname",
-    ))?)?;
-    let identity = receipt::digest(
-        format!(
-            "{}\n{}\n{}",
-            caller.trim(),
-            root.canonicalize()?.display(),
-            options.seat
-        )
-        .as_bytes(),
-    );
     let mut request = execution::Request {
         protocol: receipt::PROTOCOL,
         id: record.id.clone(),
         token: receipt::run_id()?,
         commit: sha,
-        seat: format!("{}-{}", &identity[..24], options.seat),
+        seat: transport::seat_key(root, &options.seat)?,
         recipe: declaration.clone(),
         hooks: config.hooks,
         caller_binary_sha256: record.caller_binary_sha256.clone(),
@@ -179,7 +224,9 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         preserve: record.preserve.clone(),
         args: options.args.clone(),
         provider_requires: config.provider.requires.clone(),
+        wait_seconds: options.wait_seconds,
     };
+    record.token = Some(request.token.clone());
     if matches!(route, config::Route::Remote(_)) {
         record.outcome = receipt::Outcome::Lost;
         record.exit_code = 255;
@@ -193,7 +240,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         },
     )?;
     record.mirrors.clone_from(&request.mirrors);
-    interrupted()?;
+    execution::interrupted()?;
     // Every caller fact, stored before the host is asked to run anything:
     // lost until the final receipt replaces it.
     let mut submitted = record.clone();
@@ -201,19 +248,84 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     submitted.outcome = receipt::Outcome::Lost;
     submitted.exit_code = 255;
     submitted.reason = Some("submitted; no verdict yet".into());
-    receipt::save(root, &submitted)?;
-    match route {
-        config::Route::Local => transport::local(root, &request, record, options.json),
-        config::Route::Remote(name) => {
-            transport::remote(root, &hosts.host[name], &request, record, options.json)
+    receipt::submit(root, &submitted)?;
+    let place = match route {
+        config::Route::Local => transport::Place::Local(root.join(".ferry/local")),
+        config::Route::Remote(name) => transport::Place::Remote(&hosts.host[name]),
+    };
+    transport::ship(root, &place, &request, record)?;
+    transport::run_on(root, &place, &request, record, options.json)
+}
+
+/// The place a stored receipt's run went to.
+fn place_of<'a>(
+    root: &Path,
+    record: &receipt::Receipt,
+    hosts: &'a config::Machines,
+) -> Result<transport::Place<'a>> {
+    if record.machine == "local" {
+        return Ok(transport::Place::Local(root.join(".ferry/local")));
+    }
+    Ok(transport::Place::Remote(
+        hosts
+            .host
+            .get(&record.machine)
+            .ok_or_else(|| format!("unknown machine {}", record.machine))?,
+    ))
+}
+
+/// Re-attaches to a stored run (`follow`) or reads its record (`record`),
+/// and stores the receipt as far as the place's record allows.
+fn attach(id: &str, follow: bool) -> Result<i32> {
+    execution::stopped()?;
+    let root = repository::root()?;
+    let hosts = machines()?;
+    let mut record = receipt::load(&root, id)?;
+    if record.state.as_deref() == Some("submitted") {
+        let place = place_of(&root, &record, &hosts)?;
+        let done = if follow {
+            transport::finish(&root, &place, &mut record, false)
+        } else {
+            transport::complete(&root, &place, &mut record)
+        };
+        match done {
+            Ok(()) => receipt::save(&root, &record)?,
+            Err(error) if follow => {
+                record.reason = Some(error.to_string());
+                receipt::save(&root, &record)?;
+            }
+            Err(error) => execution::warn(&format!("ferry: {error}")),
         }
     }
+    execution::emit(serde_json::to_string_pretty(&record)?.as_bytes());
+    Ok(match record.state.as_deref() {
+        Some("submitted") if !follow => 3,
+        _ => record.exit_code,
+    })
 }
-fn signal_name(signal: i32) -> String {
-    execution::signal_name(signal)
-}
-fn interrupted() -> Result<()> {
-    execution::interrupted()
+
+fn stop(id: &str, reason: Option<&str>) -> Result<i32> {
+    let root = repository::root()?;
+    let hosts = machines()?;
+    let record = receipt::load(&root, id)?;
+    let place = place_of(&root, &record, &hosts)?;
+    match transport::stop(
+        &root,
+        &place,
+        &record,
+        reason.unwrap_or("ferry stop"),
+        reason.is_some(),
+        15,
+    ) {
+        Ok(reply) => {
+            execution::emit(reply.as_bytes());
+            Ok(0)
+        }
+        Err(error) => {
+            execution::warn(&format!("ferry: {error}"));
+            Ok(125)
+        }
+    }
 }
 fn run(options: &Run) -> Result<i32> {
     // Catch INT, TERM and HUP from the start, so an early signal still ends
@@ -227,44 +339,36 @@ fn run(options: &Run) -> Result<i32> {
     if let Err(error) = dispatch(&root, options, &mut record) {
         record.reason = Some(error.to_string());
     }
-    // An interrupted caller exits 128 plus its signal, unless the recipe had
-    // already reached a verdict.
-    // After the verdict, the caller's own signal is named in the note: the
-    // host saw only its client go away.
+    // The place's verdict stands (a stop is its own verdict); a caller
+    // signal after it is only noted. A run the caller left keeps its
+    // submitted receipt. Anything else a signal interrupted is lost 128+n.
+    let submitted = record.state.as_deref() == Some("submitted");
     if let Some(signal) = execution::caught_signal()
-        && matches!(
-            record.outcome,
-            receipt::Outcome::RanPass | receipt::Outcome::RanFail | receipt::Outcome::Timeout
-        )
+        && !submitted
     {
-        let named = format!("after the verdict: caller received {}", signal_name(signal));
-        record.reason = Some(match record.reason.take() {
-            Some(reason) if reason.contains("after the verdict: client lost: heartbeat EOF") => {
-                reason.replace("after the verdict: client lost: heartbeat EOF", &named)
+        use receipt::Outcome;
+        let cause = format!("caller received {}", execution::signal_name(signal));
+        if matches!(
+            record.outcome,
+            Outcome::RanPass | Outcome::RanFail | Outcome::Timeout | Outcome::Stopped
+        ) {
+            if record.outcome != Outcome::Stopped {
+                note(&mut record.reason, format!("after the verdict: {cause}"));
             }
-            Some(reason) => format!("{named}; {reason}"),
-            None => named,
-        });
-    }
-    if let Some(signal) = execution::caught_signal()
-        && !matches!(
-            record.outcome,
-            receipt::Outcome::RanPass | receipt::Outcome::RanFail | receipt::Outcome::Timeout
-        )
-    {
-        record.outcome = receipt::Outcome::Lost;
-        record.exit_code = 128 + signal;
-        // The caller's signal is the cause; what the host saw (its client
-        // lost) is a consequence, kept as a note.
-        let cause = format!("caller received {}", signal_name(signal));
-        record.reason = Some(match record.reason.take() {
-            Some(reason) if reason.starts_with(&cause) => reason,
-            Some(reason) => format!("{cause}; {reason}"),
-            None => cause,
-        });
+        } else {
+            record.outcome = Outcome::Lost;
+            record.exit_code = 128 + signal;
+            record.reason = Some(match record.reason.take() {
+                Some(reason) if reason.starts_with(&cause) => reason,
+                Some(reason) => format!("{cause}; {reason}"),
+                None => cause,
+            });
+        }
     }
     record.elapsed_ms = receipt::now_ms() - start;
-    record.state = Some("final".into());
+    if !submitted {
+        record.state = Some("final".into());
+    }
     receipt::save(&root, &record)?;
     // The receipt is stored; a closed stdout or stderr never changes the code.
     if options.json {
@@ -319,8 +423,10 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         lease: None,
         admission: None,
         provider_requires: vec![],
-        output_dropped: BTreeMap::default(),
-        output_delivered: BTreeMap::default(),
+        output: None,
+        deadline_ms: None,
+        stopped_by: None,
+        token: None,
         state: None,
     })
 }
@@ -396,7 +502,27 @@ fn execute(cli: Cli) -> Result<i32> {
             );
             Ok(0)
         }
-        Action::HostRun { state } => transport::host_run(state),
+        Action::HostRun { .. } => Ok(place::host_run()),
+        Action::Follow { id } => attach(&id, true),
+        Action::Record { id } => attach(&id, false),
+        Action::Stop { id, reason, .. } => stop(&id, reason.as_deref()),
+        Action::Place { state, verb } => {
+            let root = place::root(state)?;
+            match verb {
+                PlaceVerb::Submit => place::submit(&root),
+                PlaceVerb::Supervise { id } => place::supervise(&root, &id),
+                PlaceVerb::Follow { id, offset } => place::follow(&root, &id, offset),
+                PlaceVerb::Stop {
+                    id,
+                    seat,
+                    who,
+                    why,
+                    other,
+                    signal,
+                } => place::stop(&root, &id, &seat, &who, &why, other, signal),
+                PlaceVerb::Record { id } => place::print_record(&root, &id),
+            }
+        }
         Action::HostInfo => {
             println!("{}", serde_json::to_string(&transport::host_info()?)?);
             Ok(0)

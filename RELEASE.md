@@ -80,9 +80,10 @@ reachable from `main` install on the live root.
 - The source commit and the flake's locked inputs are fixed by commit id and
   `narHash`. The first build on a host fetches those inputs. Rollback needs
   no network, because each generation's output stays rooted.
-- Running sessions keep the executable they started with. A run whose
-  `host-info` precedes a flip and whose `host-run` follows it is reported
-  lost ("host binary changed during run"), never mis-attributed.
+- A run keeps the executable its supervisor started with, and its record
+  names that binary (`binary_sha256`), so an install during a run is never
+  mis-attributed. A caller refuses a place without `detach` (125, naming the
+  place's `source_rev`): install places before or with their callers.
 - Activating on a shared host still needs an announced window.
 - Builds from before receipts carried the source revision report it as
   unknown. A receipt without these fields says nothing about provenance.

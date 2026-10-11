@@ -69,7 +69,12 @@ feature refuses rather than running.
 
 ```
 ferry run <recipe> [--on <machine> | --local] [--exclusive] [--seat <name>]
-          [--commit <rev>] [--timeout-seconds <n>] [--json] [-- <args>…]
+          [--commit <rev>] [--timeout-seconds <n>] [--wait-seconds <n>]
+          [--json] [-- <args>…]
+ferry follow <id>                   re-attach: the run's output, then its receipt
+ferry stop <id> [--other --reason '<why>']
+                                    stop your run (another caller's needs a reason)
+ferry record <id>                   the receipt, completed once the run is final
 ferry recipes                       the recipes at this commit
 ferry machines                      the configured machines
 ferry receipt <id>                  print a receipt
@@ -77,8 +82,9 @@ ferry seat recover <seat> [--local] [--accept-unknown --reason '<why>']
                                     clear a seat once its processes are proven gone
 ```
 
-`ferry host-run`, `host-info` and `execute-session` are internal: the caller
-runs them on the machine.
+`ferry place`, `host-info` and `execute-session` are internal: the caller
+runs them on the machine. `ferry host-run` only refuses callers from before
+detached runs.
 
 ### Outcomes and exit codes
 
@@ -89,13 +95,19 @@ refusal from a recipe failure. A recipe may itself exit 125.
 |---|---|---|
 | `ran-pass` | 0 | The recipe ran and exited 0. |
 | `ran-fail` | the recipe's code | The recipe ran and failed. |
-| `timeout` | 124 | `--timeout-seconds` elapsed; the recipe's session was ended. |
+| `timeout` | 124 | `--timeout-seconds` (or the run's absolute deadline) elapsed; the recipe's session was ended. |
 | `refused` | 125 | Nothing ran: unknown recipe or machine, unmet requirement, dirty or unknown commit, tainted seat, host policy, or a host that refused before acceptance. |
-| `lost` | 128+signal, or 255 | A stop came before the recipe's result. 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP; otherwise 255, with the cause named in `reason` (for example "client lost: heartbeat EOF"). |
+| `stopped` | 128+signal | `ferry stop`, a signal to the caller, or one to the supervisor came before the recipe's result: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. `stopped_by` names who and why. |
+| `lost` | 255 | The run ended without a verdict of its own: its supervisor is gone (reconciled), or something failed after the recipe started. |
 
-A recipe that already reached its result is never turned into `lost`. Later
-events (a lost client, a signal during the collect hook, a failed release)
-are noted in `reason` as "after the verdict: …".
+A recipe that already reached its result is never turned into `stopped` or
+`lost`. Later events (a signal during the collect hook, a failed release) are
+noted in `reason` as "after the verdict: …".
+
+A receipt whose `state` is `submitted` claims no verdict (it reads `lost`
+255): the caller left, could not deliver its stop, or the place stopped
+answering, while the run may go on. `ferry record <id>` completes it from the
+place's final record.
 
 ## Project configuration
 
@@ -191,6 +203,7 @@ requires = ["admission"]
 | `custody` | seat custody records at release |
 | `lease` | the shared/exclusive host lease |
 | `admission` | host policy admission (`host.toml`), even when not configured |
+| `detach` | detached runs (`ferry place` submit, follow, stop, record); a caller refuses a place without it (125, naming the place's `source_rev`) |
 
 A run is refused (125) before any hook runs if:
 - the caller does not know a required capability;
@@ -331,15 +344,16 @@ a quiet-host certificate, and it does not quiet:
 - other virtual machines on the same hardware;
 - Ferry binaries older than the lease.
 
-The wait for in-flight runs is not bounded by `--timeout-seconds`; interrupt
-the caller to give up.
+Every lock wait (the seat's and the host lease's) is bounded by
+`--wait-seconds` (default 30 min), apart from `--timeout-seconds`: past it the
+run refuses (125), naming the run that holds the lock exclusively, or "shared
+runs".
 
 ### Custody: nothing a run starts outlives it
 
-The supervisor is always a freshly spawned `ferry host-run`: over SSH for a
-remote run, or as a child of the caller, in its own process group, for
-`--local`. Having just started, it has no children of its own, so everything
-it later finds is the run's.
+The supervisor is always a freshly spawned `ferry place supervise`, started
+by `place submit` in its own session. Having just started, it has no children
+of its own, so everything it later finds is the run's.
 
 **At release.** After the collect hook, the receipt's `custody` records a
 census of what the run left:
@@ -372,7 +386,7 @@ is gone, checked by pid and start time. A taint that cannot be proven clear
 `--accept-unknown --reason '<why>'`, which the recover receipt keeps.
 
 **Locks outlive a killed supervisor (Linux).** The seat lock and host lease
-are inherited by the recipe's processes. A killed `host-run` therefore frees
+are inherited by the recipe's processes. A killed supervisor therefore frees
 them only when the processes that kept them exit, so a new run waits instead
 of starting beside live work. Release closes descriptors, never `LOCK_UN`.
 
@@ -385,58 +399,54 @@ of starting beside live work. Release closes descriptors, never `LOCK_UN`.
   Locks are not inherited there, and the seat is never recorded idle. The
   receipt says so.
 
-### Output and the verdict
+### Detached runs, output and the verdict
 
-Three rules hold once a run is accepted:
+A run belongs to its place, not to the connection that asked for it:
 
-- **Output is data, never control.**
-  - Output travels through one writer and bounded queues (8 MiB). A slow
-    reader slows the recipe, never the supervisor.
-  - A stream that cannot be written (`ferry run … | head -1`, a closed stderr)
-    is dropped and counted (`output_dropped`). The run goes on to its own end
-    or its timeout.
-  - Only signals, the client's heartbeat ending, and the timeout stop a run.
-- **The verdict is decided once,** by the first terminal fact (above).
-- **The supervisor never waits on data.**
-  - After release it delivers the remaining output. It stops after 15 s
-    without progress, 60 s in all, or a stop, and counts what was left.
-  - Then it finalizes its record and sends `host-result` last.
-  - If `host-result` does not arrive, the caller reads the host's final record
-    instead, and the receipt says so. A reservation alone is never a verdict:
-    the run is still going, or lost.
+- **Submit.** The caller sends the request (`place submit`, over SSH or as a
+  local exec). The place starts the supervisor paused, reserves the run id
+  with the supervisor's pid, then releases it and replies within seconds. A
+  retried submit with the same id and token gets the same run back.
+- **Follow.** The caller copies `runs/<id>/output.log` from a byte offset until
+  the record is final and every byte before it has arrived. After a dropped
+  connection it resumes from the bytes it has. If the place does not answer
+  for 5 min, the caller exits 255 and its receipt stays `submitted`.
+- **Stop.** The first INT, TERM or HUP of the caller asks the place to stop the
+  run (`stopped` 128+signal), and the caller keeps following to the record. If
+  the stop cannot be delivered, the caller prints `not stopped; continues
+  until its deadline in <n> min; ferry stop <id>` and exits 255. A second
+  signal leaves at once with 255. Either way the receipt stays `submitted`. A
+  caller killed outright stops nothing: the run goes on to its end or its
+  deadline.
+- **Deadline.** Every run ends by `submitted + wait + timeout + teardown`
+  (`wait` is `--wait-seconds`, 30 min by default), which submit returns. A
+  request without `--timeout-seconds` gets the place's maximum, 6 h (and none
+  may ask for more).
 
-**Counts.** The output log on the machine (`runs/<id>/output.log`; for a local
-run, `.ferry/local/runs/<id>/output.log`) is the complete account of
-everything written before delivery ended, including the collect hook's lines.
-Each line is counted once:
-- delivered (`output_delivered`) or dropped (`output_dropped`);
-- the host reports `output_lines`;
-- a failed log write counts in `output_log_errors`.
+**Output is data, never control.** The recipe's stdout and stderr share one
+pipe, so the log keeps the order they were written in. One writer copies its
+bytes into the log: no lines, no transcoding, nothing waits on a reader.
+- **Cap:** past 1 GiB, output is read and dropped; the record says
+  `output: {bytes, capped}`. A failed write is counted (`write_errors`).
+- **End:** after the session stop, the writer gets 2 s more. A process outside
+  the session that still holds the pipe is not waited for: the reason says
+  "output still open", and the log is closed before the record.
+- **The caller** writes the bytes exactly as logged, to stdout (to stderr with
+  `--json`). A closed stdout or stderr is data: the run goes on.
 
-**Line handling.** Lines longer than 1 MiB are split. A split, and a final
-line without a newline, gain a newline.
+**The verdict is decided once,** by the first terminal fact (above), on the
+place, and kept in its final record.
 
-**`--json`** emits version-one NDJSON events:
-- `accepted`, with the supervisor's pid;
-- `prepared`;
-- `output`, with `text`, or `base64` alone for lines that are not UTF-8 or
-  that would escape to more than twice their size;
-- `host-result`;
-- `receipt`.
-
-Before acceptance, the host may instead emit `refused`. Without `--json`, the
-caller writes the exact bytes.
-
-**Signals.** A signalled caller waits for its supervisor's worst-case stop, or
-until a second signal, then kills it and says so in the receipt.
+**`--json`** emits version-one NDJSON events: `submitted` (with the
+supervisor's pid), then `receipt`.
 
 ## Limits
 
 - **Not a sandbox.** Runs execute as you, with your permissions.
 - **Outside custody:** processes a run did not start, other users and other
   hosts. On macOS, also descendants that leave the session.
-- **A supervisor killed outright** (SIGKILL of `host-run`) stops nothing. Its
-  run is reconciled to `lost`/255 by its caller or the next run on the seat.
+- **A supervisor killed outright** stops nothing. Its run is reconciled to
+  `lost`/255 by its caller or the next run on the seat.
   - Its owner marker keeps that seat refused until `ferry seat recover`.
   - On Linux the inherited locks keep other runs out while its work lives.
   - On macOS an `--exclusive` run on another seat is not kept out.

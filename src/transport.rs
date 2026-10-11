@@ -1,16 +1,16 @@
-//! SSH carries a typed request and heartbeat stream, never interpolated recipe code.
+//! The caller's side of a run: ship the objects, then submit, follow, stop
+//! and read the record through short place verbs. SSH carries typed
+//! requests and quoted arguments, never interpolated recipe code.
 use crate::{
     config,
     execution::{self, Request},
-    receipt::{self, Outcome, Receipt},
+    receipt::{self, Outcome, Receipt, note},
     repository,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs,
-    io::{BufRead, Write},
-    os::unix::process::CommandExt,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -138,39 +138,6 @@ fn ssh(destination: &str) -> Result<Command> {
     let mut command = Command::new("ssh");
     command.args(ssh_options(destination)?).arg(destination);
     Ok(command)
-}
-
-/// Closing a failed conversation ends heartbeats and triggers host cleanup.
-/// An SSH client is killed at once: the host sees the connection close. A
-/// local host-run is the supervisor itself, so it is given `grace` to stop
-/// the work and release, and killed only after that, with a note.
-struct Connection {
-    child: std::process::Child,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    grace: Duration,
-}
-impl Drop for Connection {
-    fn drop(&mut self) {
-        // The heartbeat thread owns the host's stdin: once stop is set it
-        // exits within one beat and drops it, and the host reads EOF.
-        self.stop.store(true, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + self.grace;
-        while std::time::Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        if !self.grace.is_zero() {
-            execution::warn(&format!(
-                "ferry: host-run {} did not stop within {:?}; killing it",
-                self.child.id(),
-                self.grace
-            ));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -307,677 +274,151 @@ fn pin_mirror(store: &str, commit: &str, host: Option<&config::Machine>) -> Resu
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HostResult {
-    pub protocol: u32,
-    pub token: String,
-    pub commit: String,
-    pub outcome: Outcome,
-    pub exit_code: i32,
-    pub reason: Option<String>,
-    pub binary_sha256: String,
-    pub artifacts_sha256: Option<String>,
-    pub artifacts_error: Option<String>,
-    #[serde(default)]
-    pub collection: Option<execution::Collection>,
-    #[serde(default)]
-    pub source_rev: Option<String>,
-    #[serde(default)]
-    pub exe: Option<String>,
-    #[serde(default)]
-    pub custody: Option<crate::custody::Release>,
-    #[serde(default)]
-    pub lease: Option<execution::Lease>,
-    #[serde(default)]
-    pub admission: Option<crate::admission::Admission>,
-    /// Lines of recipe output the host read, every one in its output log.
-    /// The caller counts what it received; the rest was dropped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_lines: Option<u64>,
-    /// Of those, lines whose output-log write failed (counted, not logged).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_log_errors: Option<u64>,
-    /// `final` in a host record; absent in a result never stored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
+/// Where a run's place verbs run: a local exec on the repository's state
+/// root, or ssh to a machine.
+pub enum Place<'a> {
+    Local(PathBuf),
+    Remote(&'a config::Machine),
 }
-impl HostResult {
-    /// A result that says nothing ran yet: refused 125 until the run says more.
-    fn refused(request: &Request) -> Result<Self> {
-        Ok(Self {
-            protocol: receipt::PROTOCOL,
-            token: request.token.clone(),
-            commit: request.commit.clone(),
-            outcome: Outcome::Refused,
-            exit_code: 125,
-            reason: None,
-            binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
-            artifacts_sha256: None,
-            artifacts_error: None,
-            collection: None,
-            source_rev: Some(receipt::source_rev()),
-            exe: receipt::exe_path(),
-            custody: None,
-            lease: None,
-            admission: None,
-            output_lines: None,
-            output_log_errors: None,
-            state: None,
-        })
+
+/// Quotes one argument for the remote shell.
+fn quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+impl Place<'_> {
+    /// The command for one place verb. Only the validated binary path and
+    /// quoted arguments reach a remote shell; requests travel on stdin.
+    fn verb(&self, args: &[&str]) -> Result<Command> {
+        match self {
+            Place::Local(state) => {
+                let mut command = Command::new(std::env::current_exe()?);
+                command.arg("place").arg("--state").arg(state).args(args);
+                Ok(command)
+            }
+            Place::Remote(machine) => {
+                // Options precede the destination, so this is built in full.
+                let mut command = Command::new("ssh");
+                command
+                    .args(ssh_options(&machine.ssh)?)
+                    .args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
+                    .arg(&machine.ssh)
+                    .arg(format!(
+                        "{} place {}",
+                        machine.binary,
+                        args.iter()
+                            .map(|arg| quote(arg))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                Ok(command)
+            }
+        }
+    }
+
+    /// What the place's binary says of itself.
+    fn info(&self) -> Result<HostInfo> {
+        match self {
+            Place::Local(_) => host_info(),
+            Place::Remote(machine) => Ok(serde_json::from_slice(&repository::output(
+                ssh(&machine.ssh)?.arg(format!("{} host-info", machine.binary)),
+            )?)?),
+        }
+    }
+
+    /// A run's file under the place's state root (`runs/<id>/<name>`).
+    fn read(&self, id: &str, name: &str) -> Result<Vec<u8>> {
+        config::identifier(id)?;
+        match self {
+            Place::Local(state) => Ok(fs::read(state.join("runs").join(id).join(name))?),
+            Place::Remote(machine) => repository::output(
+                ssh(&machine.ssh)?.arg(format!("cat .local/state/ferry/runs/{id}/{name}")),
+            ),
+        }
     }
 }
 
-use crate::limits::EVENT_BOUND;
-pub use crate::limits::FINAL_EMIT;
-
-/// Queues one protocol event for the output writer. Output is data: it never
-/// blocks the supervisor for long and never stops the run.
-fn event(value: &serde_json::Value) {
-    crate::output::event(value, EVENT_BOUND);
-}
-
-/// Refuses before acceptance: the event, then a bounded wait for it to
-/// reach the client before host-run exits.
-fn refuse(reason: &str) -> i32 {
-    event(&serde_json::json!({"protocol":1,"event":"refused","reason":reason}));
-    crate::output::flush(FINAL_EMIT);
-    125
-}
-
-/// The final host record of a remote run, read over SSH when its
-/// host-result did not arrive. Bounded (P5): a dead link fails within about
-/// 25 s. A reservation alone is no verdict: the run is still going, or lost
-/// until the host's next run on the seat reconciles it.
-fn remote_record(
-    machine: &config::Machine,
-    request: &Request,
-) -> std::result::Result<HostResult, String> {
-    // Options precede the destination, so this is built in full here.
-    let mut command = Command::new("ssh");
-    command
-        .args(ssh_options(&machine.ssh).map_err(|e| e.to_string())?)
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=3",
-        ])
-        .arg(&machine.ssh)
-        .arg(format!(
-            "cat .local/state/ferry/records/{}.json",
-            request.id
-        ));
-    let bytes = repository::output(&mut command)
-        .map_err(|e| format!("no final host record (still running, or lost): {e}"))?;
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
-}
-
-/// Finalizes the host record, the truth. A failure to write it is noted in
-/// the result the caller still receives, and the reservation stays for a
-/// reconcile once this supervisor is gone.
-fn finalize(root: &Path, request: &Request, result: &mut HostResult) {
-    result.state = Some("final".into());
-    let stored = serde_json::to_value(&*result)
-        .map_err(Into::into)
-        .and_then(|record| crate::record::finalize(root, &request.id, &record));
-    if let Err(error) = stored {
-        note(&mut result.reason, format!("host record: {error}"));
-    }
-}
-
-/// The final host record of a local run, read when its host-result did not
-/// arrive. Its supervisor has exited, so a run it left reserved is
-/// reconciled as lost here.
-fn local_record(state: &Path, request: &Request) -> std::result::Result<HostResult, String> {
-    let found = crate::record::reconcile(state, &request.id).map_err(|e| e.to_string())?;
-    serde_json::from_slice(&found.ok_or("no host record")?).map_err(|e| e.to_string())
-}
-
-/// Archives the recipe's declared artifacts. A failure, the digest's
-/// included, is recorded in the result and never changes its verdict.
-fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut HostResult) {
-    if request.recipe.artifacts.is_empty() {
-        return;
-    }
-    let output = root.join("runs").join(&request.id).join("artifacts.tar");
-    match crate::artifacts::collect(seat, &request.recipe.artifacts, &output) {
-        Ok(()) => {
-            let digest = if execution::fail_at("artifact-digest") {
-                Err(std::io::Error::other("injected by FERRY_FAIL_AT"))
-            } else {
-                receipt::file_digest(&output)
+/// Ships the commit and its companion objects to the place, after checking
+/// that the place can run the request. A place without `detach` is refused:
+/// callers are never installed before their places.
+pub fn ship(root: &Path, place: &Place, request: &Request, record: &mut Receipt) -> Result<()> {
+    match place {
+        Place::Local(state) => {
+            fs::create_dir_all(state)?;
+            let bare = state.join("repo.git");
+            if !bare.exists() {
+                repository::output(Command::new("git").args(["init", "--bare"]).arg(&bare))?;
+            }
+            for commit in std::iter::once(&request.commit).chain(request.companion_refs.values()) {
+                repository::output(
+                    Command::new("git")
+                        .arg("--git-dir")
+                        .arg(&bare)
+                        .arg("fetch")
+                        .arg(repository::git_dir(root)?)
+                        .arg(commit),
+                )?;
+            }
+            Ok(())
+        }
+        Place::Remote(machine) => {
+            config::identifier(&machine.ssh)?;
+            config::relative_path(&machine.binary)?;
+            for component in Path::new(&machine.binary).components() {
+                config::identifier(
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .ok_or("binary path must be UTF-8")?,
+                )?;
+            }
+            let info = place.info()?;
+            let refused = |record: &mut Receipt, why: String| {
+                refused_by(record, &info);
+                record.outcome = Outcome::Refused;
+                record.exit_code = 125;
+                Err(why.into())
             };
-            match digest {
-                Ok(digest) => result.artifacts_sha256 = Some(digest),
-                Err(e) => result.artifacts_error = Some(format!("digest: {e}")),
+            if !info.capabilities.iter().any(|c| c == "detach") {
+                return refused(
+                    record,
+                    format!(
+                        "place {} runs ferry {}, which lacks detach: install this caller's ferry ({}) there",
+                        machine.ssh,
+                        info.source_rev.as_deref().unwrap_or("of unknown revision"),
+                        receipt::source_rev()
+                    ),
+                );
             }
-        }
-        Err(e) => result.artifacts_error = Some(e.to_string()),
-    }
-}
-
-/// Records what did not travel over the stream: lines the host read but
-/// this caller never received (each line counted once, here), and a
-/// verdict read from the host record instead of the stream.
-fn note_delivery(record: &mut Receipt, host_lines: Option<u64>, received: u64, from_record: bool) {
-    if let Some(lines) = host_lines
-        && lines > received
-    {
-        record
-            .output_dropped
-            .insert("host".into(), lines - received);
-    }
-    if from_record {
-        note(
-            &mut record.reason,
-            "the host-result did not arrive; the verdict is from the host record".into(),
-        );
-    }
-}
-
-/// Adds a note to a reason, keeping what was already there.
-fn note(reason: &mut Option<String>, text: String) {
-    *reason = Some(match reason.take() {
-        Some(previous) => format!("{previous}; {text}"),
-        None => text,
-    });
-}
-/// Reads and validates a request. Any error here is a refusal.
-fn admit(input: &mut impl BufRead, state: Option<PathBuf>) -> Result<(Request, PathBuf)> {
-    let mut line = String::new();
-    input
-        .read_line(&mut line)
-        .map_err(|e| format!("reading the request: {e}"))?;
-    let request: Request =
-        serde_json::from_str(&line).map_err(|e| format!("parsing the request: {e}"))?;
-    execution::validate(&request).map_err(|e| format!("validating the request: {e}"))?;
-    let root = match state {
-        Some(state) => state,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?)
-            .join(".local/state/ferry"),
-    };
-    Ok((request, root))
-}
-
-/// Reserves `request`'s id before any effect, so a second submit of it is
-/// refused even after a crash; then finalizes as lost the runs of its seat
-/// whose supervisor is gone.
-fn reserve(root: &Path, request: &Request, result: &HostResult) -> Result<()> {
-    let pid = std::process::id();
-    crate::record::reserve(
-        root,
-        &crate::record::Reservation {
-            state: "reserved".into(),
-            id: request.id.clone(),
-            token: request.token.clone(),
-            commit: request.commit.clone(),
-            seat: request.seat.clone(),
-            binary_sha256: result.binary_sha256.clone(),
-            supervisor: crate::record::Supervisor {
-                pid,
-                start: i32::try_from(pid)
-                    .ok()
-                    .and_then(|pid| crate::seat::start_time(pid).ok()),
-            },
-            boot_id: crate::record::boot_id(),
-            submitted_ms: receipt::now_ms(),
-        },
-    )?;
-    crate::record::reconcile_seat(root, &request.seat);
-    Ok(())
-}
-/// SIGTTOU and SIGTTIN: blocked in host-run, restored in its sessions.
-pub fn terminal_signals() -> nix::sys::signal::SigSet {
-    let mut set = nix::sys::signal::SigSet::empty();
-    set.add(nix::sys::signal::Signal::SIGTTOU);
-    set.add(nix::sys::signal::Signal::SIGTTIN);
-    set
-}
-
-/// Runs one request read from stdin, as the run's supervisor. `state` is the
-/// state root: `~/.local/state/ferry` by default, or a repository's
-/// `.ferry/local` for the local route.
-pub fn host_run(state: Option<PathBuf>) -> Result<i32> {
-    // A background process group writing to a terminal with `tostop` would
-    // be stopped by SIGTTOU (and a read by SIGTTIN). Blocked, they let the
-    // write go through (and a read fail) instead. Sessions restore them.
-    terminal_signals().thread_block()?;
-    let mut input = std::io::BufReader::new(std::io::stdin());
-    // Everything before `accepted` is a refusal: nothing ran. Say so in the
-    // protocol, so the caller records refused 125 rather than a lost run.
-    let admitted = admit(&mut input, state);
-    let (request, root) = match admitted {
-        Ok(admitted) => admitted,
-        Err(error) => return Ok(refuse(&error.to_string())),
-    };
-    let stop = execution::stopped()?;
-    let reader_stop = stop.clone();
-    thread::spawn(move || {
-        loop {
-            let mut heartbeat = String::new();
-            match input.read_line(&mut heartbeat) {
-                Ok(0) | Err(_) => break,
-                Ok(_) if heartbeat.trim() == "heartbeat" => {}
-                Ok(_) => break,
-            }
-        }
-        reader_stop.store(true, Ordering::SeqCst);
-    });
-    let mut result = HostResult::refused(&request)?;
-    if let Err(error) = reserve(&root, &request, &result) {
-        return Ok(refuse(&error.to_string()));
-    }
-    // Before acceptance, so a failure here is a refusal: nothing ran.
-    if let Err(error) = crate::custody::supervise() {
-        return Ok(refuse(&format!("supervising: {error}")));
-    }
-    // The pid names this supervisor, so an operator can stop exactly it.
-    event(
-        &serde_json::json!({"protocol":1,"event":"accepted","id":request.id,"pid":std::process::id()}),
-    );
-    let executed: Result<execution::Ended> = (|| {
-        let (seat, lease, host_lease) =
-            execution::prepare(&root, &request, &stop, &mut result.admission)?;
-        event(
-            &serde_json::json!({"protocol":1,"event":"prepared","commit":request.commit,"seat":request.seat}),
-        );
-        let locks = execution::inherited(&lease, &host_lease);
-        let finished = execution::run_released(&root, &seat, &request, &stop, &locks);
-        // Custody first: it is recorded whatever else failed (S8). A failed
-        // release, collection or artifact digest is recorded, and never
-        // changes the verdict of work that ran.
-        if let Some(error) = &finished.custody.error {
-            note(
-                &mut result.reason,
-                format!("custody release failed: {error}"),
-            );
-        }
-        result.custody = Some(finished.custody);
-        for after in finished.notes {
-            note(&mut result.reason, after);
-        }
-        // Stamped while held; the locks drop as this scope ends.
-        result.lease = Some(host_lease.stamp());
-        result.collection = finished.collection;
-        if let Some(error) = result.collection.as_ref().and_then(|c| c.error.as_ref()) {
-            note(&mut result.reason, format!("collection: {error}"));
-        }
-        let ended = finished.executed?;
-        if matches!(
-            ended,
-            execution::Ended::Result(_) | execution::Ended::Timeout
-        ) {
-            collect_artifacts(&root, &seat, &request, &mut result);
-        }
-        result.lease = Some(host_lease.stamp());
-        Ok(ended)
-    })();
-    // One verdict, from the first terminal fact (Rule B).
-    let (outcome, exit_code, reason) = execution::verdict(
-        &executed.map_err(|error| error.to_string()),
-        execution::stop_cause(&stop),
-        execution::attempted(&root, &request),
-    );
-    result.outcome = outcome;
-    result.exit_code = exit_code;
-    if let Some(reason) = reason {
-        result.reason = Some(match result.reason.take() {
-            Some(notes) => format!("{reason}; {notes}"),
-            None => reason,
-        });
-    }
-    result.output_lines = Some(crate::output::lines());
-    let log_errors = crate::output::log_errors();
-    if log_errors > 0 {
-        result.output_log_errors = Some(log_errors);
-        note(
-            &mut result.reason,
-            format!("{log_errors} output lines could not be written to output.log"),
-        );
-    }
-    finalize(&root, &request, &mut result);
-    event(&serde_json::json!({"protocol":1,"event":"host-result","result":result}));
-    // A stalled client never holds the supervisor: the caller can read the
-    // record instead.
-    if !crate::output::flush(FINAL_EMIT) {
-        execution::warn(
-            "ferry: host-run: the client did not take the host-result in time; the host record has it",
-        );
-    }
-    Ok(result.exit_code)
-}
-
-/// Runs a request on this machine through a freshly spawned `ferry host-run`
-/// on the repository's `.ferry/local` state, over the same protocol as the
-/// remote route. That child is the run's supervisor: just spawned, it has no
-/// children of its own, so custody can attribute nothing outside the run.
-/// Longer than the host's worst-case stop after its input closes: session
-/// teardown, the collect hook and its teardown, stopping survivors, and the
-/// final emit, plus a margin.
-fn supervisor_grace() -> Duration {
-    execution::SESSION_CLEANUP
-        + execution::COLLECT_TIMEOUT
-        + execution::SESSION_CLEANUP
-        + crate::custody::STOP_GRACE
-        + crate::custody::KILL_GRACE
-        + crate::output::STALL * 3
-        + EVENT_BOUND * 2
-        + FINAL_EMIT
-        + Duration::from_secs(10)
-}
-
-pub fn local(root: &Path, request: &Request, record: &mut Receipt, json: bool) -> Result<()> {
-    let state = root.join(".ferry/local");
-    fs::create_dir_all(&state)?;
-    let bare = state.join("repo.git");
-    if !bare.exists() {
-        repository::output(Command::new("git").args(["init", "--bare"]).arg(&bare))?;
-    }
-    repository::output(
-        Command::new("git")
-            .arg("--git-dir")
-            .arg(&bare)
-            .arg("fetch")
-            .arg(repository::git_dir(root)?)
-            .arg(&request.commit),
-    )?;
-    for commit in request.companion_refs.values() {
-        repository::output(
-            Command::new("git")
-                .arg("--git-dir")
-                .arg(&bare)
-                .arg("fetch")
-                .arg(repository::git_dir(root)?)
-                .arg(commit),
-        )?;
-    }
-    record.outcome = Outcome::Lost;
-    record.exit_code = 255;
-    let stop = execution::stopped()?;
-    // The last moment before the host is asked to run anything.
-    execution::interrupted()?;
-    // Its own process group: a signal or kill aimed at the caller's group
-    // (a harness, a terminal) cannot take the supervisor with it. The
-    // supervisor learns of a lost caller from its heartbeat.
-    let child = Command::new(std::env::current_exe()?)
-        .arg("host-run")
-        .arg("--state")
-        .arg(&state)
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    let (mut stream, status) = converse(child, request, &stop, json, supervisor_grace())?;
-    record.output_dropped.clone_from(&stream.dropped);
-    record.output_delivered.clone_from(&stream.delivered);
-    // The final record on disk is the truth when the host-result did not
-    // arrive. It is bound by the token checks below, so it can stand in
-    // even when no event arrived at all.
-    let from_record = stream.result.is_none() && stream.refusal.is_none();
-    if from_record {
-        match local_record(&state, request) {
-            Ok(result) => stream.result = Some(result),
-            Err(error) => note(
-                &mut record.reason,
-                format!("the host-result did not arrive, and the host record is unusable: {error}"),
-            ),
-        }
-    }
-    if let Some(result) = stream.result {
-        if result.token != request.token
-            || result.commit != request.commit
-            || result.protocol != receipt::PROTOCOL
-        {
-            return Err("host result binding mismatch".into());
-        }
-        record.collection.clone_from(&result.collection);
-        record.outcome = result.outcome;
-        record.exit_code = result.exit_code;
-        record.reason = result.reason;
-        record.host_binary_sha256 = Some(result.binary_sha256);
-        record.host_source_rev = result.source_rev;
-        record.host_exe = result.exe;
-        record.custody = result.custody;
-        record.lease = result.lease;
-        record.admission = result.admission;
-        note_delivery(record, result.output_lines, stream.received, from_record);
-        if record.host_binary_sha256.as_deref() != Some(&record.caller_binary_sha256) {
-            record.outcome = Outcome::Lost;
-            record.exit_code = 255;
-            return Err("ferry binary changed during run".into());
-        }
-        if let Some(error) = result.artifacts_error {
-            note(
-                &mut record.reason,
-                format!("artifact collection failed: {error}"),
-            );
-        }
-        if let Some(expected) = result.artifacts_sha256 {
-            let archive = state.join("runs").join(&request.id).join("artifacts.tar");
-            if receipt::file_digest(&archive)? != expected {
-                return Err("artifact integrity failed".into());
-            }
-            crate::artifacts::unpack(&archive, &root.join(".ferry/runs").join(&request.id))?;
-        }
-    } else if let Some(reason) = stream.refusal {
-        record.outcome = Outcome::Refused;
-        record.exit_code = 125;
-        record.reason = Some(reason);
-    } else {
-        // Keep what the fallback said (e.g. "no host record").
-        note(
-            &mut record.reason,
-            format!("no result from host-run: {status}"),
-        );
-    }
-    Ok(())
-}
-
-/// Sends the request to a host-run child, keeps it alive with heartbeats,
-/// and relays its events until it ends. Dropping the conversation early
-/// ends the heartbeats, so the host stops the work and releases.
-fn converse(
-    child: std::process::Child,
-    request: &Request,
-    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    json: bool,
-    grace: Duration,
-) -> Result<(HostStream, std::process::ExitStatus)> {
-    let mut connection = Connection {
-        child,
-        stop: stop.clone(),
-        grace,
-    };
-    let mut stdin = connection.child.stdin.take().ok_or("missing host stdin")?;
-    serde_json::to_writer(&mut stdin, request)?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    let heartbeat_stop = stop.clone();
-    let heartbeat = thread::spawn(move || {
-        while !heartbeat_stop.load(Ordering::SeqCst) {
-            if stdin
-                .write_all(b"heartbeat\n")
-                .and_then(|()| stdin.flush())
-                .is_err()
+            if let Err(missing) = receipt::provides(&request.provider_requires, &info.capabilities)
             {
-                break;
+                return refused(record, format!("host {missing}"));
             }
-            thread::sleep(Duration::from_millis(200));
-        }
-    });
-    let stdout = connection
-        .child
-        .stdout
-        .take()
-        .ok_or("missing host stdout")?;
-    // The stream is read in its own thread, so a signalled caller is never
-    // held by a supervisor that stopped answering: once signalled, it waits
-    // at most the supervisor's worst-case stop.
-    let (sender, received) = std::sync::mpsc::channel();
-    let reader_stop = stop.clone();
-    thread::spawn(move || {
-        let _ = sender.send(read_stream(stdout, json, &reader_stop).map_err(|e| e.to_string()));
-    });
-    let bound = supervisor_grace();
-    let mut signalled: Option<(std::time::Instant, std::sync::Arc<AtomicBool>)> = None;
-    let stream = loop {
-        match received.recv_timeout(Duration::from_millis(100)) {
-            Ok(stream) => break stream?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if signalled.is_none() && execution::caught_signal().is_some() {
-                    // A second signal means it: stop waiting at once.
-                    signalled = Some((std::time::Instant::now(), execution::stopped()?));
-                }
-                if let Some((at, again)) = &signalled {
-                    let insisted = again.load(Ordering::SeqCst);
-                    if insisted || at.elapsed() >= bound {
-                        // Waited enough: no second grace before the kill.
-                        connection.grace = Duration::ZERO;
-                        return Err(format!(
-                            "killed host-run {} after {}",
-                            connection.child.id(),
-                            if insisted {
-                                "a second signal".to_owned()
-                            } else {
-                                format!("it did not answer within {bound:?} of the caller's signal")
-                            }
-                        )
-                        .into());
-                    }
-                }
+            if info.protocol != receipt::PROTOCOL {
+                return refused(record, "host protocol mismatch".into());
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("the host stream reader ended without a stream".into());
+            if request.recipe.requires.iter().any(|requirement| {
+                (requirement.starts_with("linux-") || requirement.starts_with("macos-"))
+                    && *requirement != info.os_arch
+            }) {
+                return refused(
+                    record,
+                    "reported host architecture does not meet requirements".into(),
+                );
             }
-        }
-    };
-    stop.store(true, Ordering::SeqCst);
-    heartbeat.join().map_err(|_| "heartbeat thread panicked")?;
-    // Bounded too: a supervisor that never exits cannot hold the caller.
-    let deadline = std::time::Instant::now() + bound;
-    let status = loop {
-        if let Some(status) = connection.child.try_wait()? {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            connection.grace = Duration::ZERO;
-            return Err(format!(
-                "killed host-run {} after it did not exit within {bound:?} of its stream ending",
-                connection.child.id()
-            )
-            .into());
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    Ok((stream, status))
-}
-
-pub fn remote(
-    root: &Path,
-    machine: &config::Machine,
-    request: &Request,
-    record: &mut Receipt,
-    json: bool,
-) -> Result<()> {
-    config::identifier(&machine.ssh)?;
-    config::relative_path(&machine.binary)?;
-    for component in Path::new(&machine.binary).components() {
-        config::identifier(
-            component
-                .as_os_str()
-                .to_str()
-                .ok_or("binary path must be UTF-8")?,
-        )?;
-    }
-    // Only validated SSH alias and relative binary path reach a shell. All repo
-    // data travels through git or the typed stdin protocol.
-    record.outcome = Outcome::Lost;
-    record.exit_code = 255;
-    let info: HostInfo = serde_json::from_slice(&repository::output(
-        ssh(&machine.ssh)?.arg(format!("{} host-info", machine.binary)),
-    )?)?;
-    if let Err(missing) = receipt::provides(&request.provider_requires, &info.capabilities) {
-        refused_by(record, &info);
-        record.outcome = Outcome::Refused;
-        record.exit_code = 125;
-        return Err(format!("host {missing}").into());
-    }
-    if info.protocol != receipt::PROTOCOL {
-        record.outcome = Outcome::Refused;
-        record.exit_code = 125;
-        return Err("host protocol mismatch".into());
-    }
-    for requirement in &request.recipe.requires {
-        if (requirement.starts_with("linux-") || requirement.starts_with("macos-"))
-            && *requirement != info.os_arch
-        {
-            record.outcome = Outcome::Refused;
-            record.exit_code = 125;
-            return Err("reported host architecture does not meet requirements".into());
-        }
-    }
-    repository::output(ssh(&machine.ssh)?.arg("mkdir -p .local/state/ferry; test -d .local/state/ferry/repo.git || git init --bare .local/state/ferry/repo.git"))?;
-    push(
-        root,
-        &machine.ssh,
-        ".local/state/ferry/repo.git",
-        &format!(
-            "{}:refs/ferry/{}/{}",
-            request.commit, request.seat, request.commit
-        ),
-    )?;
-    push_companions(root, machine, request)?;
-    let stop = execution::stopped()?;
-    // The last moment before the host is asked to run anything.
-    execution::interrupted()?;
-    let child = ssh(&machine.ssh)?
-        .arg(format!("{} host-run", machine.binary))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    let (mut stream, status) = converse(child, request, &stop, json, Duration::ZERO)?;
-    record.output_dropped.clone_from(&stream.dropped);
-    record.output_delivered.clone_from(&stream.delivered);
-    // The final record on the host is the truth when the host-result did
-    // not arrive. It is bound by the token checks in accept_result, so it
-    // can stand in even when no event arrived at all.
-    let from_record = stream.result.is_none() && stream.refusal.is_none();
-    if from_record {
-        let fetched = remote_record(machine, request);
-        match fetched {
-            Ok(result) => stream.result = Some(result),
-            Err(error) => note(
-                &mut record.reason,
-                format!(
-                    "the host-result did not arrive, and reading the host record failed: {error}"
+            repository::output(ssh(&machine.ssh)?.arg("mkdir -p .local/state/ferry; test -d .local/state/ferry/repo.git || git init --bare .local/state/ferry/repo.git"))?;
+            push(
+                root,
+                &machine.ssh,
+                ".local/state/ferry/repo.git",
+                &format!(
+                    "{}:refs/ferry/{}/{}",
+                    request.commit, request.seat, request.commit
                 ),
-            ),
+            )?;
+            push_companions(root, machine, request)
         }
     }
-    if let Some(result) = stream.result {
-        let lines = result.output_lines;
-        accept_result(root, machine, request, record, &info, result)?;
-        note_delivery(record, lines, stream.received, from_record);
-    } else if let Some(reason) = stream.refusal {
-        refused_by(record, &info);
-        record.outcome = Outcome::Refused;
-        record.exit_code = 125;
-        record.reason = Some(format!("host refused before acceptance: {reason}"));
-    } else if !stream.accepted && status.code() == Some(125) {
-        // A host from before the refusal event exits 125 for every error it
-        // meets before acceptance, and the recipe cannot have started.
-        refused_by(record, &info);
-        record.outcome = Outcome::Refused;
-        record.exit_code = 125;
-        record.reason = Some("host refused before acceptance (exit 125; see its stderr)".into());
-    } else {
-        note(&mut record.reason, format!("no host result: {status}"));
-    }
-    Ok(())
 }
 
 /// A refusal names the host binary that refused, as host-info reported it.
@@ -987,193 +428,345 @@ fn refused_by(record: &mut Receipt, info: &HostInfo) {
     record.host_exe.clone_from(&info.exe);
 }
 
-/// What the host said on the protocol stream.
-struct HostStream {
-    result: Option<HostResult>,
-    accepted: bool,
-    refusal: Option<String>,
-    /// Lines this caller could not write, and wrote, per stream.
-    dropped: BTreeMap<String, u64>,
-    delivered: BTreeMap<String, u64>,
-    /// Output events received from the host.
-    received: u64,
-}
-
-/// Relays recipe output and collects the host's protocol verdicts.
-///
-/// Output is data (Rule A): it goes to a writer thread over a bounded
-/// channel. A slow reader of this caller's output slows the run through
-/// backpressure. A stream that cannot be written (`| head -1`, a closed
-/// stderr) is dropped and its lost lines counted; it never stops the run.
-/// Only a signal (`stop`) makes this reader give up waiting for room, so a
-/// stalled consumer cannot keep a signalled caller from its receipt.
-fn read_stream(
-    stdout: impl std::io::Read,
+/// Submits the request, then follows the run to its record. The receipt
+/// becomes final only from the place's final record (or a refusal).
+pub fn run_on(
+    root: &Path,
+    place: &Place,
+    request: &Request,
+    record: &mut Receipt,
     json: bool,
-    stop: &std::sync::atomic::AtomicBool,
-) -> Result<HostStream> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<(bool, bool, Vec<u8>)>(1024);
-    // Lines offered to and written by the writer, per stream: every output
-    // line is either written or counted as dropped (Rule D).
-    let offered = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
-    let written = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
-    let done = std::sync::Arc::new(AtomicBool::new(false));
-    let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let writer = spawn_writer(
-        receiver,
-        written.clone(),
-        done.clone(),
-        queued_bytes.clone(),
-    );
-    let mut stream = HostStream {
-        result: None,
-        accepted: false,
-        refusal: None,
-        dropped: BTreeMap::new(),
-        delivered: BTreeMap::new(),
-        received: 0,
+) -> Result<()> {
+    // The last moment before the place is asked to run anything.
+    execution::interrupted()?;
+    let mut submit = place
+        .verb(&["submit"])?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    submit
+        .stdin
+        .take()
+        .ok_or("no submit stdin")?
+        .write_all(format!("{}\n", serde_json::to_string(request)?).as_bytes())?;
+    let out = submit.wait_with_output()?;
+    let reply = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok();
+    let refused = match &reply {
+        Some(reply) => reply["refused"].as_str().map(str::to_owned),
+        // No reply: exit 125 refused before any effect; anything else may
+        // have started the run, so the receipt stays submitted.
+        None if out.status.code() == Some(125) => {
+            Some("exit 125 without a reply; see its stderr".to_owned())
+        }
+        None => {
+            record.state = Some("submitted".into());
+            record.outcome = Outcome::Lost;
+            record.exit_code = 255;
+            note(
+                &mut record.reason,
+                format!(
+                    "submit gave no reply ({}); the run may have started: ferry record {}",
+                    out.status, request.id
+                ),
+            );
+            return Ok(());
+        }
     };
-    for line in std::io::BufReader::new(stdout).lines() {
-        // A truncated or unreadable event line is data, not control: the
-        // stream ends there, and the host record can stand in.
-        let Ok(line) = line else { break };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            break;
-        };
-        if value.get("protocol").and_then(serde_json::Value::as_u64) != Some(1) {
-            return Err("host protocol mismatch".into());
+    let reply = reply.unwrap_or_default();
+    if let Some(why) = refused {
+        if let Ok(info) = place.info() {
+            refused_by(record, &info);
         }
-        match value.get("event").and_then(|v| v.as_str()) {
-            Some("accepted") => stream.accepted = true,
-            Some("refused") if !stream.accepted => {
-                stream.refusal = Some(value["reason"].as_str().unwrap_or("").to_owned());
-            }
-            Some("output") => stream.received += 1,
-            Some("host-result") => {
-                stream.result = Some(serde_json::from_value::<HostResult>(
-                    value["result"].clone(),
-                )?);
-                continue;
-            }
-            _ => {}
-        }
-        let output = value.get("event").and_then(|v| v.as_str()) == Some("output");
-        let message = if json {
-            Some((false, output, line.into_bytes()))
-        } else {
-            value
-                .get("base64")
-                .and_then(|v| v.as_str())
-                .and_then(receipt::unbase64)
-                .or_else(|| {
-                    value
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .map(|text| text.as_bytes().to_vec())
-                })
-                .map(|bytes| {
-                    (
-                        value.get("stream").and_then(|v| v.as_str()) == Some("stderr"),
-                        output,
-                        bytes,
-                    )
-                })
-        };
-        if let Some(message) = message {
-            if message.1 {
-                offered[usize::from(message.0)].fetch_add(1, Ordering::SeqCst);
-            }
-            offer(&sender, message, stop, &queued_bytes);
-        }
+        record.outcome = Outcome::Refused;
+        record.exit_code = 125;
+        record.reason = Some(format!("place refused before acceptance: {why}"));
+        return Ok(());
     }
-    drop(sender);
-    // Everything relayed is written before the receipt, unless signalled.
-    while !done.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(10));
+    record.deadline_ms = reply["deadline_ms"].as_u64().map(u128::from);
+    if json {
+        execution::emit(
+            serde_json::json!({"protocol": receipt::PROTOCOL, "event": "submitted", "id": request.id, "pid": reply["pid"]})
+                .to_string()
+                .as_bytes(),
+        );
     }
-    if done.load(Ordering::SeqCst) {
-        let _ = writer.join();
-    }
-    for (index, name) in ["stdout", "stderr"].into_iter().enumerate() {
-        let wrote = written[index].load(Ordering::SeqCst);
-        let lost = offered[index].load(Ordering::SeqCst).saturating_sub(wrote);
-        if lost > 0 {
-            stream.dropped.insert(name.to_owned(), lost);
-        }
-        if wrote > 0 {
-            stream.delivered.insert(name.to_owned(), wrote);
-        }
-    }
-    Ok(stream)
+    finish(root, place, record, json)
 }
 
-/// The caller's output writer: writes each line to its stream, and once a
-/// stream fails stops writing it (its lines then count as dropped).
-fn spawn_writer(
-    receiver: std::sync::mpsc::Receiver<(bool, bool, Vec<u8>)>,
-    written: std::sync::Arc<[AtomicU64; 2]>,
-    done: std::sync::Arc<AtomicBool>,
-    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut dead = [false, false];
-        for (to_stderr, counted, bytes) in receiver {
-            queued_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
-            let index = usize::from(to_stderr);
-            if !dead[index] {
-                let result = if to_stderr {
-                    let mut err = std::io::stderr().lock();
-                    err.write_all(&bytes).and_then(|()| err.write_all(b"\n"))
-                } else {
-                    let mut out = std::io::stdout().lock();
-                    out.write_all(&bytes)
-                        .and_then(|()| out.write_all(b"\n"))
-                        .and_then(|()| out.flush())
-                };
-                dead[index] = result.is_err();
-                if !dead[index] && counted {
-                    written[index].fetch_add(1, Ordering::SeqCst);
+/// How following a run ended.
+enum Followed {
+    Final,
+    Unreachable,
+    /// The stop a signal asked for could not be delivered.
+    NotStopped,
+    /// A second signal while the run was stopping.
+    Left(i32),
+}
+
+/// Follows a run to its end, then completes the receipt from the place's
+/// final record. If the run's end cannot be seen, the receipt stays
+/// submitted: the run may go on, and `ferry record <id>` finishes it later.
+pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) -> Result<()> {
+    let id = record.id.clone();
+    let left = match follow(root, place, record, json)? {
+        Followed::Final => return complete(root, place, record),
+        Followed::Unreachable => format!(
+            "the place did not answer for {:?}; the run may go on: ferry record {id}",
+            unreachable()
+        ),
+        Followed::NotStopped => {
+            let until = record.deadline_ms.map_or_else(
+                || "its deadline".to_owned(),
+                |ms| {
+                    format!(
+                        "its deadline in {} min (unix ms {ms})",
+                        ms.saturating_sub(receipt::now_ms()).div_ceil(60_000)
+                    )
+                },
+            );
+            let left = format!("not stopped; continues until {until}; ferry stop {id}");
+            execution::warn(&format!("ferry: {left}"));
+            left
+        }
+        Followed::Left(signal) => format!(
+            "left at a second {} while the run was stopping: ferry record {id}",
+            execution::signal_name(signal)
+        ),
+    };
+    // No verdict is claimed while the run may go on (SPEC §4, A3).
+    record.state = Some("submitted".into());
+    record.outcome = Outcome::Lost;
+    record.exit_code = 255;
+    note(&mut record.reason, left);
+    Ok(())
+}
+
+/// Writes the run's output as the place logs it, from offset 0, reconnecting
+/// from the bytes received after any drop. Output is written by its own
+/// thread, so a stalled stdout never keeps this loop from a signal. The
+/// first signal asks the place to stop the run; from then on the run's
+/// record, not its output, decides when this ends. A second signal leaves.
+fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Followed> {
+    let offset = std::sync::Arc::new(AtomicU64::new(0));
+    let mut contact = std::time::Instant::now();
+    let mut backoff = Duration::from_secs(1);
+    let mut stopping: Option<(i32, std::sync::Arc<AtomicBool>)> = None;
+    loop {
+        let mut child = place
+            .verb(&[
+                "follow",
+                &record.id,
+                &offset.load(Ordering::SeqCst).to_string(),
+            ])?
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // Its failures are retried, and reported as an unreachable
+            // place; they never mix into the output.
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut pipe = child.stdout.take().ok_or("no follow stdout")?;
+        let copied = offset.clone();
+        let reader = thread::spawn(move || {
+            let mut out: Box<dyn Write> = if json {
+                Box::new(std::io::stderr())
+            } else {
+                Box::new(std::io::stdout())
+            };
+            let mut buffer = vec![0u8; 64 << 10];
+            while let Ok(read @ 1..) = pipe.read(&mut buffer) {
+                // A closed stdout is data: the run goes on regardless.
+                let _ = out.write_all(&buffer[..read]).and_then(|()| out.flush());
+                copied.fetch_add(read as u64, Ordering::SeqCst);
+            }
+        });
+        let attempt = std::time::Instant::now();
+        let before = offset.load(Ordering::SeqCst);
+        let mut checked = attempt;
+        // Both the follow and its reader: the next offset counts every byte
+        // this one delivered.
+        let status = loop {
+            if let Some(status) = child.try_wait()?
+                && reader.is_finished()
+            {
+                break status;
+            }
+            match &stopping {
+                Some((signal, again)) if again.load(Ordering::SeqCst) => {
+                    // Its own child, by its handle.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(Followed::Left(*signal));
+                }
+                Some(_) if checked.elapsed() >= Duration::from_secs(1) => {
+                    checked = std::time::Instant::now();
+                    if place
+                        .verb(&["record", &record.id])?
+                        .output()?
+                        .status
+                        .success()
+                    {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(Followed::Final);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if let Some(signal) = execution::caught_signal() {
+                        // Watch for a second signal before asking, so one
+                        // that arrives while the stop is delivered counts.
+                        let again = execution::stopped()?;
+                        if !ask_stop(root, place, record, signal) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Ok(Followed::NotStopped);
+                        }
+                        stopping = Some((signal, again));
+                    }
                 }
             }
+            thread::sleep(Duration::from_millis(50));
+        };
+        match status.code() {
+            Some(0) => return Ok(Followed::Final),
+            Some(4) => return Err(format!("the place has no run {}", record.id).into()),
+            _ => {}
         }
-        done.store(true, Ordering::SeqCst);
-    })
+        // Contact is output received, or a follow that stayed connected; a
+        // place failing at once (ssh or follow alike) is not.
+        if offset.load(Ordering::SeqCst) > before || attempt.elapsed() >= Duration::from_secs(10) {
+            contact = std::time::Instant::now();
+            backoff = Duration::from_secs(1);
+        }
+        if contact.elapsed() >= unreachable() {
+            return Ok(Followed::Unreachable);
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
 }
 
-/// Hands one line to the caller's writer, waiting for room unless the
-/// caller has been signalled; then the line is dropped and counted.
-fn offer(
-    sender: &std::sync::mpsc::SyncSender<(bool, bool, Vec<u8>)>,
-    message: (bool, bool, Vec<u8>),
-    stop: &std::sync::atomic::AtomicBool,
-    queued_bytes: &std::sync::atomic::AtomicUsize,
-) {
-    let size = message.2.len();
-    let mut message = message;
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        // Room in bytes as well as lines (always room for one line).
-        let queued = queued_bytes.load(Ordering::SeqCst);
-        if queued > 0 && queued + size > crate::output::MAX_QUEUE {
-            thread::sleep(Duration::from_millis(5));
-            continue;
-        }
-        queued_bytes.fetch_add(size, Ordering::SeqCst);
-        match sender.try_send(message) {
-            Ok(()) => return,
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                queued_bytes.fetch_sub(size, Ordering::SeqCst);
-                return;
-            }
-            Err(std::sync::mpsc::TrySendError::Full(back)) => {
-                queued_bytes.fetch_sub(size, Ordering::SeqCst);
-                message = back;
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
+/// How long a caller keeps trying a place that does not answer; debug
+/// builds read `FERRY_UNREACHABLE_MS` so a control can reach it quickly.
+fn unreachable() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("FERRY_UNREACHABLE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        return Duration::from_millis(ms);
     }
+    crate::limits::UNREACHABLE
+}
+
+/// Asks the place to stop the run as its own caller. A failure is a note
+/// on stderr: following goes on, and a second signal leaves.
+fn ask_stop(root: &Path, place: &Place, record: &Receipt, signal: i32) -> bool {
+    let why = format!("caller received {}", execution::signal_name(signal));
+    let stopped = stop(root, place, record, &why, false, signal);
+    if let Err(error) = &stopped {
+        execution::warn(&format!("ferry: stopping run {}: {error}", record.id));
+    }
+    stopped.is_ok()
+}
+
+/// The key that identifies this caller's seat on a place: the caller's host,
+/// the repository and the seat name.
+pub fn seat_key(root: &Path, seat: &str) -> Result<String> {
+    let caller = String::from_utf8(repository::output(&mut Command::new("hostname"))?)?;
+    let identity = receipt::digest(
+        format!(
+            "{}\n{}\n{seat}",
+            caller.trim(),
+            root.canonicalize()?.display()
+        )
+        .as_bytes(),
+    );
+    Ok(format!("{}-{seat}", &identity[..24]))
+}
+
+/// Asks the place to stop a run: as its own caller, or as another with a
+/// reason. Returns the place's reply.
+pub fn stop(
+    root: &Path,
+    place: &Place,
+    record: &Receipt,
+    why: &str,
+    other: bool,
+    signal: i32,
+) -> Result<String> {
+    let seat = seat_key(root, &record.seat)?;
+    let who = format!(
+        "{}:{}",
+        String::from_utf8_lossy(&repository::output(&mut Command::new("hostname"))?).trim(),
+        std::process::id()
+    );
+    let signal = signal.to_string();
+    let mut args = vec![
+        "stop", &record.id, "--seat", &seat, "--who", &who, "--why", why, "--signal", &signal,
+    ];
+    if other {
+        args.push("--other");
+    }
+    let out = place.verb(&args)?.output()?;
+    let reply = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if out.status.success() {
+        Ok(reply)
+    } else {
+        Err(reply.into())
+    }
+}
+
+/// Completes the receipt from the place's final record, if it is final:
+/// bound to the request's token and commit. The record names the binary
+/// that ran, which a later install on the place does not change. Artifacts
+/// are fetched and checked.
+pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> {
+    let out = place.verb(&["record", &record.id])?.output()?;
+    if out.status.code() == Some(3) {
+        return Err(format!("run {} is not final yet", record.id).into());
+    }
+    if !out.status.success() {
+        return Err(format!("reading the record of run {}: {}", record.id, out.status).into());
+    }
+    let result: crate::place::HostResult = serde_json::from_slice(&out.stdout)?;
+    if Some(&result.token) != record.token.as_ref()
+        || Some(&result.commit) != record.commit.as_ref()
+        || result.protocol != receipt::PROTOCOL
+    {
+        return Err("host result binding mismatch".into());
+    }
+    record.state = Some("final".into());
+    record.collection = result.collection;
+    record.outcome = result.outcome;
+    record.exit_code = result.exit_code;
+    record.reason = result.reason;
+    record.host_binary_sha256 = Some(result.binary_sha256);
+    record.host_source_rev = result.source_rev;
+    record.host_exe = result.exe;
+    record.custody = result.custody;
+    record.lease = result.lease;
+    record.admission = result.admission;
+    record.output = result.output;
+    record.deadline_ms = result.deadline_ms;
+    record.stopped_by = result.stopped_by;
+    if let Some(error) = result.artifacts_error {
+        note(
+            &mut record.reason,
+            format!("artifact collection failed: {error}"),
+        );
+    }
+    if let Some(expected) = result.artifacts_sha256 {
+        let destination = root.join(".ferry/runs").join(&record.id);
+        fs::create_dir_all(&destination)?;
+        let archive = destination.join("artifacts.tar");
+        fs::write(&archive, place.read(&record.id, "artifacts.tar")?)?;
+        if receipt::file_digest(&archive)? != expected {
+            return Err("artifact transfer integrity failed".into());
+        }
+        crate::artifacts::unpack(&archive, &destination)?;
+    }
+    Ok(())
 }
 
 fn push_companions(root: &Path, machine: &config::Machine, request: &Request) -> Result<()> {
@@ -1189,76 +782,4 @@ fn push_companions(root: &Path, machine: &config::Machine, request: &Request) ->
         )?;
     }
     Ok(())
-}
-
-fn accept_result(
-    root: &Path,
-    machine: &config::Machine,
-    request: &Request,
-    record: &mut Receipt,
-    info: &HostInfo,
-    result: HostResult,
-) -> Result<()> {
-    record.collection.clone_from(&result.collection);
-    if result.token != request.token
-        || result.commit != request.commit
-        || result.protocol != receipt::PROTOCOL
-    {
-        return Err("host result binding mismatch".into());
-    }
-    record.outcome = result.outcome;
-    record.exit_code = result.exit_code;
-    record.reason = result.reason;
-    record.host_binary_sha256 = Some(result.binary_sha256);
-    record.host_source_rev = result.source_rev;
-    record.custody = result.custody;
-    record.lease = result.lease;
-    record.admission = result.admission;
-    record.host_exe = result.exe;
-    if record.host_binary_sha256.as_deref() != Some(&info.binary_sha256) {
-        record.outcome = Outcome::Lost;
-        record.exit_code = 255;
-        return Err("host binary changed during run".into());
-    }
-    if let Some(error) = result.artifacts_error {
-        note(
-            &mut record.reason,
-            format!("artifact collection failed: {error}"),
-        );
-    }
-    if let Some(expected) = result.artifacts_sha256 {
-        let destination = root.join(".ferry/runs").join(&request.id);
-        fs::create_dir_all(&destination)?;
-        let archive = destination.join("artifacts.tar");
-        let file = fs::File::create(&archive)?;
-        let status = ssh(&machine.ssh)?
-            .arg(format!(
-                "cat .local/state/ferry/runs/{}/artifacts.tar",
-                request.id
-            ))
-            .stdout(file)
-            .status()?;
-        if !status.success() || receipt::file_digest(&archive)? != expected {
-            return Err("artifact transfer integrity failed".into());
-        }
-        crate::artifacts::unpack(&archive, &destination)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::read_stream;
-    use std::sync::atomic::AtomicBool;
-
-    #[test]
-    fn a_truncated_last_event_ends_the_stream_instead_of_failing_it() {
-        let stream = b"{\"protocol\":1,\"event\":\"accepted\",\"id\":\"x\",\"pid\":1}\n\
-{\"protocol\":1,\"event\":\"output\",\"stream\":\"stdout\",\"text\":\"one\"}\n\
-{\"protocol\":1,\"event\":\"host-res";
-        let read = read_stream(&stream[..], false, &AtomicBool::new(false)).unwrap();
-        assert!(read.accepted);
-        assert!(read.result.is_none());
-        assert_eq!(read.received, 1);
-    }
 }
