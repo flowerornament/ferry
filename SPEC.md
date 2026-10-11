@@ -72,8 +72,14 @@ ferry recipes · ferry places
 | `stopped` | 128+signal |
 | `lost` | 255 (the supervisor died; reconciled) |
 
+**`record` exit codes:** a final record exits with its outcome's code, as
+above. A run with no verdict yet (state `submitted`) exits 3, meaning poll
+again or `ferry follow <id>`.
+
 **Why:** a caller can always tell its own code from Ferry's refusal from
-infrastructure loss.
+infrastructure loss, by the record's `outcome`. Exit codes are for people:
+a recipe's own code can coincide with 3, 124, 125 or 255, so a program
+decides by `--json` (`state`, then `outcome`), never by the exit code alone.
 
 **Refusals (125)** each print `what / why / next`:
 
