@@ -237,7 +237,7 @@ working tree.
 
 | Guarantee | Mechanism | Residue (reported) |
 |---|---|---|
-| exact commit | pushed objects, reset checkout | — |
+| exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (until the scope tier) |
 | one run per seat; exclusive host | inherited flock | work that unlocks its own descriptor |
 | every run ends | an absolute deadline | a killed supervisor: reconciled as `lost` |
 | nothing left running | session stop; scope tier | outside a scope: a session leaver that closed its fds |
