@@ -3,6 +3,7 @@
 //! client does changes how a run ends. Output is the bytes the recipe
 //! wrote, through one capped writer.
 mod common;
+use common::{ferry, git, receipt};
 #[path = "../src/limits.rs"]
 #[allow(dead_code)]
 mod limits;
@@ -33,21 +34,6 @@ impl Drop for Owned {
             let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
         }
     }
-}
-
-fn git(root: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// A repository whose `probe` recipe runs `script`, plus `pass`.
@@ -86,27 +72,6 @@ fn with_collect(collect: &str, command: &str) -> TempDir {
     git(d, &["add", "-A"]);
     git(d, &["commit", "-m", "fixture"]);
     dir
-}
-
-fn ferry(dir: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
-    command
-        .current_dir(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("FERRY_ID")
-        .env("XDG_CONFIG_HOME", dir.join("config"));
-    command
-}
-
-fn receipt(out: &Output) -> serde_json::Value {
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|value| value["event"] == "receipt")
-        .map_or_else(
-            || panic!("no receipt: {}", String::from_utf8_lossy(&out.stderr)),
-            |value| value["receipt"].clone(),
-        )
 }
 
 /// Runs a caller to its end like `output()`, but bounded: a caller that

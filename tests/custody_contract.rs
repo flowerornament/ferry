@@ -3,12 +3,14 @@
 //! children, unstoppable survivors, inheritance boundaries, malformed taint.
 //! Linux only: the census they rely on exists only there.
 #![cfg(target_os = "linux")]
+mod common;
+use common::{ferry, git, receipt};
 use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -48,21 +50,6 @@ impl Drop for Owned {
     }
 }
 
-fn git(root: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, body).unwrap();
@@ -97,32 +84,6 @@ fn fixture(probe: &str, hooks: &[(&str, &str)]) -> TempDir {
     git(d, &["add", "ferry.toml"]);
     git(d, &["commit", "-m", "fixture"]);
     dir
-}
-
-fn ferry(dir: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_ferry"));
-    c.current_dir(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env("XDG_CONFIG_HOME", dir.join("config"));
-    c
-}
-
-fn receipt(out: &Output) -> serde_json::Value {
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find(|v| v["event"] == "receipt")
-        .map_or_else(
-            || {
-                panic!(
-                    "no receipt: {} {}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            },
-            |v| v["receipt"].clone(),
-        )
 }
 
 /// Starts `ferry run pass --local` and reports whether it is still running

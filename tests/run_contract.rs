@@ -1,5 +1,6 @@
 //! Real CLI contracts exercise committed bytes and durable refusal receipts.
 mod common;
+use common::{git, receipt};
 use nix::{
     sys::signal::{Signal, kill, killpg},
     unistd::{Pid, getsid},
@@ -48,21 +49,6 @@ impl Drop for OwnedCaller {
     }
 }
 
-fn git(root: &Path, args: &[&str]) {
-    // Each test owns its repository; never inherit another one's.
-    let out = Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 fn fixture() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init"]);
@@ -97,14 +83,6 @@ fn sha256(bytes: &[u8]) -> String {
             write!(hex, "{byte:02x}").unwrap();
             hex
         })
-}
-fn receipt(out: &Output) -> serde_json::Value {
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|v| v["event"] == "receipt")
-        .unwrap()["receipt"]
-        .clone()
 }
 
 #[test]
