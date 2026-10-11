@@ -255,10 +255,19 @@ deploy window.
 
 1. **No mount crossing.** `outside` also requires every component to be on
    the state root's device, so a volume mounted inside a seat is not the
-   seat's. The size walk counts nothing on another device, and the delete
-   (`admission::remove`, replacing `remove_dir_all`, which crosses mounts)
-   refuses to descend into one. A test cannot mount, so the control is a
-   unit test with a different device standing in.
+   seat's. The size walk counts nothing on another device, and
+   `admission::remove` deletes nothing if any entry under the path, walked
+   with `lstat`, is on another device. The delete itself stays std's
+   `remove_dir_all`, which walks directory handles (`openat` with
+   `O_NOFOLLOW`, `unlinkat`; CVE-2022-21658), so a directory swapped for a
+   link during it is unlinked, never followed. A first version walked by
+   path to refuse mounts during the delete; the critic showed that a swap
+   between a directory's `lstat` and its listing deleted the link's target,
+   so that walk was replaced (control
+   `a_link_swapped_in_during_a_wipe_is_never_followed`, made deterministic
+   by the `remove-walk` debug pause). Making a mount needs privileges, so the
+   device check before the delete is not a practical race. A test cannot
+   mount, so the device control is a unit test with another device id.
 2. **The check is repeated at the delete.** `admission::remove` proves
    containment again immediately before each delete, for the cap and for
    `retire`. The window after the measurement (up to 30 s) is now the gap

@@ -182,10 +182,9 @@ fn size_until(path: &Path, until: Option<std::time::Instant>, dev: u64) -> Optio
 /// is absent, so there is nothing to touch, and that is inside. Anything
 /// that cannot be inspected is outside (slice 5 review P1-a).
 pub fn outside(root: &Path, rel: &Path) -> Option<String> {
-    match fs::metadata(root) {
-        Ok(meta) => outside_on(root, rel, meta.dev()),
-        Err(e) => Some(format!("{} cannot be inspected: {e}", root.display())),
-    }
+    let root_meta =
+        fs::metadata(root).map_err(|e| format!("{} cannot be inspected: {e}", root.display()));
+    root_meta.map_or_else(Some, |meta| outside_on(root, rel, meta.dev()))
 }
 
 /// As `outside`, with every component also on device `dev`: a volume
@@ -214,39 +213,41 @@ fn outside_on(root: &Path, rel: &Path, dev: u64) -> Option<String> {
 
 /// Bytes under `rel` below `root`, on `root`'s device.
 pub fn size_in(root: &Path, rel: &Path) -> u64 {
-    fs::metadata(root).map_or(0, |meta| {
-        size_until(&root.join(rel), None, meta.dev()).unwrap_or(0)
-    })
+    let dev = fs::metadata(root).map_or(0, |meta| meta.dev());
+    size_until(&root.join(rel), None, dev).unwrap_or(0)
 }
 
-/// Deletes `rel` below `root`, proving containment again immediately before
-/// (so the window after any earlier check is this call), and never crossing
-/// into another device. An absent path is already deleted.
+/// Deletes `rel` below `root`: containment proven again right before, and
+/// nothing deleted if anything under it is on another device (a mount). std's
+/// `remove_dir_all` walks directory handles, so a link swapped in is unlinked.
 pub fn remove(root: &Path, rel: &Path) -> Result<()> {
     if let Some(why) = outside(root, rel) {
         return Err(format!("{why}: not deleted").into());
     }
-    remove_on(&root.join(rel), fs::metadata(root)?.dev())
+    let path = root.join(rel);
+    if let Some(mount) = foreign(&path, fs::metadata(root)?.dev()) {
+        return Err(format!("{} is on another device: not deleted", mount.display()).into());
+    }
+    crate::execution::pause_at("remove-walk", &path);
+    match fs::remove_dir_all(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
-fn remove_on(path: &Path, dev: u64) -> Result<()> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
+/// The first path under `path` on another device than `dev` (no link followed).
+fn foreign(path: &Path, dev: u64) -> Option<std::path::PathBuf> {
+    let meta = fs::symlink_metadata(path).ok()?;
     if meta.dev() != dev {
-        return Err(format!("{} is on another device: not deleted", path.display()).into());
+        return Some(path.to_path_buf());
     }
-    if meta.is_dir() {
-        for entry in fs::read_dir(path)? {
-            remove_on(&entry?.path(), dev)?;
-        }
-        fs::remove_dir(path)?;
-    } else {
-        fs::remove_file(path)?;
+    if !meta.is_dir() {
+        return None;
     }
-    Ok(())
+    let entries = fs::read_dir(path).ok()?;
+    entries
+        .flatten()
+        .find_map(|entry| foreign(&entry.path(), dev))
 }
 
 /// Under the run's seat lock, before the checkout: when the seat was last
@@ -322,7 +323,7 @@ pub fn cap(
 
 #[cfg(test)]
 mod tests {
-    use super::{outside, outside_on, remove_on, size_until};
+    use super::{foreign, outside, outside_on, size_until};
     use std::{fs, os::unix::fs::MetadataExt, os::unix::fs::symlink, path::Path};
 
     /// At the point of deletion, independently of request validation, only a
@@ -370,10 +371,11 @@ mod tests {
         assert_eq!(outside_on(root, mount, dev), None);
         assert!(outside_on(root, mount, other).is_some_and(|why| why.contains("another device")));
         assert_eq!(size_until(&root.join("slots"), None, other), Some(0));
-        assert!(remove_on(&root.join(mount), other).is_err());
-        assert!(root.join(mount).join("data").exists());
-        remove_on(&root.join(mount), dev).unwrap();
-        assert!(!root.join(mount).exists());
+        assert_eq!(
+            foreign(&root.join("slots"), other),
+            Some(root.join("slots"))
+        );
+        assert_eq!(foreign(&root.join("slots"), dev), None);
     }
 
     /// A delete proves containment again at its own moment: a directory

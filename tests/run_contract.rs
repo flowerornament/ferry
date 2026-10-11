@@ -2461,3 +2461,60 @@ fn consumer_prune_must_not_treat_permission_denied_as_workspace_gone() {
         "prune deleted a live workspace's seat: code={code:?}, {said}"
     );
 }
+
+/// A directory swapped for a symbolic link while a wipe runs is unlinked,
+/// never followed: the delete walks directory handles (std's
+/// `remove_dir_all`), not paths. `remove-walk` holds the delete after its
+/// checks, so the swap is deterministic (ferry-xtx.23; the critic's race).
+#[test]
+fn a_link_swapped_in_during_a_wipe_is_never_followed() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "big/\nconfig/\nstate/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['big']\n[recipe.pass]\ncommand=['sh','-c','mkdir -p big/sub; head -c 4096 /dev/zero > big/sub/blob']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "a preserved tree that grows"]);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
+    );
+    run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let state = dir.path().join(".ferry/local");
+    let slot = fs::read_dir(state.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
+    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
+    // The cache's own delete is not held.
+    fs::write(state.join(format!("caches/{key}.go")), "").unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    fs::write(victim.path().join("precious"), "keep").unwrap();
+    let wipe = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env("FERRY_FAIL_AT", "remove-walk")
+        .args(["run", "pass", "--local", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let paused = slot.join("big.paused");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !paused.exists() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(paused.exists(), "the wipe never paused");
+    fs::remove_dir_all(slot.join("big/sub")).unwrap();
+    std::os::unix::fs::symlink(victim.path(), slot.join("big/sub")).unwrap();
+    fs::write(slot.join("big.go"), "").unwrap();
+    let out = wipe.wait_with_output().unwrap();
+    let record = receipt(&out);
+    assert!(victim.path().join("precious").exists(), "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["pruned"]["cap"], 1000, "{record}");
+}
