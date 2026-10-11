@@ -221,26 +221,43 @@ pub fn size_in(root: &Path, rel: &Path) -> u64 {
 /// nothing deleted if anything under it is on another device (a mount). std's
 /// `remove_dir_all` walks directory handles, so a link swapped in is unlinked.
 pub fn remove(root: &Path, rel: &Path) -> Result<()> {
-    if let Some(why) = outside(root, rel) {
-        return Err(format!("{why}: not deleted").into());
-    }
+    let contained = || outside(root, rel).map_or(Ok(()), |why| Err(format!("{why}: not deleted")));
+    contained()?;
     let path = root.join(rel);
-    let found =
-        foreign(&path, fs::metadata(root)?.dev()).map_err(|why| format!("{why}: not deleted"))?;
+    let until = std::time::Instant::now() + MEASURE_LIMIT;
+    let found = foreign(&path, fs::metadata(root)?.dev(), until)
+        .map_err(|why| format!("{why}: not deleted"))?;
     if let Some(mount) = found {
         return Err(format!("{} is on another device: not deleted", mount.display()).into());
     }
     crate::execution::pause_at("remove-walk", &path);
-    match fs::remove_dir_all(&path) {
+    // Again after the walk, so only the delete's own moment is exposed.
+    contained()?;
+    let removed = match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+        Ok(_) => fs::remove_file(&path),
+        Err(e) => Err(e),
+    };
+    match removed {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
     }
 }
 
 /// The first path under `path` on another device than `dev` (no link
-/// followed). What cannot be inspected is an error: fail closed. An entry
-/// gone meanwhile is skipped.
-fn foreign(path: &Path, dev: u64) -> std::result::Result<Option<PathBuf>, String> {
+/// followed). What cannot be inspected, or not before `until`, is an error:
+/// fail closed. An entry gone meanwhile is skipped.
+fn foreign(
+    path: &Path,
+    dev: u64,
+    until: std::time::Instant,
+) -> std::result::Result<Option<PathBuf>, String> {
+    if std::time::Instant::now() >= until {
+        return Err(format!(
+            "{} not inspected within {MEASURE_LIMIT:?}",
+            path.display()
+        ));
+    }
     let unseen = |e: std::io::Error| format!("{} could not be inspected: {e}", path.display());
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let meta = match fs::symlink_metadata(path) {
@@ -258,7 +275,7 @@ fn foreign(path: &Path, dev: u64) -> std::result::Result<Option<PathBuf>, String
         entries => entries.map_err(unseen)?,
     };
     for entry in entries {
-        if let Some(found) = foreign(&entry.map_err(unseen)?.path(), dev)? {
+        if let Some(found) = foreign(&entry.map_err(unseen)?.path(), dev, until)? {
             return Ok(Some(found));
         }
     }
@@ -326,8 +343,11 @@ pub fn cap(
         if crate::execution::fail_at("cap-wipe") {
             return Err("cap-wipe: injected by FERRY_FAIL_AT".into());
         }
+        // Each path on its own: one that fails is a note, not the end.
         for rel in &paths {
-            remove(root, rel)?;
+            if let Err(e) = remove(root, rel) {
+                crate::run::note_after(format!("seat cap: {e}"));
+            }
         }
     }
     fs::create_dir_all(root.join("caches"))?;
@@ -386,11 +406,12 @@ mod tests {
         assert_eq!(outside_on(root, mount, dev), None);
         assert!(outside_on(root, mount, other).is_some_and(|why| why.contains("another device")));
         assert_eq!(size_until(&root.join("slots"), None, other), Some(0));
-        assert_eq!(
-            foreign(&root.join("slots"), other),
-            Ok(Some(root.join("slots")))
-        );
-        assert_eq!(foreign(&root.join("slots"), dev), Ok(None));
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let slots = root.join("slots");
+        assert_eq!(foreign(&slots, other, later), Ok(Some(slots.clone())));
+        assert_eq!(foreign(&slots, dev, later), Ok(None));
+        // Past its time it fails closed (ferry-xtx.24).
+        assert!(foreign(&slots, dev, std::time::Instant::now()).is_err());
     }
 
     /// A delete proves containment again at its own moment: a directory

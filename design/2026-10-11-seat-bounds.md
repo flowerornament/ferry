@@ -284,3 +284,22 @@ deploy window.
    operator removes it. A `--forget` for operator-confirmed retirement
    would be a feature, so it waits for the stop rule's call.
 
+## 12. Before deploy, second pass (2026-10-11, ferry-xtx.24)
+
+The critic's P2s on 9f6fafe2 (GO; none a safety escape); evidence
+`ferry-critic-s23-evidence/xtx23-r2/`.
+
+- **A file at a wipe path** (a preserve path or `caches/<key>`) is deleted
+  as a file; `remove_dir_all` refused it, and the cap's loop stopped there.
+  The loop now carries on over the remaining paths; each failure is a
+  `seat cap:` note (controls `a_file_at_a_wipe_path_is_deleted`, and the
+  cache reached after a failed preserve path in
+  `a_wipe_that_cannot_inspect_its_tree_deletes_nothing`).
+- **Containment again after the device walk.** `remove` checks `outside`
+  before the walk and again after it, right before the delete, so the
+  starting path's ancestors are exposed only for the delete's own moment.
+  The `remove-walk` pause now sits between the walk and that check (control
+  `a_seat_swapped_for_a_link_after_the_walk_is_not_deleted_through`).
+- **The device walk is bounded** by `MEASURE_LIMIT`; past it, it fails
+  closed and nothing is deleted.
+

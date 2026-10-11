@@ -2543,6 +2543,10 @@ fn a_wipe_that_cannot_inspect_its_tree_deletes_nothing() {
     let key = slot.file_name().unwrap().to_string_lossy().into_owned();
     fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
     fs::write(slot.join("big/other/keep"), "keep").unwrap();
+    // After the preserve path fails, the wipe still reaches the cache.
+    let cache = state.join(format!("caches/{key}"));
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("blob"), "x").unwrap();
     let locked = slot.join("big/locked");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
@@ -2550,6 +2554,11 @@ fn a_wipe_that_cannot_inspect_its_tree_deletes_nothing() {
     let record = receipt(&out);
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     assert!(slot.join("big/other/keep").exists(), "{record}");
+    // The run makes its cache again; what the wipe reached is gone.
+    assert!(
+        !cache.join("blob").exists(),
+        "the wipe stopped at the first failure: {record}"
+    );
     assert!(
         record["reason"]
             .as_str()
@@ -2562,6 +2571,107 @@ fn a_wipe_that_cannot_inspect_its_tree_deletes_nothing() {
             .as_str()
             .unwrap_or("")
             .contains("could not be inspected"),
+        "{record}"
+    );
+}
+
+/// A wipe path that is a regular file is deleted as one, not left as an
+/// error (ferry-xtx.24 (a)).
+#[test]
+fn a_file_at_a_wipe_path_is_deleted() {
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "big/\nconfig/\nstate/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['big']\n[recipe.pass]\ncommand=['sh','-c','mkdir -p big; head -c 4096 /dev/zero > big/blob']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "a preserved tree"]);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
+    );
+    run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let state = dir.path().join(".ferry/local");
+    let slot = fs::read_dir(state.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
+    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
+    let cache = state.join(format!("caches/{key}"));
+    let _ = fs::remove_dir_all(&cache);
+    fs::write(&cache, "a file where a directory belongs").unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["pruned"]["cap"], 1000, "{record}");
+    assert!(!cache.is_file(), "{record}");
+    assert!(
+        !record["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("seat cap:"),
+        "{record}"
+    );
+}
+
+/// Containment is proven again after the device walk, right before the
+/// delete: a seat directory swapped for a link while the walk ran stops the
+/// delete, and the link's target survives (ferry-xtx.24 (b)).
+#[test]
+fn a_seat_swapped_for_a_link_after_the_walk_is_not_deleted_through() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    fs::write(dir.path().join(".gitignore"), "big/\nconfig/\nstate/\n").unwrap();
+    fs::write(dir.path().join("ferry.toml"), "version=1\npreserve=['big']\n[recipe.pass]\ncommand=['sh','-c','mkdir -p big; head -c 4096 /dev/zero > big/blob']\n").unwrap();
+    git(dir.path(), &["add", ".gitignore", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "a preserved tree"]);
+    with_host_policy(
+        dir.path(),
+        "version = 1\nmin_free_bytes = 1\nseat_cap_bytes = 1000\n",
+    );
+    run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let state = dir.path().join(".ferry/local");
+    let slot = fs::read_dir(state.join("slots"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let key = slot.file_name().unwrap().to_string_lossy().into_owned();
+    fs::remove_file(state.join(format!("caches/.measured-{key}"))).unwrap();
+    fs::write(state.join(format!("caches/{key}.go")), "").unwrap();
+    let victim = tempfile::tempdir().unwrap();
+    fs::create_dir_all(victim.path().join("big")).unwrap();
+    fs::write(victim.path().join("big/precious"), "keep").unwrap();
+    let wipe = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env("FERRY_FAIL_AT", "remove-walk")
+        .args(["run", "pass", "--local", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let paused = slot.join("big.paused");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !paused.exists() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(paused.exists(), "the wipe never paused");
+    fs::rename(&slot, state.join("moved-away")).unwrap();
+    std::os::unix::fs::symlink(victim.path(), &slot).unwrap();
+    fs::write(victim.path().join("big.go"), "").unwrap();
+    let out = wipe.wait_with_output().unwrap();
+    let record = receipt(&out);
+    assert!(victim.path().join("big/precious").exists(), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("is behind a symbolic link: not deleted"),
         "{record}"
     );
 }
