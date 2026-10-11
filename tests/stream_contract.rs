@@ -1093,10 +1093,11 @@ fn a_busy_seat_refuses_at_once_naming_the_run() {
 }
 
 /// Between taking the seat lock and writing its id, the lock file still
-/// names the previous, finished run (amendment A1). A run refused in that
-/// window must not blame the finished run: it names the one starting.
+/// names the previous, finished run (amendment A1). State cannot tell that
+/// from a leftover of the finished run, so a run refused in that window
+/// names both: the finished run, and the one starting (murail-4a, herald-1b).
 #[test]
-fn a_run_refused_while_the_holder_starts_names_it_not_the_last_run() {
+fn a_run_refused_while_the_holder_starts_names_both_possible_holders() {
     if !cfg!(debug_assertions) {
         return;
     }
@@ -1107,6 +1108,7 @@ fn a_run_refused_while_the_holder_starts_names_it_not_the_last_run() {
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
     let lock = seat_lock(dir.path());
+    let previous = fs::read_to_string(&lock).unwrap();
     let holder = Caller(
         ferry(dir.path())
             .env("FERRY_FAIL_AT", "seat-lock-write")
@@ -1123,8 +1125,19 @@ fn a_run_refused_while_the_holder_starts_names_it_not_the_last_run() {
     let record = receipt(&out);
     assert_eq!(out.status.code(), Some(125), "{record}");
     let reason = record["reason"].as_str().unwrap();
+    let starting = fs::read_dir(dir.path().join(".ferry/local/records"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".reserved.json").map(str::to_owned)
+        })
+        .find(|id| *id != record["id"])
+        .unwrap();
     assert!(
-        reason.contains("held by a run that is starting") && !reason.contains("ended"),
+        reason.contains(&format!(
+            "held after run {previous} ended (ran-pass) by something it started, or by a run that is starting ({starting})"
+        )),
         "{reason}"
     );
     fs::write(lock.with_extension("go"), "").unwrap();
@@ -1146,13 +1159,7 @@ fn a_run_refused_while_the_holder_starts_names_it_not_the_last_run() {
 fn a_lock_held_after_its_run_keeps_the_seat_busy() {
     let scratch = tempfile::tempdir().unwrap();
     let pidfile = scratch.path().join("leaver.pid");
-    let dir = fixture(
-        &format!(
-            "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
-            p = pidfile.display()
-        ),
-        "",
-    );
+    let dir = fixture(&leaving(&pidfile), "");
     let _leaver = Owned(pidfile.clone());
     let out = ferry(dir.path())
         .args(["run", "probe", "--local", "--json"])
@@ -1170,6 +1177,162 @@ fn a_lock_held_after_its_run_keeps_the_seat_busy() {
     assert!(
         reason.contains(&format!(
             "seat busy: held after run {} ended (ran-pass)",
+            first["id"].as_str().unwrap()
+        )),
+        "{reason}"
+    );
+}
+
+/// A reservation proves a run was submitted, not that it holds the lock
+/// (murail-4a's reproduction, 5c27e351): a finished run's leftover holds
+/// it while a contender has reserved but not tried it. A third run's
+/// refusal must name the finished run; the contender only as a possibility.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
+    // The pause before the seat is a debug-build point.
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaver.pid");
+    let dir = fixture(&leaving(&pidfile), "");
+    let _leaver = Owned(pidfile);
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let first = receipt(&out);
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
+    let mut contender = Caller(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "seat-try")
+            .args(["run", "probe", "--local", "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let runs = dir.path().join(".ferry/local/runs");
+    let mut paused = PathBuf::new();
+    wait_until("the contender reserved, before trying the seat", || {
+        fs::read_dir(&runs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                paused = e.path().join("seat.paused");
+                paused.exists()
+            })
+    });
+    let contender_id = paused
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    fs::write(paused.with_extension("go"), "").unwrap();
+    wait_until("the contender ended", || {
+        contender.0.try_wait().unwrap().is_some()
+    });
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!(
+            "held after run {} ended (ran-pass) by something it started, or by a run that is starting ({contender_id})",
+            first["id"].as_str().unwrap()
+        )),
+        "{reason}"
+    );
+}
+
+/// A recipe line that leaves a setsid python running, holding the run's
+/// inherited lock descriptors, and records its pid.
+#[cfg(target_os = "macos")]
+fn leaving(pidfile: &Path) -> String {
+    format!(
+        "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+        p = pidfile.display()
+    )
+}
+
+/// Runs refused together behind a leaver each see the others' reservations
+/// (critic L1): every refusal must still name the ended run whose leftover
+/// holds the lock, with the others only as "or" possibilities.
+#[cfg(target_os = "macos")]
+#[test]
+fn runs_refused_together_behind_a_leaver_each_name_the_ended_run() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaver.pid");
+    let dir = fixture(&leaving(&pidfile), "");
+    let _leaver = Owned(pidfile);
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let first = receipt(&out);
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
+    let ended = format!(
+        "held after run {} ended (ran-pass)",
+        first["id"].as_str().unwrap()
+    );
+    for _ in 0..3 {
+        let barrier = std::sync::Barrier::new(3);
+        thread::scope(|scope| {
+            let refused: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        bounded_output(
+                            ferry(dir.path()).args(["run", "probe", "--local", "--json"]),
+                        )
+                    })
+                })
+                .collect();
+            for out in refused {
+                let record = receipt(&out.join().unwrap());
+                let reason = record["reason"].as_str().unwrap();
+                assert!(reason.contains(&ended), "{reason}");
+            }
+        });
+    }
+}
+
+/// An exclusive run's leftover holds the host (critic L2): the holder's
+/// name is never cleared, so a waiter on another seat refuses naming the
+/// ended exclusive run, not "shared runs".
+#[cfg(target_os = "macos")]
+#[test]
+fn a_host_held_after_an_exclusive_run_names_that_run() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaver.pid");
+    let dir = fixture(&leaving(&pidfile), "");
+    let _leaver = Owned(pidfile);
+    let out = ferry(dir.path())
+        .args(["run", "probe", "--local", "--json", "--exclusive"])
+        .output()
+        .unwrap();
+    let first = receipt(&out);
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
+    let out = bounded_output(ferry(dir.path()).args([
+        "run",
+        "probe",
+        "--local",
+        "--json",
+        "--seat",
+        "other",
+        "--wait-seconds",
+        "3",
+    ]));
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!(
+            "held after exclusive run {} ended (ran-pass) by something it started, or by shared runs",
             first["id"].as_str().unwrap()
         )),
         "{reason}"
@@ -1307,7 +1470,7 @@ fn a_host_lease_wait_past_its_bound_refuses_naming_the_holder() {
         .to_owned();
     let reason = record["reason"].as_str().unwrap();
     assert!(
-        reason.contains(&format!("held by run {holder_id}")),
+        reason.contains(&format!("held by exclusive run {holder_id}")),
         "{record}"
     );
     // The wait is bounded apart from the run's own timeout: the deadline is

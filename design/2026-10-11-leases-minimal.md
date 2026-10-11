@@ -256,17 +256,32 @@ the same window.
   record (`records/<id>.reserved.json`, naming its seat) before it touches
   the seat lock, and the supervisor reconciles the seat's reservations
   (`record::reconcile_seat`) before it tries the lock. So when the lock is
-  held, every other reservation for the seat is a live run:
+  held, every other reservation for the seat is a live run. This proves only
+  that a lock holder has a reservation, never that a reservation holds the
+  lock: a live run may not have tried it yet. Hence:
   - the lock file names a live reservation: that run holds the seat
     (`seat busy: run <id>, submitted <n> min ago; ferry follow <id> or
     ferry stop <id>`);
-  - it names a final run (or nothing), but a live reservation exists: that
-    run holds the lock and has not written its id yet (`held by a run that
-    is starting (<ids>)`);
-  - neither: the lock outlived the run it names (`held after run <id> ended
-    (<outcome>), by something it started; ferry record <id>`).
+  - it names a final run, and no reservation is live: the lock outlived
+    that run (`held after run <id> ended (<outcome>) by something it
+    started; ferry record <id>`);
+  - it names a final run, and a reservation is live: both are possible,
+    and both are named (`held after run <id> ended … , or by a run that is
+    starting (<ids>)`). A live reservation proves the run is alive, not that
+    it holds the lock: it may not have tried it yet. **Correction after the
+    freeze:** 90a792a4 named the live reservation alone as the holder;
+    murail-4a and herald-1b each showed a finished run's leftover holding
+    the lock while a contender had reserved but not tried it (RETURN,
+    2026-10-11);
+  - it names nothing: a run that is starting, if one is live, or an unknown
+    process.
 - **Controls:** `a_busy_seat_refuses_at_once_naming_the_run` (§12.7);
-  `a_run_refused_while_the_holder_starts_names_it_not_the_last_run`
+  `a_run_refused_while_the_holder_starts_names_both_possible_holders`;
+  `record::tests::a_reserved_contender_does_not_prove_it_holds_an_ended_runs_lock`
+  (herald-1b's deterministic reproduction, adapted);
+  `a_starting_contender_is_not_named_as_a_finished_runs_lock_holder` (macOS;
+  murail-4a's reproduction, with a FERRY_FAIL_AT=seat-try pause before the
+  lock is tried)
   (FERRY_FAIL_AT=seat-lock-write holds the window open);
   `a_lock_held_after_its_run_keeps_the_seat_busy` (macOS; on Linux the census
   stops such a leaver until 4b); `a_host_refusal_before_acceptance…` now
@@ -277,3 +292,19 @@ the same window.
 - **SPEC §6:** `refuse(why, next)` replies `{refused, why, next}`; `refused`
   stays for older callers, and the caller joins `why; next` when both are
   present.
+- **Host holder, by state (critic L2, 2026-10-11).** `HostLease`'s drop no
+  longer clears the exclusive holder's name: the work inherits the lock on
+  every platform, so the lock outlives the clearing, and waiters named
+  "shared runs" after a full wait. An expired host wait names, by
+  `record::host_holder`:
+  - a live exclusive run (`ferry follow/stop`);
+  - an ended one, "or by shared runs";
+  - or shared runs (an empty name).
+
+  Control: `a_host_held_after_an_exclusive_run_names_that_run`.
+- **Concurrent refusals (critic L1):**
+  `runs_refused_together_behind_a_leaver_each_name_the_ended_run`.
+- **Next step for a lock that outlived its run:** "stop what run <id> left
+  running (its processes in this seat's checkout)". 4b's survivors
+  `{pid, start}` make it exact.
+

@@ -283,6 +283,10 @@ pub fn prepare(
     let tainted = || crate::custody::check(root, &request.seat, local);
     tainted()?;
     // A busy seat refuses at once, naming the run that holds it (SPEC §5).
+    pause_at(
+        "seat-try",
+        &root.join("runs").join(&request.id).join("seat"),
+    );
     let path = root.join("locks").join(&request.seat);
     let Some(lease) = crate::lock::try_seat(&path, &request.id)? else {
         let named = fs::read_to_string(&path).unwrap_or_default();

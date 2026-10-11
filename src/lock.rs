@@ -78,14 +78,14 @@ pub(crate) fn acquire_as(
                 waiting()?;
                 if crate::receipt::now_ms() >= ends_ms {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    let holder = fs::read_to_string(path).unwrap_or_default();
-                    let holder = match holder.trim() {
-                        "" => "shared runs".to_owned(),
-                        id => format!("run {id}"),
-                    };
+                    // The holder's name is never cleared: the work inherits
+                    // the lock and may outlive its run (SPEC §3).
+                    let named = fs::read_to_string(path).unwrap_or_default();
+                    let root = path.parent().and_then(Path::parent).unwrap_or(path);
                     return Err(format!(
-                        "waited {:?} for lock {name}, the end of the run's wait: held by {holder}",
-                        started.elapsed()
+                        "waited {:?} for lock {name}, the end of the run's wait: {}",
+                        started.elapsed(),
+                        crate::record::host_holder(root, named.trim())
                     )
                     .into());
                 }
@@ -102,18 +102,6 @@ pub(crate) fn acquire_as(
         }
     }
 }
-impl Drop for HostLease {
-    /// An exclusive holder clears its name before the lock drops, so a
-    /// later wait never names a run that is gone.
-    fn drop(&mut self) {
-        if self.record.mode == "exclusive" {
-            for file in &self.held {
-                let _ = file.set_len(0);
-            }
-        }
-    }
-}
-
 /// The host-wide lease every session holds while it runs. Ordinary runs
 /// share it. A recipe that requires `exclusive` holds it alone: it first
 /// closes the gate, so no new run starts, then waits for in-flight runs to

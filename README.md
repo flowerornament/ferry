@@ -354,13 +354,18 @@ a quiet-host certificate, and it does not quiet:
 - Ferry binaries older than the lease.
 
 A run never waits for its seat: a held seat lock refuses at once (125). The
-refusal names the run that holds it, or the run that is starting and holds
-it, or, when the lock outlived its run, that run ("held after run <id>
-ended"). The work inherits the seat lock and the host lease on every
+refusal names the run that holds it when the lock file names a live run.
+Otherwise it says what it can prove. The lock may have outlived the run it
+names ("held after run <id> ended"), or a run that is starting may hold it.
+When the seat's live reservations make both possible, it names both: a
+reservation shows a run is alive, not that it has the lock. The work inherits the seat lock and the host lease on every
 platform, so whatever a run leaves running while holding them keeps them
 held. Its waits for the host lease end by its submit plus `--wait-seconds`
 (default 30 min), apart from `--timeout-seconds`. Past it the run refuses
-(125), naming the run that holds the lease exclusively, or "shared runs".
+(125), naming the exclusive run that holds the lease, or, if that run has
+ended, "held after exclusive run <id> ended … or by shared runs"; an empty
+name means shared runs. No holder's name is ever cleared: the work inherits
+the lock and may outlive its run.
 A place's refusal carries `why` and `next` apart (SPEC §6); the receipt's
 reason is `<why>; <next>`.
 

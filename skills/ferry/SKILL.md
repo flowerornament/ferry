@@ -96,8 +96,11 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 - **Seat busy:** `seat busy: run <id>, submitted <n> min ago` means your seat
   already has a run. `ferry follow <id>` or `ferry stop <id>`, or use another
   `--seat`. "Held after run <id> ended" means something that run started
-  still holds the seat's lock: `ferry record <id>` names the run; stop the
-  leftover process by its exact pid.
+  still holds the seat's lock: stop what it left running (its processes in
+  the seat's checkout), by exact pid. An "or" lists runs that may be
+  starting instead: Ferry names both when it cannot tell them apart.
+- **Host held after an exclusive run ended:** the same, for the host lease:
+  something an `--exclusive` run left running still holds it.
 
 - **Unmet requirement or unknown machine:** the recipe's `requires` are not
   all in a machine's features. Pick another `--on`, or run `--local` if the

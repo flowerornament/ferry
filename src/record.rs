@@ -256,10 +256,12 @@ pub fn reconcile_seat(root: &Path, seat: &str) {
 }
 
 /// Why a seat is busy, from the run its lock file names and the seat's
-/// other reservations. Those were reconciled before the lock was tried, so
-/// each is a live run. Named and live: that run, its age, the next step.
-/// Otherwise a live one is starting (it holds the lock, its id not yet
-/// written). Otherwise the lock outlived the run it names.
+/// other reservations (reconciled before the lock was tried, so each is a
+/// live run). Named and live: that run, its age, the next step. Otherwise
+/// what is provable: a live reservation may be a run that holds the lock
+/// and has not written its id yet, or one that has not tried it; a final
+/// named run may have left something holding it. When both are possible,
+/// both are named.
 pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     let live: Vec<Reservation> = fs::read_dir(records(root))
         .into_iter()
@@ -275,30 +277,87 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
             "seat busy: run {named}, submitted {minutes} min ago; ferry follow {named} or ferry stop {named}"
         );
     }
-    if !live.is_empty() {
-        let ids: Vec<&str> = live.iter().map(|r| r.id.as_str()).collect();
-        return format!(
-            "seat busy: held by a run that is starting ({}); ferry follow <id> or ferry stop <id>",
-            ids.join(", ")
-        );
-    }
+    let starting = live
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let ended = (!named.is_empty())
         .then(|| fs::read(final_path(root, named)).ok())
         .flatten()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    match ended {
-        Some(record) => format!(
-            "seat busy: held after run {named} ended ({}), by something it started; ferry record {named}",
-            record["outcome"].as_str().unwrap_or("unknown")
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(|record| {
+            let outcome = record["outcome"].as_str().unwrap_or("unknown").to_owned();
+            format!("held after run {named} ended ({outcome}) by something it started")
+        });
+    match (ended, starting.is_empty()) {
+        (Some(ended), true) => format!(
+            "seat busy: {ended}; stop what run {named} left running (its processes in this seat's checkout)"
         ),
-        None => "seat busy: held by an unknown process".into(),
+        (Some(ended), false) => format!(
+            "seat busy: {ended}, or by a run that is starting ({starting}); stop what run {named} left running, or ferry follow <id>"
+        ),
+        (None, false) => format!(
+            "seat busy: held by a run that is starting ({starting}), or by an unknown process; ferry follow <id>"
+        ),
+        (None, true) => "seat busy: held by an unknown process".into(),
     }
+}
+
+/// Who holds the host lease, by state as for the seat (`busy`): an
+/// exclusive run writes its id on acquisition and never clears it, and
+/// shared runs write nothing.
+pub fn host_holder(root: &Path, named: &str) -> String {
+    if named.is_empty() {
+        return "held by shared runs".into();
+    }
+    if let Ok(bytes) = fs::read(final_path(root, named)) {
+        let outcome = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|record| record["outcome"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        return format!(
+            "held after exclusive run {named} ended ({outcome}) by something it started, or by shared runs"
+        );
+    }
+    format!("held by exclusive run {named}; ferry follow {named} or ferry stop {named}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Reservation, finalize, reconcile_with, reserve};
     use std::fs;
+
+    /// A reservation proves a live run, not that it holds the lock: a
+    /// finished run's leftover may hold it while a contender has not yet
+    /// tried it. The refusal names the finished run, and the contender only
+    /// as a possibility (herald-1b's reproduction, 24bb602b, adapted).
+    #[test]
+    fn a_reserved_contender_does_not_prove_it_holds_an_ended_runs_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = own("boot");
+        reserve(dir.path(), &old).unwrap();
+        let path = dir.path().join("seat-lock");
+        let _inherited = crate::lock::try_seat(&path, &old.id).unwrap().unwrap();
+        finalize(
+            dir.path(),
+            &old.id,
+            &serde_json::json!({"outcome":"ran-pass"}),
+        )
+        .unwrap();
+        let mut contender = own("boot");
+        contender.id = "contender-not-yet-scheduled".into();
+        reserve(dir.path(), &contender).unwrap();
+        let named = fs::read_to_string(path).unwrap();
+        let reason = super::busy(dir.path(), &old.seat, "reader", &named);
+        assert!(
+            reason.starts_with(&format!(
+                "seat busy: held after run {} ended (ran-pass) by something it started, or by a run that is starting (contender-not-yet-scheduled)",
+                old.id
+            )),
+            "{reason}"
+        );
+    }
 
     fn reservation(pid: u32, start: Option<u128>, boot: &str) -> Reservation {
         Reservation {
