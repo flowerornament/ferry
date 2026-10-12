@@ -1,0 +1,78 @@
+# Architecture
+
+How SPEC.md's model maps onto the code. SPEC says what must hold; this says
+where it is done. Keep both true to the code, in the same commit as the
+change.
+
+## One run, end to end
+
+```
+caller (ferry run)                                place (ferry place <verb>, over ssh or a local exec)
+──────────────────                                ───────────────────────────────────────────────────
+main ── config, repository                         
+  │     resolve recipe@commit, route (§10)         
+  │     refuse 125 before any effect               
+  ▼                                                
+transport::ship ── push commit + [[ship]] ──────►  store/repo.git
+transport::run_on ── submit{request} ──────────►  place::submit
+  │                                                  record::reserve (O_EXCL)   ── records/<id>.reserved.json
+  │                                                  fork supervisor (setsid)
+  │                                                place::supervise
+  │                                                  execution::prepare
+  │                                                    lock::try_seat ── locks/seat.<key>   (refuse busy, named)
+  │                                                    lock::HostLease ── locks/host[.gate] (bounded wait)
+  │                                                    admission::admit / cap (§9 floor, seat cap)
+  │                                                    reset checkout, present [[ship]]   ── seats/<key>/checkout
+  │                                                  run::run_released (deadline absolute, §5)
+  │                                                    session owner: prepare → env → recipe → (result.json | result.error)
+  │                                                    copy output ── runs/<id>/output.log (capped)
+  │                                                    end/timeout/stop → custody: stop session (§7)
+  │                                                    collect hook, artifacts (§8)  ── runs/<id>/artifacts.tar
+  │                                                  run::verdict: first terminal fact (§5)
+  │                                                  record::finalize (once)   ── records/<id>.json
+transport::follow ◄── output.log by offset ──────  place::follow
+transport::complete ◄── final record ───────────  place::print_record
+  │   artifacts::fetch, verify per file
+  ▼
+receipt::save ── <repo>/.ferry/receipts/<id>.json (submitted → final)
+```
+
+A dropped caller changes nothing on the place: the supervisor runs to the
+final record, and `ferry record <id>` completes the receipt later.
+
+## Modules
+
+| Module | Owns | SPEC |
+|---|---|---|
+| `main` | The CLI; builds a caller's receipt; maps any error to 125. | §4 |
+| `config` | `ferry.toml`, `machines.toml`, catalogs; routing; path and env rules. | §10 |
+| `repository` | Exact commits from git or jj; committed declarations; git helpers. | §2, §10 |
+| `transport` | The caller's side: ssh options, ship, submit, follow, stop, record, retire. | §6 |
+| `place` | The place's verbs and the supervisor; the place record (`HostResult`). | §5, §6 |
+| `execution` | The request; prepare (locks, admission, checkout reset, ship); debug fault points. | §5, §9 |
+| `run` | The session: spawn with locks inherited, deadline loop, output copier, verdict. | §3, §5 |
+| `custody` | What a session stop left alive, as recorded evidence. | §7 |
+| `lock` | Seat lock and host lease (shared or exclusive) as inherited flock files. | §3, §5 |
+| `record` | Reserve, finalize once, reconcile a lost supervisor; busy-holder naming. | §8 |
+| `receipt` | The caller's receipt, digests, run ids, capabilities. | §8 |
+| `admission` | Host policy: disk floor, per-seat cap, and every delete in a seat (contained, same device). | §9 |
+| `seats` | The caller's seat book and `ferry seats prune`. | §9 |
+| `artifacts` | Collect and hash at the place; fetch and verify at the caller. | §8 |
+| `limits` | Every timing and size bound, shared with the tests. | §5 |
+
+## Rules the code keeps
+
+- **One record per run.** Only `record::finalize` writes a final record, and
+  only once; a lost supervisor is reconciled to `lost` exactly once.
+- **The verdict is the first terminal fact** (`run::verdict`): a later fact
+  is a note, never a new verdict.
+- **Locks live as long as the work.** The session inherits the seat lock and
+  host lease; release is `close()`, after the final record.
+- **Refuse before effect.** A refusal (125) happens before anything runs or is
+  deleted. A seat's contents are deleted only by `admission::remove`, which
+  re-proves containment and never crosses a device.
+- **Records parse across versions.** Fields a place writes in a shape that
+  may change (`custody`, `admission`, `pruned`, `artifacts`) are kept as the
+  JSON it wrote, and read where they are used.
+- **Every fallible point has a fault point** (`execution::fail_at`, debug
+  builds only) and a control that injects it.

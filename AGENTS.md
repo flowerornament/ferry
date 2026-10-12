@@ -98,8 +98,8 @@ its own reviewed change.
 ## Documents
 
 - **Living documents** are at the root in capitals and are kept true to the
-  code: README, AGENTS, PRINCIPLES, RELEASE (later REFERENCE and
-  ARCHITECTURE). `SPEC.md` is the normative end state that M1 converges
+  code: README, AGENTS, PRINCIPLES, RELEASE, ARCHITECTURE (where SPEC's
+  model lives in the code; later REFERENCE). `SPEC.md` is the normative end state that M1 converges
   on: every slice cites the SPEC sections it implements, and a change to the
   target amends SPEC first, in its own reviewed change. Change them in the same commit as the behaviour they
   describe.
