@@ -610,9 +610,8 @@ fn run_session(
         // Not reaped here: the stop still signals the session by its id.
         if owner.leader_exited() {
             // Its own error when it left one (SPEC §5), else only the fact.
-            let error = fs::read_to_string(result_path.with_extension("error"));
-            return Err(error
-                .unwrap_or_else(|_| "session owner exited without result".into())
+            return Err(owner_error(&result_path)
+                .unwrap_or_else(|| "session owner exited without result".into())
                 .into());
         }
         thread::sleep(Duration::from_millis(20));
@@ -683,13 +682,31 @@ fn copy_output(mut pipe: std::io::PipeReader, log: &RunLog) {
     }
 }
 
+/// The most of an owner's error a record carries: a failed hook's error
+/// includes its stderr, which can be long or hold what it was given.
+const OWNER_ERROR_CAP: usize = 4096;
+
 /// The session owner's error, written beside its result (`result.error`,
 /// SPEC §9) before it exits, so the record gives the cause, not only that
-/// it exited. Best effort: without it the record says the owner exited.
+/// it exited: capped, and renamed into place whole. Best effort: without it
+/// the record says the owner exited.
 pub fn left_error(result: &Path, error: &dyn std::error::Error) {
-    if !fail_at("owner-error") {
-        let _ = fs::write(result.with_extension("error"), error.to_string());
+    if fail_at("owner-error") {
+        return;
     }
+    let mut text = error.to_string();
+    if text.len() > OWNER_ERROR_CAP {
+        text.truncate(text.floor_char_boundary(OWNER_ERROR_CAP));
+        text.push_str(" … (truncated)");
+    }
+    let tmp = result.with_extension("error.tmp");
+    let _ = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, result.with_extension("error")));
+}
+
+/// The error the owner left, if it left any text.
+fn owner_error(result: &Path) -> Option<String> {
+    let text = fs::read_to_string(result.with_extension("error")).ok()?;
+    (!text.trim().is_empty()).then_some(text)
 }
 
 pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
@@ -764,7 +781,20 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ended, verdict};
+    use super::{Ended, owner_error, verdict};
+
+    /// An empty `result.error` (a full disk, a kill mid-write) is no error:
+    /// the record then says the owner exited, never an empty reason.
+    #[test]
+    fn an_empty_owner_error_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = dir.path().join("result.json");
+        assert_eq!(owner_error(&result), None);
+        std::fs::write(result.with_extension("error"), " \n").unwrap();
+        assert_eq!(owner_error(&result), None);
+        std::fs::write(result.with_extension("error"), "boom").unwrap();
+        assert_eq!(owner_error(&result).as_deref(), Some("boom"));
+    }
     use crate::receipt::Outcome;
 
     #[test]

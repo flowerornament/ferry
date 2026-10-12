@@ -484,6 +484,28 @@ fn a_session_owners_error_is_the_records_reason() {
     }
 }
 
+/// An owner error carrying a hook's long stderr is capped in the record.
+#[test]
+fn a_long_owner_error_is_capped() {
+    let dir = fixture();
+    let hook = dir.path().join("environment");
+    let noisy = "#!/bin/sh\nhead -c 100000 /dev/zero | tr '\\0' x >&2\nexit 1\n";
+    fs::write(&hook, noisy).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let toml = "version=1\n[hooks]\nenv='environment'\n[recipe.pass]\ncommand=['true']\n";
+    fs::write(dir.path().join("ferry.toml"), toml).unwrap();
+    git(dir.path(), &["add", "ferry.toml", "environment"]);
+    git(dir.path(), &["commit", "-m", "noisy env hook"]);
+    let record = receipt(&run(dir.path(), &["run", "pass", "--local", "--json"]));
+    assert_eq!(record["outcome"], "refused", "{record}");
+    let reason = record["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("xxxx") && reason.ends_with("(truncated)"),
+        "{reason}"
+    );
+    assert!(reason.len() < 5000, "{} bytes", reason.len());
+}
+
 #[test]
 fn environment_hook_cannot_replace_ferry_owned_mirror_configuration() {
     let dir = fixture();
@@ -1929,7 +1951,7 @@ fn a_failed_stop_names_the_places_error() {
     let out = run(dir.path(), &["stop", &id]);
     assert_eq!(out.status.code(), Some(125));
     let said = String::from_utf8_lossy(&out.stderr);
-    assert!(said.contains("expected"), "{said}");
+    assert!(said.contains("at line 1 column"), "{said}");
 }
 
 #[test]

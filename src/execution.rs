@@ -311,6 +311,7 @@ fn present_ship(bare: &Path, seat: &Path, request: &Request) -> Result<()> {
     let git = |args: &[&str]| repository::git(seat, args);
     // Exit 1 is "none made yet"; any other failure would leave last run's
     // refs in the checkout, so it refuses (`ship-refs` injects one).
+    // `--no-type` is the default, there to give the injection its slot.
     let kind = if fail_at("ship-refs") {
         "--type=injected"
     } else {
