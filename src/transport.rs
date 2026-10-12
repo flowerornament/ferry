@@ -571,11 +571,6 @@ pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) {
     note(&mut record.reason, left);
 }
 
-/// Writes the run's output as the place logs it, from offset 0, reconnecting
-/// from the bytes received after any drop. Output is written by its own
-/// thread, so a stalled stdout never keeps this loop from a signal. The
-/// first signal asks the place to stop the run; from then on the run's
-/// record, not its output, decides when this ends. A second signal leaves.
 /// Ends this follow's own child, by its handle, and leaves `how`.
 fn leave(child: &mut std::process::Child, how: Followed) -> Followed {
     let _ = child.kill();
@@ -583,6 +578,11 @@ fn leave(child: &mut std::process::Child, how: Followed) -> Followed {
     how
 }
 
+/// Writes the run's output as the place logs it, from offset 0, reconnecting
+/// from the bytes received after any drop. Output is written by its own
+/// thread, so a stalled stdout never keeps this loop from a signal. The
+/// first signal asks the place to stop the run; from then on the run's
+/// record, not its output, decides when this ends. A second signal leaves.
 fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Followed> {
     let offset = std::sync::Arc::new(AtomicU64::new(0));
     let mut contact = std::time::Instant::now();

@@ -51,9 +51,10 @@ pub struct HostResult {
     /// As the place wrote it, for the same reason as `custody`.
     #[serde(default)]
     pub admission: Option<serde_json::Value>,
-    /// What the per-seat cap wiped at this run's start (SPEC §9).
+    /// What the per-seat cap wiped at this run's start (SPEC §9), as the
+    /// place wrote it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pruned: Option<crate::admission::Pruned>,
+    pub pruned: Option<serde_json::Value>,
     /// What reached `output.log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<crate::run::Output>,
@@ -250,15 +251,17 @@ fn existing(root: &Path, request: &Request) -> Option<u32> {
     (done.token == request.token).then_some(0)
 }
 
-/// Records admission as JSON, as the place writes it (an older shape must
-/// always parse), what the cap pruned, and the notes prepare left when no
-/// run took them (a refusal after the cap).
+/// Records admission and what the cap pruned as JSON, as the place writes
+/// them (an older shape must always parse), and the notes prepare left when
+/// no run took them (a refusal after the cap).
 fn record_admission(result: &mut HostResult, admission: Option<crate::admission::Admission>) {
     for after in crate::run::take_notes() {
         note(&mut result.reason, after);
     }
     let mut admission = admission;
-    result.pruned = admission.as_mut().and_then(|a| a.pruned.take());
+    result.pruned = admission
+        .as_mut()
+        .and_then(|a| serde_json::to_value(a.pruned.take()?).ok());
     result.admission = admission.and_then(|admission| serde_json::to_value(admission).ok());
 }
 
