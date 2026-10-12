@@ -76,7 +76,7 @@ pub fn validate(request: &Request) -> Result<()> {
     for value in [&request.id, &request.token, &request.seat] {
         identifier(value)?;
     }
-    if request.commit.len() != 40 || !request.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !repository::is_commit(&request.commit) {
         return Err("invalid commit".into());
     }
     for shipped in &request.ship {
@@ -85,7 +85,7 @@ pub fn validate(request: &Request) -> Result<()> {
             (None, Some(url)) if !url.is_empty() && !url.contains(['\n', '\0']) => {}
             _ => return Err("invalid ship entry".into()),
         }
-        if shipped.commit.len() != 40 || !shipped.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !repository::is_commit(&shipped.commit) {
             return Err("invalid ship commit".into());
         }
     }
@@ -107,13 +107,13 @@ pub fn validate(request: &Request) -> Result<()> {
     }
     Ok(request.hooks.check()?)
 }
-/// Writes one line to stdout, never panicking. False if it could not.
-pub fn emit(line: &[u8]) -> bool {
+/// Writes one line to stdout, never panicking; a closed stdout is ignored.
+pub fn emit(line: &[u8]) {
     let mut out = std::io::stdout().lock();
-    out.write_all(line)
+    let _ = out
+        .write_all(line)
         .and_then(|()| out.write_all(b"\n"))
-        .and_then(|()| out.flush())
-        .is_ok()
+        .and_then(|()| out.flush());
 }
 
 /// Writes a diagnostic line to stderr, ignoring a closed stderr.
@@ -146,6 +146,20 @@ pub fn fail_at(point: &str) -> bool {
     {
         let _ = point;
         false
+    }
+}
+
+/// Debug builds only: a bound a control set in the environment variable
+/// `name`, so it can reach a limit quickly. Release builds never read it.
+pub fn debug_bound<T: std::str::FromStr>(name: &str) -> Option<T> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var(name).ok()?.parse().ok()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+        None
     }
 }
 
@@ -200,7 +214,7 @@ pub fn prepare(
     // A busy seat refuses at once, naming the run that holds it (SPEC §5).
     pause_at(
         "seat-try",
-        &root.join("runs").join(&request.id).join("seat"),
+        &crate::record::run_dir(root, &request.id).join("seat"),
     );
     let path = root.join("locks").join(format!("seat.{}", request.seat));
     let Some(seat) = crate::lock::try_seat(&path, &request.id)? else {

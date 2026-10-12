@@ -179,10 +179,6 @@ fn session_list(sid: u32) -> Result<Vec<i32>> {
     if fail_at("session-list") {
         return Err("session-list: injected by FERRY_FAIL_AT".into());
     }
-    session_members(sid)
-}
-
-pub fn session_members(sid: u32) -> Result<Vec<i32>> {
     Ok(process_ids()?
         .into_iter()
         .filter(|pid| {
@@ -275,8 +271,7 @@ pub fn attempted(root: &Path, request: &Request) -> bool {
         .exists()
 }
 
-/// The verdict, decided once by the first terminal fact (README, Detached
-/// runs, output and the verdict):
+/// The verdict, decided once by the first terminal fact (SPEC §5):
 /// - a recipe that reached its result, or timed out, keeps that verdict
 ///   whatever happened later; a later signal is only noted;
 /// - a signal (a `stop`, or one sent to the supervisor) before the result
@@ -380,7 +375,7 @@ pub fn run_released(
 /// Runs the recipe session, then the collect hook's. `locks` are the seat
 /// lock and host lease descriptors: each session inherits them, so they stay
 /// held while the session lives even if this supervisor is killed.
-pub fn run(
+fn run(
     root: &Path,
     workdir: &Path,
     request: &Request,
@@ -392,7 +387,7 @@ pub fn run(
     // the recipe nor the collect hook.
     pause_at(
         "prepare-pause",
-        &root.join("runs").join(&request.id).join("spawn"),
+        &crate::record::run_dir(root, &request.id).join("spawn"),
     );
     if stop.load(Ordering::SeqCst) {
         return (Ok(Ended::Stopped), None, Output::default());
@@ -430,20 +425,16 @@ fn collect(
     log: &RunLog,
 ) -> Collection {
     let mut collection = match run_collect(root, workdir, request, hook, outcome, locks, log) {
-        Ok((code, false)) => Collection {
+        Ok((code, timed_out)) => Collection {
             exit_code: Some(code),
-            error: None,
-        },
-        Ok((code, true)) => Collection {
-            exit_code: Some(code),
-            error: Some("collection timed out".into()),
+            error: timed_out.then(|| "collection timed out".into()),
         },
         Err(error) => Collection {
             exit_code: None,
             error: Some(error.to_string()),
         },
     };
-    let path = root.join("runs").join(&request.id).join("collection.json");
+    let path = crate::record::run_dir(root, &request.id).join("collection.json");
     let written = if fail_at("collection-write") {
         Err(std::io::Error::other("injected by FERRY_FAIL_AT"))
     } else {
@@ -469,44 +460,42 @@ fn run_collect(
     locks: &[&fs::File],
     log: &RunLog,
 ) -> Result<(i32, bool)> {
-    {
-        let mut collect = request.clone();
-        collect.id = receipt::run_id()?;
-        collect.hooks.prepare = None;
-        collect.hooks.collect = None;
-        collect.args.clear();
-        collect.recipe.command = vec![
-            "env".into(),
-            format!(
-                "FERRY_EXIT_CODE={}",
-                match outcome {
-                    Ok(Ended::Result(code)) => *code,
-                    Ok(Ended::Timeout) => 124,
-                    _ => 125,
-                }
-            ),
-            workdir
-                .join(hook)
-                .to_str()
-                .ok_or("non-UTF-8 collect path")?
-                .to_owned(),
-        ];
-        collect.timeout_seconds = Some(COLLECT_TIMEOUT.as_secs());
-        // Collection has its own bounded session after recipe teardown, including
-        // timeout or preparation failure. Never reinterpret the recipe verdict.
-        match run_session(
-            root,
-            workdir,
-            &collect,
-            &AtomicBool::new(false),
-            locks,
-            log,
-            u128::MAX,
-        )? {
-            Ended::Result(code) => Ok((code, false)),
-            Ended::Timeout => Ok((124, true)),
-            Ended::Stopped => Err("collection stopped".into()),
-        }
+    let mut collect = request.clone();
+    collect.id = receipt::run_id()?;
+    collect.hooks.prepare = None;
+    collect.hooks.collect = None;
+    collect.args.clear();
+    collect.recipe.command = vec![
+        "env".into(),
+        format!(
+            "FERRY_EXIT_CODE={}",
+            match outcome {
+                Ok(Ended::Result(code)) => *code,
+                Ok(Ended::Timeout) => 124,
+                _ => 125,
+            }
+        ),
+        workdir
+            .join(hook)
+            .to_str()
+            .ok_or("non-UTF-8 collect path")?
+            .to_owned(),
+    ];
+    collect.timeout_seconds = Some(COLLECT_TIMEOUT.as_secs());
+    // Collection has its own bounded session after recipe teardown, including
+    // timeout or preparation failure. Never reinterpret the recipe verdict.
+    match run_session(
+        root,
+        workdir,
+        &collect,
+        &AtomicBool::new(false),
+        locks,
+        log,
+        u128::MAX,
+    )? {
+        Ended::Result(code) => Ok((code, false)),
+        Ended::Timeout => Ok((124, true)),
+        Ended::Stopped => Err("collection stopped".into()),
     }
 }
 
@@ -560,7 +549,7 @@ pub enum Ended {
 type RunLog = Arc<std::sync::Mutex<Option<(fs::File, Output)>>>;
 
 fn open_log(root: &Path, request: &Request) -> Result<RunLog> {
-    let run_dir = root.join("runs").join(&request.id);
+    let run_dir = crate::record::run_dir(root, &request.id);
     fs::create_dir_all(&run_dir)?;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -581,7 +570,7 @@ fn run_session(
     log: &RunLog,
     deadline_ms: u128,
 ) -> Result<Ended> {
-    let run_dir = root.join("runs").join(&request.id);
+    let run_dir = crate::record::run_dir(root, &request.id);
     fs::create_dir_all(&run_dir)?;
     let spec = run_dir.join("request.json");
     fs::write(&spec, serde_json::to_vec(request)?)?;
@@ -656,14 +645,7 @@ fn is_zero(n: &u64) -> bool {
 /// The output cap; debug builds read `FERRY_OUTPUT_CAP` so a control can
 /// reach it quickly.
 fn output_cap() -> u64 {
-    #[cfg(debug_assertions)]
-    if let Some(cap) = std::env::var("FERRY_OUTPUT_CAP")
-        .ok()
-        .and_then(|cap| cap.parse().ok())
-    {
-        return cap;
-    }
-    crate::limits::OUTPUT_CAP
+    crate::execution::debug_bound("FERRY_OUTPUT_CAP").unwrap_or(crate::limits::OUTPUT_CAP)
 }
 
 /// The one writer of a run's output: copies a session's pipe into the log

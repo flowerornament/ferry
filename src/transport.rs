@@ -264,7 +264,7 @@ impl Place<'_> {
     fn read(&self, id: &str, name: &str) -> Result<Vec<u8>> {
         config::identifier(id)?;
         match self {
-            Place::Local(state) => Ok(fs::read(state.join("runs").join(id).join(name))?),
+            Place::Local(state) => Ok(fs::read(crate::record::run_dir(state, id).join(name))?),
             Place::Remote(machine) => repository::output(ssh(&machine.ssh)?.arg(format!(
                 "cat {}/runs/{id}/{name}",
                 crate::place::REMOTE_ROOT
@@ -576,6 +576,13 @@ pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) {
 /// thread, so a stalled stdout never keeps this loop from a signal. The
 /// first signal asks the place to stop the run; from then on the run's
 /// record, not its output, decides when this ends. A second signal leaves.
+/// Ends this follow's own child, by its handle, and leaves `how`.
+fn leave(child: &mut std::process::Child, how: Followed) -> Followed {
+    let _ = child.kill();
+    let _ = child.wait();
+    how
+}
+
 fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Followed> {
     let offset = std::sync::Arc::new(AtomicU64::new(0));
     let mut contact = std::time::Instant::now();
@@ -625,25 +632,18 @@ fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Fo
             }
             match &stopping {
                 Some((signal, again)) if again.load(Ordering::SeqCst) => {
-                    // Its own child, by its handle.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(Followed::Left(*signal));
+                    return Ok(leave(&mut child, Followed::Left(*signal)));
                 }
                 Some(_) if checked.elapsed() >= Duration::from_secs(1) => {
                     checked = std::time::Instant::now();
                     if is_final(place, record)? {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(Followed::Final);
+                        return Ok(leave(&mut child, Followed::Final));
                     }
                 }
                 Some(_) => {}
                 None => match &ended {
                     Some(again) if again.load(Ordering::SeqCst) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(Followed::Final);
+                        return Ok(leave(&mut child, Followed::Final));
                     }
                     Some(_) => {}
                     None => {
@@ -660,9 +660,7 @@ fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Fo
                                         "ferry: stopping run {}: {error}",
                                         record.id
                                     ));
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                    return Ok(Followed::NotStopped);
+                                    return Ok(leave(&mut child, Followed::NotStopped));
                                 }
                             }
                         }
@@ -693,14 +691,8 @@ fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Fo
 /// How long a caller keeps trying a place that does not answer; debug
 /// builds read `FERRY_UNREACHABLE_MS` so a control can reach it quickly.
 fn unreachable() -> Duration {
-    #[cfg(debug_assertions)]
-    if let Some(ms) = std::env::var("FERRY_UNREACHABLE_MS")
-        .ok()
-        .and_then(|ms| ms.parse().ok())
-    {
-        return Duration::from_millis(ms);
-    }
-    crate::limits::UNREACHABLE
+    execution::debug_bound("FERRY_UNREACHABLE_MS")
+        .map_or(crate::limits::UNREACHABLE, Duration::from_millis)
 }
 
 fn stop_reason(signal: i32) -> String {

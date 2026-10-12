@@ -43,6 +43,18 @@ pub struct Release {
     pub error: Option<String>,
 }
 
+impl Default for Release {
+    /// A run that spawned no session stopped nothing and left nothing.
+    fn default() -> Self {
+        let survivors = Survivors::Listed(vec![]);
+        Self {
+            tier: "session".into(),
+            survivors,
+            error: None,
+        }
+    }
+}
+
 /// What this run's session stops found (recipe, then collect).
 static FOUND: Mutex<Option<Release>> = Mutex::new(None);
 
@@ -59,35 +71,22 @@ pub fn note(stopped: Stopped) {
     let Ok(mut found) = FOUND.lock() else {
         return;
     };
-    let release = found.get_or_insert_with(|| Release {
-        tier: "session".into(),
-        survivors: Survivors::Listed(vec![]),
-        error: None,
-    });
+    let release = found.get_or_insert_with(Release::default);
     match (stopped.survivors, &mut release.survivors) {
         (Some(more), Survivors::Listed(list)) => list.extend(more),
         (Some(_), Survivors::Unknown(_)) => {}
         (None, _) => release.survivors = Survivors::Unknown(Unknown::Unknown),
     }
     if !stopped.errors.is_empty() {
-        let error = stopped.errors.join("; ");
-        release.error = Some(match release.error.take() {
-            Some(before) => format!("{before}; {error}"),
-            None => error,
-        });
+        crate::receipt::note(&mut release.error, stopped.errors.join("; "));
     }
 }
 
-/// The run's custody, taken once at its end. A run that spawned no session
-/// stopped nothing and left nothing.
+/// The run's custody, taken once at its end.
 pub fn take() -> Release {
     FOUND
         .lock()
         .ok()
         .and_then(|mut found| found.take())
-        .unwrap_or(Release {
-            tier: "session".into(),
-            survivors: Survivors::Listed(vec![]),
-            error: None,
-        })
+        .unwrap_or_default()
 }

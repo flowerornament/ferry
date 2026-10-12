@@ -70,19 +70,18 @@ fn available(root: &Path) -> Result<u64> {
 /// `admission` is filled as far as the decision got, refused or not.
 pub fn admit(root: &Path, admission: &mut Admission) -> Result<()> {
     admission.result = "refused".into();
-    let Some(path) = policy_path() else {
-        admission.policy = Some("not-configured".into());
-        admission.result = "admitted".into();
-        return Ok(());
-    };
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let read = policy_path().map(|path| (fs::read(&path), path));
+    let (bytes, path) = match read {
+        Some((Ok(bytes), path)) => (bytes, path),
+        Some((Err(error), path)) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("host policy {}: {error}", path.display()).into());
+        }
+        // No policy file: not configured, and the run proceeds.
+        _ => {
             admission.policy = Some("not-configured".into());
             admission.result = "admitted".into();
             return Ok(());
         }
-        Err(error) => return Err(format!("host policy {}: {error}", path.display()).into()),
     };
     admission.policy = Some(serde_json::json!({
         "path": path.display().to_string(),
@@ -320,6 +319,11 @@ pub fn cap(
             None => true,
         })
         .collect();
+    let stamped = |bytes: Option<u64>| -> Result<()> {
+        fs::create_dir_all(root.join("seats").join(seat))?;
+        let measured = serde_json::json!({"ms": now, "bytes": bytes});
+        Ok(fs::write(&stamp, measured.to_string())?)
+    };
     let dev = fs::metadata(root)?.dev();
     let until = std::time::Instant::now() + MEASURE_LIMIT;
     let Some(bytes) = paths
@@ -331,11 +335,7 @@ pub fn cap(
             "seat cap: not measured: over {MEASURE_LIMIT:?}; not wiped"
         ));
         // Stamped all the same, so the next try is an hour away.
-        fs::create_dir_all(root.join("seats").join(seat))?;
-        fs::write(
-            &stamp,
-            serde_json::json!({"ms": now, "bytes": null}).to_string(),
-        )?;
+        stamped(None)?;
         return Ok(None);
     };
     let over = bytes > cap;
@@ -350,9 +350,7 @@ pub fn cap(
             }
         }
     }
-    fs::create_dir_all(root.join("seats").join(seat))?;
-    let measured = serde_json::json!({"ms": now, "bytes": if over { 0 } else { bytes }});
-    fs::write(&stamp, measured.to_string())?;
+    stamped(Some(if over { 0 } else { bytes }))?;
     Ok(over.then_some(Pruned { bytes, cap }))
 }
 

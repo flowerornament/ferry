@@ -62,6 +62,10 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 pub fn git_at(git_dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     output(Command::new("git").arg("--git-dir").arg(git_dir).args(args))
 }
+/// A full commit id: 40 hexadecimal digits.
+pub fn is_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
 /// A command's output as trimmed text.
 fn text(bytes: Vec<u8>) -> Result<String> {
     Ok(String::from_utf8(bytes)?.trim().to_owned())
@@ -109,7 +113,7 @@ pub fn commit(root: &Path, revision: Option<&str>) -> Result<String> {
             &["rev-parse", "--verify", "--end-of-options", &revision],
         )?)?
     };
-    if value.len() != 40 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_commit(&value) {
         return Err(Refusal::Declaration("invalid commit identity".into()).into());
     }
     Ok(value)
@@ -133,7 +137,7 @@ pub fn source_commit(root: &Path, source: &crate::config::Source) -> Result<Stri
         &dir,
         &["rev-parse", "--verify", "--end-of-options", &reference],
     )?)?;
-    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_commit(&value) {
         return Err(Refusal::Declaration("invalid tracking commit identity".into()).into());
     }
     let kind = git_at(&dir, &["cat-file", "-t", &value])?;

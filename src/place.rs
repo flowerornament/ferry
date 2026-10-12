@@ -51,10 +51,9 @@ pub struct HostResult {
     /// As the place wrote it, for the same reason as `custody`.
     #[serde(default)]
     pub admission: Option<serde_json::Value>,
-    /// What the per-seat cap wiped at this run's start (SPEC §9), as the
-    /// place wrote it.
+    /// What the per-seat cap wiped at this run's start (SPEC §9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pruned: Option<serde_json::Value>,
+    pub pruned: Option<crate::admission::Pruned>,
     /// What reached `output.log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<crate::run::Output>,
@@ -98,10 +97,6 @@ pub fn root(state: Option<PathBuf>) -> Result<PathBuf> {
     state
         .or_else(|| home.map(|home| home.join(REMOTE_ROOT)))
         .ok_or_else(|| "HOME missing".into())
-}
-
-fn run_dir(root: &Path, id: &str) -> PathBuf {
-    root.join("runs").join(id)
 }
 
 /// Prints one JSON reply line.
@@ -203,7 +198,7 @@ pub fn submit(root: &Path) -> Result<i32> {
         std::process::exit(70);
     }
     let released = (|| -> Result<()> {
-        let dir = run_dir(root, &request.id);
+        let dir = record::run_dir(root, &request.id);
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("request.json"), serde_json::to_vec(&request)?)?;
         let mut go = supervisor.stdin.take().ok_or("no supervisor stdin")?;
@@ -234,11 +229,7 @@ pub fn submit(root: &Path) -> Result<i32> {
 /// `FERRY_DEADLINE_MS` (from submit), so a control can make the deadline,
 /// not the timeout, end a run.
 fn deadline_ms(submitted_ms: u128, request: &Request) -> u128 {
-    #[cfg(debug_assertions)]
-    if let Some(ms) = std::env::var("FERRY_DEADLINE_MS")
-        .ok()
-        .and_then(|ms| ms.parse::<u128>().ok())
-    {
+    if let Some(ms) = execution::debug_bound::<u128>("FERRY_DEADLINE_MS") {
         return submitted_ms + ms;
     }
     submitted_ms
@@ -250,27 +241,24 @@ fn deadline_ms(submitted_ms: u128, request: &Request) -> u128 {
 /// The supervisor's pid of a run this request already started (0 once it
 /// is final): its own caller retrying gets that run, never a second one.
 fn existing(root: &Path, request: &Request) -> Option<u32> {
-    let records = root.join("records");
-    if let Ok(bytes) = fs::read(records.join(format!("{}.reserved.json", request.id))) {
+    if let Ok(bytes) = fs::read(record::reserved_path(root, &request.id)) {
         let reservation: record::Reservation = serde_json::from_slice(&bytes).ok()?;
         return (reservation.token == request.token).then_some(reservation.supervisor.pid);
     }
-    let bytes = fs::read(records.join(format!("{}.json", request.id))).ok()?;
+    let bytes = fs::read(record::final_path(root, &request.id)).ok()?;
     let done: HostResult = serde_json::from_slice(&bytes).ok()?;
     (done.token == request.token).then_some(0)
 }
 
-/// Records admission and what the cap pruned as JSON, as the place writes
-/// them (an older shape must always parse), and the notes prepare left when
-/// no run took them (a refusal after the cap).
+/// Records admission as JSON, as the place writes it (an older shape must
+/// always parse), what the cap pruned, and the notes prepare left when no
+/// run took them (a refusal after the cap).
 fn record_admission(result: &mut HostResult, admission: Option<crate::admission::Admission>) {
     for after in crate::run::take_notes() {
         note(&mut result.reason, after);
     }
     let mut admission = admission;
-    result.pruned = admission
-        .as_mut()
-        .and_then(|a| serde_json::to_value(a.pruned.take()?).ok());
+    result.pruned = admission.as_mut().and_then(|a| a.pruned.take());
     result.admission = admission.and_then(|admission| serde_json::to_value(admission).ok());
 }
 
@@ -284,7 +272,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         // Submit never released it: leave without effect.
         return Ok(0);
     }
-    let dir = run_dir(root, id);
+    let dir = record::run_dir(root, id);
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -293,9 +281,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     let mut request: Request = serde_json::from_slice(&fs::read(dir.join("request.json"))?)?;
     let stop = execution::stopped()?;
     let mut result = HostResult::refused(&request)?;
-    let reservation: record::Reservation = serde_json::from_slice(&fs::read(
-        root.join("records").join(format!("{id}.reserved.json")),
-    )?)?;
+    let reservation: record::Reservation =
+        serde_json::from_slice(&fs::read(record::reserved_path(root, id))?)?;
     // One wait budget for all the run's locks, from its submit (SPEC §5).
     request.waits_end_ms = Some(reservation.submitted_ms + request.wait().as_millis());
     let deadline = deadline_ms(reservation.submitted_ms, &request);
@@ -349,8 +336,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     )
     .unwrap_or_else(|_| Err("supervisor panicked".into()));
     record_admission(&mut result, admission);
-    // One verdict, from the first terminal fact (`run::verdict`). A stop's
-    // signal is the first stop's, whatever arrived after it.
+    // One verdict, from the first terminal fact (SPEC §5). A stop's signal is
+    // the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
     let (outcome, exit_code, reason) = crate::run::verdict(
         &executed.map_err(|error| error.to_string()),
@@ -400,7 +387,7 @@ fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut H
     if request.recipe.artifacts.is_empty() {
         return;
     }
-    let output = run_dir(root, &request.id).join("artifacts.tar");
+    let output = record::run_dir(root, &request.id).join("artifacts.tar");
     match crate::artifacts::collect(seat, &request.recipe.artifacts, &output) {
         Ok(()) => {
             let digest = if execution::fail_at("artifact-digest") {
@@ -421,11 +408,11 @@ fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut H
 /// every byte written before that is sent, or until its reader is gone.
 /// Exit 0 at the end, 4 for a run this place never had.
 pub fn follow(root: &Path, id: &str, offset: u64) -> Result<i32> {
-    let reserved = root.join("records").join(format!("{id}.reserved.json"));
+    let reserved = record::reserved_path(root, id);
     if !reserved.exists() && record::reconcile(root, id)?.is_none() {
         return Ok(4);
     }
-    let path = run_dir(root, id).join("output.log");
+    let path = record::run_dir(root, id).join("output.log");
     let mut sent = offset;
     let mut out = std::io::stdout().lock();
     let mut buffer = vec![0u8; 64 << 10];
@@ -486,20 +473,15 @@ pub fn stop(
     other: bool,
     signal: i32,
 ) -> Result<i32> {
-    let signal = nix::sys::signal::Signal::try_from(signal)?;
-    if ![
-        nix::sys::signal::Signal::SIGINT,
-        nix::sys::signal::Signal::SIGTERM,
-        nix::sys::signal::Signal::SIGHUP,
-    ]
-    .contains(&signal)
-    {
+    use nix::sys::signal::Signal::{self, SIGHUP, SIGINT, SIGTERM};
+    let signal = Signal::try_from(signal)?;
+    if !matches!(signal, SIGINT | SIGTERM | SIGHUP) {
         return Ok(refuse(
             "a stop sends INT, TERM or HUP",
             "stop with one of them",
         ));
     }
-    let path = root.join("records").join(format!("{id}.reserved.json"));
+    let path = record::reserved_path(root, id);
     let Ok(bytes) = fs::read(&path) else {
         return Ok(refuse(
             &format!("run {id} is not running here"),
@@ -535,7 +517,7 @@ pub fn stop(
         Err("stop-write: injected by FERRY_FAIL_AT".into())
     } else {
         record::write_new(
-            &run_dir(root, id).join("stop.json"),
+            &record::run_dir(root, id).join("stop.json"),
             stopped.to_string().as_bytes(),
             None,
         )
@@ -545,7 +527,7 @@ pub fn stop(
     // died between recording and signalling.
     let signal = match written {
         Ok(()) => signal,
-        Err(error) => match first_stop_signal(&run_dir(root, id)) {
+        Err(error) => match first_stop_signal(&record::run_dir(root, id)) {
             Some(first) => nix::sys::signal::Signal::try_from(first)?,
             None => {
                 return Ok(refuse(
@@ -639,7 +621,7 @@ pub fn print_record(root: &Path, id: &str) -> Result<i32> {
         execution::emit(&bytes);
         return Ok(0);
     }
-    match fs::read(root.join("records").join(format!("{id}.reserved.json"))) {
+    match fs::read(record::reserved_path(root, id)) {
         Ok(bytes) => {
             execution::emit(&bytes);
             Ok(3)

@@ -47,12 +47,17 @@ fn records(root: &Path) -> PathBuf {
     root.join("records")
 }
 
-fn reserved_path(root: &Path, id: &str) -> PathBuf {
+pub(crate) fn reserved_path(root: &Path, id: &str) -> PathBuf {
     records(root).join(format!("{id}.reserved.json"))
 }
 
-fn final_path(root: &Path, id: &str) -> PathBuf {
+pub(crate) fn final_path(root: &Path, id: &str) -> PathBuf {
     records(root).join(format!("{id}.json"))
+}
+
+/// A run's working files at the place: request, output, result, artifacts.
+pub(crate) fn run_dir(root: &Path, id: &str) -> PathBuf {
+    root.join("runs").join(id)
 }
 
 /// This boot's id: Linux `/proc/sys/kernel/random/boot_id`, macOS
@@ -237,22 +242,22 @@ fn reconcile_with(root: &Path, id: &str, boot: Option<&str>) -> Result<Option<Ve
 /// next run on that seat begins. Errors are left for the next reader.
 pub fn reconcile_seat(root: &Path, seat: &str) {
     let boot = boot_id();
-    let Ok(entries) = fs::read_dir(records(root)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(id) = name.strip_suffix(".reserved.json") else {
-            continue;
-        };
-        let belongs = fs::read(entry.path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Reservation>(&bytes).ok())
-            .is_some_and(|r| r.seat == seat);
-        if belongs {
-            let _ = reconcile_with(root, id, boot.as_deref());
-        }
+    for reservation in reservations(root, seat) {
+        let _ = reconcile_with(root, &reservation.id, boot.as_deref());
     }
+}
+
+/// The readable reservations of `seat` (a reservation file is named by its
+/// run's id, so `id` is its name).
+fn reservations(root: &Path, seat: &str) -> Vec<Reservation> {
+    fs::read_dir(records(root))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".reserved.json"))
+        .filter_map(|e| serde_json::from_slice::<Reservation>(&fs::read(e.path()).ok()?).ok())
+        .filter(|r| r.seat == seat)
+        .collect()
 }
 
 /// Why a seat is busy, from the run its lock file names and the seat's
@@ -270,14 +275,8 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     if !named.is_empty() {
         let _ = reconcile(root, named);
     }
-    let live: Vec<Reservation> = fs::read_dir(records(root))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".reserved.json"))
-        .filter_map(|e| serde_json::from_slice::<Reservation>(&fs::read(e.path()).ok()?).ok())
-        .filter(|r| r.seat == seat && r.id != own)
-        .collect();
+    let mut live = reservations(root, seat);
+    live.retain(|r| r.id != own);
     if let Some(run) = live.iter().find(|r| r.id == named) {
         let minutes = crate::receipt::now_ms().saturating_sub(run.submitted_ms) / 60_000;
         return format!(

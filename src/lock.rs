@@ -66,6 +66,7 @@ pub(crate) fn acquire_as(
     let ends_ms = request
         .waits_end_ms
         .unwrap_or_else(|| crate::receipt::now_ms() + request.wait().as_millis());
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
     let mut said = false;
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -86,14 +87,13 @@ pub(crate) fn acquire_as(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if crate::receipt::now_ms() >= ends_ms {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
                     // The holder's name is never cleared: the work inherits
                     // the lock and may outlive its run (SPEC §3).
                     let named = fs::read_to_string(path).unwrap_or_default();
                     let root = path.parent().and_then(Path::parent).unwrap_or(path);
                     crate::execution::pause_at(
                         "host-probe",
-                        &root.join("runs").join(&request.id).join("probe"),
+                        &crate::record::run_dir(root, &request.id).join("probe"),
                     );
                     return Err(format!(
                         "waited {:?} for lock {name}, the end of the run's wait: {}",
@@ -104,7 +104,6 @@ pub(crate) fn acquire_as(
                 }
                 if !said && started.elapsed() >= Duration::from_secs(3) {
                     said = true;
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
                     crate::execution::warn(&format!(
                         "ferry: waiting for lock {name}: another run holds it"
                     ));
