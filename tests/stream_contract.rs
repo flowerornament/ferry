@@ -2322,13 +2322,21 @@ fn locks_reach_the_recipe_but_not_the_supervisors_other_children() {
     assert!(out.status.success(), "{}", receipt(&out));
     let recipe = fs::read_to_string(&recipe_fds).unwrap();
     let git = fs::read_to_string(&log).unwrap_or_default();
+    // This run's own locks only: inside another Ferry run (a bench cell),
+    // every process here also inherits that run's locks, as it should.
+    let locks = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".ferry/local/v1/locks/");
+    let locks = locks.to_str().unwrap();
     assert!(
-        recipe.contains("/locks/"),
+        recipe.contains(locks),
         "the recipe did not inherit its locks"
     );
     assert!(!git.is_empty(), "the git wrapper never ran");
     assert!(
-        !git.contains("/locks/"),
+        !git.contains(locks),
         "a supervisor child inherited a lock:\n{git}"
     );
 }
