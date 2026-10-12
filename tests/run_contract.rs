@@ -1878,6 +1878,9 @@ fn a_local_failure_reading_the_final_record_leaves_the_receipt_submitted() {
     let record = receipt(&out);
     assert_eq!(out.status.code(), Some(255), "{record}");
     assert_eq!(record["state"], "submitted", "{record}");
+    // The place's own error, which it wrote only to stderr, is the cause.
+    let reason = record["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("record-read: injected"), "{record}");
     let id = record["id"].as_str().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .current_dir(dir.path())
@@ -1890,6 +1893,21 @@ fn a_local_failure_reading_the_final_record_leaves_the_receipt_submitted() {
     let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(record["state"], "final", "{record}");
     assert_eq!(record["outcome"], "ran-pass", "{record}");
+}
+
+/// A stop the place fails with nothing on stdout names the place's error,
+/// never an empty one: here its reservation cannot be read.
+#[test]
+fn a_failed_stop_names_the_places_error() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let records = dir.path().join(".ferry/local/v1/records");
+    fs::write(records.join(format!("{id}.reserved.json")), "not json").unwrap();
+    let out = run(dir.path(), &["stop", &id]);
+    assert_eq!(out.status.code(), Some(125));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("expected"), "{said}");
 }
 
 #[test]

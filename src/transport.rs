@@ -724,7 +724,16 @@ pub fn retire(place: &Place, key: &str) -> Result<serde_json::Value> {
     }
     let out = place.verb(&["retire", key])?.output()?;
     serde_json::from_slice(&out.stdout)
-        .map_err(|_| format!("retire gave no reply ({})", out.status).into())
+        .map_err(|_| format!("retire gave no reply ({})", failed(&out)).into())
+}
+
+/// How a place command failed: its exit status, and its stderr when it
+/// said something (an ssh failure or a place error is only there).
+fn failed(out: &std::process::Output) -> String {
+    match String::from_utf8_lossy(&out.stderr).trim() {
+        "" => out.status.to_string(),
+        said => format!("{}: {said}", out.status),
+    }
 }
 
 /// The key that identifies this caller's seat on a place: the caller's host,
@@ -769,6 +778,8 @@ pub fn stop(
     let reply = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if out.status.success() {
         Ok(reply)
+    } else if reply.is_empty() {
+        Err(failed(&out).into())
     } else {
         Err(reply.into())
     }
@@ -784,7 +795,7 @@ pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> 
         return Err(format!("run {} is not final yet", record.id).into());
     }
     if !out.status.success() {
-        return Err(format!("reading the record of run {}: {}", record.id, out.status).into());
+        return Err(format!("reading the record of run {}: {}", record.id, failed(&out)).into());
     }
     let result: crate::place::HostResult = serde_json::from_slice(&out.stdout)?;
     if Some(&result.token) != record.token.as_ref()
