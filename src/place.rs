@@ -24,7 +24,8 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// What the place reports at the end of a run, and keeps as its record.
-#[derive(Debug, Serialize, Deserialize)]
+/// Like a receipt, every construction names `outcome`, `exit_code`, `state`.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct HostResult {
     pub protocol: u32,
     pub token: String,
@@ -76,21 +77,11 @@ impl HostResult {
             commit: request.commit.clone(),
             outcome: Outcome::Refused,
             exit_code: 125,
-            reason: None,
+            state: None,
             binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
-            artifacts_sha256: None,
-            artifacts_error: None,
-            collection: None,
             source_rev: Some(receipt::source_rev()),
             exe: receipt::exe_path(),
-            custody: None,
-            lease: None,
-            admission: None,
-            pruned: None,
-            output: None,
-            deadline_ms: None,
-            stopped_by: None,
-            state: None,
+            ..Default::default()
         })
     }
 }

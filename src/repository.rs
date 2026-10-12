@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 pub struct Declaration {
     pub config: Config,
@@ -17,7 +18,7 @@ pub struct DeclarationEvidence {
     pub adapter_sha256: Option<String>,
     pub contract_sha256: Option<String>,
 }
-fn adapter(root: &Path, sha: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn adapter(root: &Path, sha: &str, path: &str) -> Result<Vec<u8>> {
     relative_path(path)?;
     let checkout = tempfile::tempdir()?;
     let mut archive = Command::new("git")
@@ -42,7 +43,7 @@ fn adapter(root: &Path, sha: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::e
     Ok(bytes)
 }
 
-pub fn output(command: &mut Command) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub fn output(command: &mut Command) -> Result<Vec<u8>> {
     let result = command.output()?;
     if !result.status.success() {
         return Err(Refusal::Declaration(format!(
@@ -53,29 +54,33 @@ pub fn output(command: &mut Command) -> Result<Vec<u8>, Box<dyn std::error::Erro
     }
     Ok(result.stdout)
 }
-pub fn root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Ok(bytes) = output(Command::new("jj").args(["root"])) {
-        return Ok(PathBuf::from(String::from_utf8(bytes)?.trim()));
-    }
-    Ok(PathBuf::from(
-        String::from_utf8(output(
-            Command::new("git").args(["rev-parse", "--show-toplevel"]),
-        )?)?
-        .trim(),
-    ))
+/// `git` run in `dir`, its working tree.
+pub fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    output(Command::new("git").current_dir(dir).args(args))
 }
-pub fn git_dir(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// `git` on the repository at `git_dir`.
+pub fn git_at(git_dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    output(Command::new("git").arg("--git-dir").arg(git_dir).args(args))
+}
+/// A command's output as trimmed text.
+fn text(bytes: Vec<u8>) -> Result<String> {
+    Ok(String::from_utf8(bytes)?.trim().to_owned())
+}
+pub fn root() -> Result<PathBuf> {
+    if let Ok(bytes) = output(Command::new("jj").args(["root"])) {
+        return Ok(PathBuf::from(text(bytes)?));
+    }
+    let top = output(Command::new("git").args(["rev-parse", "--show-toplevel"]))?;
+    Ok(PathBuf::from(text(top)?))
+}
+pub fn git_dir(root: &Path) -> Result<PathBuf> {
     if root.join(".jj").exists() {
-        return Ok(PathBuf::from(
-            String::from_utf8(output(
-                Command::new("jj").current_dir(root).args(["git", "root"]),
-            )?)?
-            .trim(),
-        ));
+        let dir = output(Command::new("jj").current_dir(root).args(["git", "root"]))?;
+        return Ok(PathBuf::from(text(dir)?));
     }
     Ok(root.join(".git"))
 }
-pub fn commit(root: &Path, revision: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+pub fn commit(root: &Path, revision: Option<&str>) -> Result<String> {
     if revision.is_some_and(|value| value.starts_with('-')) {
         return Err("revision cannot be a command option".into());
     }
@@ -98,40 +103,24 @@ pub fn commit(root: &Path, revision: Option<&str>) -> Result<String, Box<dyn std
         }
         lines[0].split_whitespace().next().unwrap_or("").to_owned()
     } else {
-        String::from_utf8(output(Command::new("git").current_dir(root).args([
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{}^{{commit}}", revision.unwrap_or("HEAD")),
-        ]))?)?
-        .trim()
-        .into()
+        let revision = format!("{}^{{commit}}", revision.unwrap_or("HEAD"));
+        text(git(
+            root,
+            &["rev-parse", "--verify", "--end-of-options", &revision],
+        )?)?
     };
     if value.len() != 40 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Refusal::Declaration("invalid commit identity".into()).into());
     }
     Ok(value)
 }
-pub fn committed_file(
-    root: &Path,
-    sha: &str,
-    path: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub fn committed_file(root: &Path, sha: &str, path: &str) -> Result<Vec<u8>> {
     relative_path(path)?;
-    let dir = git_dir(root)?;
-    output(
-        Command::new("git")
-            .arg("--git-dir")
-            .arg(dir)
-            .args(["show", &format!("{sha}:{path}")]),
-    )
+    git_at(&git_dir(root)?, &["show", &format!("{sha}:{path}")])
 }
 
 /// Resolve once without fetching, peeling tags, or substituting a local branch.
-pub fn source_commit(
-    root: &Path,
-    source: &crate::config::Source,
-) -> Result<String, Box<dyn std::error::Error>> {
+pub fn source_commit(root: &Path, source: &crate::config::Source) -> Result<String> {
     let published = match source {
         crate::config::Source::Revision(revision) => return commit(root, Some(revision)),
         crate::config::Source::Published(published) => published,
@@ -140,25 +129,14 @@ pub fn source_commit(
     let reference = format!("refs/remotes/{}/{}", published.remote, published.branch);
     ref_name(&reference)?;
     let dir = git_dir(root)?;
-    let value = String::from_utf8(output(
-        Command::new("git").arg("--git-dir").arg(&dir).args([
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &reference,
-        ]),
-    )?)?
-    .trim()
-    .to_owned();
+    let value = text(git_at(
+        &dir,
+        &["rev-parse", "--verify", "--end-of-options", &reference],
+    )?)?;
     if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Refusal::Declaration("invalid tracking commit identity".into()).into());
     }
-    let kind = output(
-        Command::new("git")
-            .arg("--git-dir")
-            .arg(&dir)
-            .args(["cat-file", "-t", &value]),
-    )?;
+    let kind = git_at(&dir, &["cat-file", "-t", &value])?;
     if kind != b"commit\n" {
         return Err(Refusal::Declaration("tracking ref must name a commit object".into()).into());
     }
@@ -225,16 +203,7 @@ pub fn declaration(
         return Err(Refusal::Declaration("unsupported ferry.toml version".into()).into());
     }
     crate::config::retired([&config.companion_refs, &config.mirror])?;
-    for hook in [
-        &config.hooks.prepare,
-        &config.hooks.env,
-        &config.hooks.collect,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        relative_path(hook)?;
-    }
+    config.hooks.check()?;
     let recipes = if let Some(catalog) = &config.catalog {
         if !config.recipe.is_empty() {
             return Err(Refusal::Declaration(

@@ -101,26 +101,11 @@ pub fn validate(request: &Request) -> Result<()> {
     if request.args.iter().any(|arg| arg.contains('\0')) {
         return Err("invalid recipe argument".into());
     }
-    if request.forwarded_env.iter().any(|(name, value)| {
-        name.is_empty()
-            || name.contains(['=', '\0'])
-            || value.contains('\0')
-            || name.starts_with("FERRY_")
-            || name == "GIT_CONFIG_GLOBAL"
-    }) {
+    let mut forwarded = request.forwarded_env.iter();
+    if forwarded.any(|(name, value)| crate::config::invalid_env(name, value)) {
         return Err("invalid forwarded environment".into());
     }
-    for hook in [
-        &request.hooks.prepare,
-        &request.hooks.env,
-        &request.hooks.collect,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        crate::config::relative_path(hook)?;
-    }
-    Ok(())
+    Ok(request.hooks.check()?)
 }
 /// Writes one line to stdout, never panicking. False if it could not.
 pub fn emit(line: &[u8]) -> bool {
@@ -256,11 +241,10 @@ pub fn prepare(
         }
     }
     let bare = root.join("store/repo.git");
-    repository::output(Command::new("git").arg("--git-dir").arg(&bare).args([
-        "cat-file",
-        "-e",
-        &format!("{}^{{commit}}", request.commit),
-    ]))?;
+    repository::git_at(
+        &bare,
+        &["cat-file", "-e", &format!("{}^{{commit}}", request.commit)],
+    )?;
     let seat = root.join("seats").join(&request.seat).join("checkout");
     fs::create_dir_all(seat.parent().ok_or("invalid seat")?)?;
     if !seat.exists() {
@@ -277,55 +261,28 @@ pub fn prepare(
 }
 
 fn reset_checkout(seat: &Path, request: &Request) -> Result<()> {
+    let git = |args: &[&str]| repository::git(seat, args);
     // Check index flags BEFORE resetting: reset would conceal tampering.
-    let index = repository::output(
-        Command::new("git")
-            .current_dir(seat)
-            .args(["ls-files", "-v"]),
-    )?;
+    let index = git(&["ls-files", "-v"])?;
     if index.split(|b| *b == b'\n').any(|line| {
         line.first()
             .is_some_and(|b| b.is_ascii_lowercase() || *b == b'S')
     }) {
         return Err("hidden index entries".into());
     }
-    repository::output(Command::new("git").current_dir(seat).args([
-        "checkout",
-        "--force",
-        "--detach",
-        &request.commit,
-    ]))?;
+    git(&["checkout", "--force", "--detach", &request.commit])?;
     let mut clean = Command::new("git");
     clean.current_dir(seat).args(["clean", "-ffdx"]);
     for path in &request.preserve {
-        repository::output(Command::new("git").current_dir(seat).args([
-            "check-ignore",
-            "--no-index",
-            "--",
-            &format!("{path}/"),
-        ]))?;
-        if !repository::output(
-            Command::new("git")
-                .current_dir(seat)
-                .args(["ls-files", "--", path]),
-        )?
-        .is_empty()
-        {
+        git(&["check-ignore", "--no-index", "--", &format!("{path}/")])?;
+        if !git(&["ls-files", "--", path])?.is_empty() {
             return Err("preserve path contains tracked files".into());
         }
         clean.args(["-e", &format!("/{path}/")]);
     }
     repository::output(&mut clean)?;
-    let head = repository::output(
-        Command::new("git")
-            .current_dir(seat)
-            .args(["rev-parse", "HEAD"]),
-    )?;
-    let status = repository::output(Command::new("git").current_dir(seat).args([
-        "status",
-        "--porcelain",
-        "--untracked-files=all",
-    ]))?;
+    let head = git(&["rev-parse", "HEAD"])?;
+    let status = git(&["status", "--porcelain", "--untracked-files=all"])?;
     if String::from_utf8(head)?.trim() != request.commit || !status.is_empty() {
         return Err("checkout integrity failed".into());
     }
@@ -337,7 +294,7 @@ fn reset_checkout(seat: &Path, request: &Request) -> Result<()> {
 /// own config lists them, so the list lives and dies with the seat); each
 /// `url` entry served from the store through the checkout's git config.
 fn present_ship(bare: &Path, seat: &Path, request: &Request) -> Result<()> {
-    let git = |args: &[&str]| repository::output(Command::new("git").current_dir(seat).args(args));
+    let git = |args: &[&str]| repository::git(seat, args);
     let made = git(&["config", "--local", "--get-all", "ferry.ref"]).unwrap_or_default();
     for name in String::from_utf8(made)?.lines() {
         if !request.ship.iter().any(|s| s.name.as_deref() == Some(name)) {
@@ -368,12 +325,7 @@ fn present_ship(bare: &Path, seat: &Path, request: &Request) -> Result<()> {
                 fs::write(served.join("objects/info/alternates"), alternates)?;
             }
             let branch = format!("refs/heads/ferry/ship/{}", shipped.commit);
-            let mut serve = Command::new("git");
-            serve
-                .arg("--git-dir")
-                .arg(&served)
-                .args(["update-ref", &branch, &shipped.commit]);
-            repository::output(&mut serve)?;
+            repository::git_at(&served, &["update-ref", &branch, &shipped.commit])?;
             repository::output(
                 Command::new("git")
                     .args(["config", "--add", "--file"])

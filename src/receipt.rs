@@ -57,11 +57,12 @@ pub fn exe_path() -> Option<String> {
         .map(|path| path.display().to_string())
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
     RanPass,
     RanFail,
+    #[default]
     Refused,
     Lost,
     Timeout,
@@ -69,7 +70,9 @@ pub enum Outcome {
     Stopped,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Every construction names `outcome`, `exit_code` and `state`, so a
+/// forgotten field never silently means refused, 0 or no state.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Receipt {
     pub protocol: u32,
     pub id: String,

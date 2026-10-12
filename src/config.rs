@@ -136,10 +136,7 @@ impl Environment {
             }
         }
         if !self.forwards.is_disjoint(&self.local)
-            || self
-                .forwards
-                .iter()
-                .any(|name| name.starts_with("FERRY_") || name == "GIT_CONFIG_GLOBAL")
+            || self.forwards.iter().any(|name| reserved(name))
         {
             return Err(Refusal::Declaration(
                 "conflicting environment declarations".into(),
@@ -328,6 +325,24 @@ pub fn identifier(value: &str) -> Result<(), Refusal> {
         )));
     }
     Ok(())
+}
+/// A name only Ferry sets: the run's identity and its git configuration.
+pub fn reserved(name: &str) -> bool {
+    name.starts_with("FERRY_") || name == "GIT_CONFIG_GLOBAL"
+}
+/// An environment entry a run never takes from a caller or a hook.
+pub fn invalid_env(name: &str, value: &str) -> bool {
+    name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') || reserved(name)
+}
+impl Hooks {
+    /// Every hook is a plain relative path inside the checkout.
+    pub fn check(&self) -> Result<(), Refusal> {
+        let hooks = [&self.prepare, &self.env, &self.collect];
+        hooks
+            .into_iter()
+            .flatten()
+            .try_for_each(|hook| relative_path(hook))
+    }
 }
 pub fn relative_path(value: &str) -> Result<(), Refusal> {
     if value.is_empty()

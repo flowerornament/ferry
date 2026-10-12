@@ -736,14 +736,10 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
     if let Some(hook) = &request.hooks.env {
         let bytes = repository::output(Command::new(workdir.join(hook)).envs(&env))?;
         let additions: BTreeMap<String, String> = serde_json::from_slice(&bytes)?;
-        if additions.iter().any(|(k, v)| {
-            k.is_empty()
-                || k.contains(['=', '\0'])
-                || v.contains('\0')
-                || k.starts_with("FERRY_")
-                || k == "GIT_CONFIG_GLOBAL"
-                || request.forwarded_env.contains_key(k)
-        }) {
+        if additions
+            .iter()
+            .any(|(k, v)| crate::config::invalid_env(k, v) || request.forwarded_env.contains_key(k))
+        {
             return Err("invalid hook environment".into());
         }
         env.extend(additions);
