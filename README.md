@@ -340,6 +340,10 @@ or prepares its seat) runs none of them, collect included: nothing ran.
   seat's is `checkout`). A stable per-seat identity is `FERRY_SEAT`, the
   same value the pre-M1 slot directory was named after; `FERRY_ID` is per
   run.
+- **Sockets:** keep Unix sockets out of the checkout. A remote seat's path
+  (`~/.local/state/ferry/v1/seats/<key>/checkout`) is about 82 bytes on
+  bench, and a socket path is limited to 107: put sockets under `/tmp` or
+  a short `$XDG_RUNTIME_DIR` path instead.
 - **Reserved:** `FERRY_*` and `GIT_CONFIG_GLOBAL`. A hook cannot replace the
   run's identity or the seat-local git configuration that serves shipped
   URLs.

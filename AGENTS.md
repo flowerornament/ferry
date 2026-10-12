@@ -10,12 +10,13 @@ Current extraction is tracked on Herald's herald-4e6mw bead.
 
 `just check` runs Rust formatting, Clippy and contract tests. Changes to transport
 require real execution controls for exact commits, refusal versus recipe exit,
-slot isolation, and session cleanup on client loss.
+seat isolation, and session cleanup on client loss.
 
 ## Structure
 
-One Rust crate builds one binary: `ferry run` and `ferry host-run`. Murail's
-reviewed transport 8ba36cfa is a behavioral spec, not a second implementation.
+One Rust crate builds one binary, `ferry`: callers use `ferry run` and its
+siblings, and a place answers the `ferry place …` verbs over ssh. `SPEC.md`
+is the behavioural target.
 Project-specific environment and artifact handling are hooks,
 not branches in Ferry. Recipe requirements have one home in the project catalog.
 

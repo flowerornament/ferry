@@ -121,9 +121,12 @@ or Murail.
    <bench-ssh> <commit>`. Bench is the only place callers reach over ssh
    (the Mac's `machines.toml` lists only `host.bench`); the Mac's place is
    the local route, the caller's own binary, so it moves with step 4. From
-   here until step 4, a pre-M1 caller is refused with 125 naming
-   the place's revision (it may push into the old root's store first: see
-   above). A new caller refuses an old place, which is why places go first.
+   here until step 4, a pre-M1 caller's run ends Lost (255) with nothing
+   run: it invokes `host-run`, which M1 removed, and reads the unknown-verb
+   error as a lost place (it may push into the old root's store first: see
+   above). Expect it and don't retry; the caller moves in step 4. Only the
+   other direction is a typed 125: a new caller refuses an old place, naming
+   its revision, which is why places go first.
 4. **Callers and Herald together:**
    - the Mac caller's Nix configuration pins `<commit>` and is switched;
      `scripts/ferry-install verify-caller <commit>` checks it;
