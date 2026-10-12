@@ -93,7 +93,7 @@ pub fn validate(request: &Request) -> Result<()> {
         return Err("empty command".into());
     }
     // Before anything touches the disk: the cap deletes under these paths
-    // (slice 5 review S2; checked again where it deletes).
+    // (and checks them again where it deletes).
     for path in &request.preserve {
         preserve_path(path)?;
     }
@@ -136,8 +136,6 @@ pub fn warn(message: &str) {
     let _ = writeln!(std::io::stderr().lock(), "{message}");
 }
 
-/// Debug builds only: whether a control asked this fallible point to fail
-/// (`FERRY_FAIL_AT=<point>[,<point>…]`). Release builds never read it.
 /// Debug builds, `FERRY_FAIL_AT=<point>`: mark `<at>.paused` and wait (at
 /// most 60 s) for `<at>.go`, so a control can act inside a window.
 pub fn pause_at(point: &str, at: &Path) {
@@ -152,6 +150,8 @@ pub fn pause_at(point: &str, at: &Path) {
     }
 }
 
+/// Debug builds only: whether a control asked this fallible point to fail
+/// (`FERRY_FAIL_AT=<point>[,<point>…]`). Release builds never read it.
 pub fn fail_at(point: &str) -> bool {
     #[cfg(debug_assertions)]
     {
@@ -218,13 +218,13 @@ pub fn prepare(
         &root.join("runs").join(&request.id).join("seat"),
     );
     let path = root.join("locks").join(format!("seat.{}", request.seat));
-    let Some(lease) = crate::lock::try_seat(&path, &request.id)? else {
+    let Some(seat) = crate::lock::try_seat(&path, &request.id)? else {
         let named = fs::read_to_string(&path).unwrap_or_default();
         return Err(crate::record::busy(root, &request.seat, &request.id, named.trim()).into());
     };
     // Each lock goes to the supervisor as soon as it is taken, so no later
     // refusal here closes it before the record is final.
-    held.seat = Some(lease);
+    held.seat = Some(seat);
     held.host = Some(crate::lock::HostLease::acquire(
         root,
         request,
@@ -238,7 +238,7 @@ pub fn prepare(
     let admitted = admission.get_or_insert_with(Default::default);
     if let Some(cap) = admitted.seat_cap_bytes {
         // Not when the run has spent its wait budget: measuring would eat
-        // into its recipe's time (review P2).
+        // into its recipe's time.
         let spent = request
             .waits_end_ms
             .is_some_and(|end| receipt::now_ms() >= end);
@@ -356,7 +356,7 @@ fn present_ship(bare: &Path, seat: &Path, request: &Request) -> Result<()> {
             // Served from a bare repository of this run's own (the checkout
             // reset removes it): it borrows the store's objects and holds
             // only this run's declared commits as branches, so a recipe sees
-            // no other project's entries (the critic's L1 on slice 6).
+            // no other project's entries.
             let served = seat.join(".ferry/ship.git");
             if !served.exists() {
                 repository::output(

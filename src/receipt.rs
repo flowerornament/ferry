@@ -113,16 +113,14 @@ pub struct Receipt {
     pub host_source_rev: Option<String>,
     #[serde(default)]
     pub host_exe: Option<String>,
-    /// What the session left behind at release; null when it never released.
+    /// What the session left behind at release (SPEC §7); null when it never
+    /// released. Kept as the place wrote it, so an older shape still parses.
     #[serde(default)]
-    /// The place's custody record, as it was (its shape changed in slice
-    /// 4b; a receipt keeps what its place wrote).
     pub custody: Option<serde_json::Value>,
     /// The host lease the session held: `shared` or `exclusive`, and its wait.
     #[serde(default)]
     pub lease: Option<crate::lock::Lease>,
-    /// The host's disk admission, as its place wrote it (its shape changed
-    /// in slice 4b).
+    /// The host's disk admission, kept as its place wrote it, like `custody`.
     #[serde(default)]
     pub admission: Option<serde_json::Value>,
     /// What the per-seat cap wiped at the run's start (SPEC §9), as the

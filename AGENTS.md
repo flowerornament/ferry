@@ -10,7 +10,7 @@ Current extraction is tracked on Herald's herald-4e6mw bead.
 
 `just check` runs Rust formatting, Clippy and contract tests. Changes to transport
 require real execution controls for exact commits, refusal versus recipe exit,
-seat isolation, and session cleanup on client loss.
+seat isolation, and session stop at the run's end or deadline.
 
 ## Structure
 

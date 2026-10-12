@@ -145,8 +145,8 @@ pub struct HostInfo {
     pub protocol: u32,
     pub binary_sha256: String,
     pub os_arch: String,
-    /// Not read here; emitted because every caller before slice 7 requires
-    /// it, so it parses this reply and refuses naming the revision (§12.11).
+    /// Not read here; emitted because callers older than the v1 root require
+    /// it, so they parse this reply and refuse naming the revision (§12.11).
     #[serde(default)]
     pub cores: usize,
     #[serde(default)]
@@ -421,8 +421,7 @@ fn kept(commit: &str) -> String {
 }
 
 /// Initializes the place's store, again if it exists (harmless). Two first
-/// runs may race on its config lock, so a failure is retried a few times
-/// (the critic's L2 on slice 6).
+/// runs may race on its config lock, so a failure is retried a few times.
 fn init_store(command: &mut Command) -> Result<()> {
     let mut tries = 0;
     loop {
@@ -534,7 +533,7 @@ enum Followed {
 pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) {
     let id = record.id.clone();
     // After the place accepted the run, only its final record decides: any
-    // other failure leaves the receipt submitted (A3, rule B).
+    // other failure leaves the receipt submitted (SPEC §4, §5).
     let followed = follow(root, place, record, json);
     let left = match followed {
         Ok(Followed::Final) => match complete(root, place, record) {
@@ -565,7 +564,7 @@ pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) {
             execution::signal_name(signal)
         ),
     };
-    // No verdict is claimed while the run may go on (SPEC §4, A3).
+    // No verdict is claimed while the run may go on (SPEC §4).
     record.state = Some("submitted".into());
     record.outcome = Outcome::Lost;
     record.exit_code = 255;

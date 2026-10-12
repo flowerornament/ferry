@@ -82,7 +82,8 @@ pub fn record(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()
 /// Whether the workspace is provably gone: its name is absent from a parent
 /// directory that can be listed and is on the device recorded with it.
 /// Anything else (a denied or failed lookup, a missing parent, another
-/// device) cannot prove it, and the seat is kept (slice 5 review P1-b).
+/// device) cannot prove it, and the seat is kept: retiring a live
+/// workspace's seat would destroy its warm state.
 fn gone(line: &Line) -> std::result::Result<bool, String> {
     let path = Path::new(&line.repo_path);
     match fs::symlink_metadata(path) {

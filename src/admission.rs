@@ -9,9 +9,8 @@
 //!   wiped at run start and runs cold (SPEC §9).
 //!
 //! Anything else (malformed TOML, another version, an unknown key) refuses.
-//! Eviction (version 2) is gone with the idle records it read (slice 4b);
-//! seats are bounded instead by `ferry seats prune` and `seat_cap_bytes`
-//! (SPEC §9, slice 5).
+//! Seats are bounded by `ferry seats prune` and `seat_cap_bytes` (SPEC §9),
+//! not by evicting idle seats.
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -143,11 +142,11 @@ pub struct Pruned {
 
 /// How often a seat is measured against its cap: a walk of a large cache
 /// costs seconds, and growth per run is bounded, so the cap may be exceeded
-/// by at most this long of runs (coordinator, ferry-xtx.10 Q3).
+/// by at most this long of runs.
 const MEASURE_EVERY_MS: u128 = 60 * 60 * 1000;
 
 /// The longest a seat's measurement may take before the cap gives up for
-/// this run (review P2): it runs before the recipe, inside its deadline.
+/// this run: it runs before the recipe, inside its deadline.
 const MEASURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Bytes of regular files under `path` on device `dev`, never following
@@ -180,7 +179,8 @@ fn size_until(path: &Path, until: Option<std::time::Instant>, dev: u64) -> Optio
 /// provably lies inside: every component a plain name, and none on the way a
 /// symbolic link, by `lstat`, never following one. A path that ends early
 /// is absent, so there is nothing to touch, and that is inside. Anything
-/// that cannot be inspected is outside (slice 5 review P1-a).
+/// that cannot be inspected is outside: deleting needs proof, not absence of
+/// evidence.
 pub fn outside(root: &Path, rel: &Path) -> Option<String> {
     let root_meta =
         fs::metadata(root).map_err(|e| format!("{} cannot be inspected: {e}", root.display()));

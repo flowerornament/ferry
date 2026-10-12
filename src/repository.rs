@@ -306,7 +306,7 @@ pub fn declaration(
 
 pub fn ref_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !name.starts_with("refs/") {
-        return Err("companion ref must be fully qualified".into());
+        return Err("ship ref must be fully qualified".into());
     }
     output(Command::new("git").args(["check-ref-format", name]))?;
     Ok(())

@@ -42,7 +42,7 @@ pub struct HostResult {
     #[serde(default)]
     pub exe: Option<String>,
     /// Kept as the place wrote it: a record of an older shape must always
-    /// parse, or `ferry record` could never complete its run (4b's review R3).
+    /// parse, or `ferry record` could never complete its run.
     #[serde(default)]
     pub custody: Option<serde_json::Value>,
     #[serde(default)]
@@ -269,10 +269,9 @@ fn existing(root: &Path, request: &Request) -> Option<u32> {
     (done.token == request.token).then_some(0)
 }
 
-/// Runs a submitted request to its final record, detached from any client.
 /// Records admission and what the cap pruned as JSON, as the place writes
-/// them (an older shape must always parse: 4b's review R3), and the notes
-/// prepare left when no run took them (a refusal after the cap).
+/// them (an older shape must always parse), and the notes prepare left when
+/// no run took them (a refusal after the cap).
 fn record_admission(result: &mut HostResult, admission: Option<crate::admission::Admission>) {
     for after in crate::run::take_notes() {
         note(&mut result.reason, after);
@@ -324,11 +323,11 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
                 !execution::fail_at("supervise-panic"),
                 "injected by FERRY_FAIL_AT"
             );
-            let (Some(lease), Some(host_lease)) = (&held.seat, &held.host) else {
+            let (Some(lock), Some(host_lease)) = (&held.seat, &held.host) else {
                 return Err("prepare returned without its locks".into());
             };
             // The work inherits both, on every platform (SPEC §3).
-            let locks: Vec<_> = std::iter::once(lease).chain(host_lease.files()).collect();
+            let locks: Vec<_> = std::iter::once(lock).chain(host_lease.files()).collect();
             let finished = crate::run::run_released(root, &seat, &request, &stop, &locks, deadline);
             if let Some(error) = &finished.custody.error {
                 note(
@@ -358,7 +357,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     )
     .unwrap_or_else(|_| Err("supervisor panicked".into()));
     record_admission(&mut result, admission);
-    // One verdict, from the first terminal fact (Rule B). A stop's signal is
+    // One verdict, from the first terminal fact (SPEC §5). A stop's signal is
     // the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
     let (outcome, exit_code, reason) = crate::run::verdict(
@@ -583,8 +582,8 @@ fn first_stop_signal(dir: &Path) -> Option<i32> {
 pub const RETIRING: &str = "retiring";
 
 /// Retires a seat whose caller's workspace is gone (SPEC §6, §9): tries its
-/// lock once; held → refused, naming the holder; free → deletes its slot and
-/// cache under the lock and records `records/retired-<key>.json`. The lock
+/// lock once; held → refused, naming the holder; free → deletes its seat
+/// directory (checkout and cache) under the lock and records `records/retired-<key>.json`. The lock
 /// file itself is never removed: unlinking a held flock file would let a new
 /// run lock a fresh file of the same name beside it.
 pub fn retire(root: &Path, key: &str) -> Result<i32> {

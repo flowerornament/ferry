@@ -81,7 +81,7 @@ impl SessionOwner {
     /// `STOP_GRACE` for them to leave, KILL, then up to `KILL_GRACE` for them
     /// to be gone, killing again whatever is left. It never gives up early:
     /// an error on the way is kept, and the stop goes on to the KILL and the
-    /// leader's reaping (4b review R4).
+    /// leader's reaping: giving up would leave members running unrecorded.
     fn stop(&mut self) -> crate::custody::Stopped {
         self.stopped = true;
         let sid = self.child.id();
@@ -130,7 +130,7 @@ impl SessionOwner {
         let survivors = match left {
             // A member whose start cannot be read is dropped only on proven
             // absence; otherwise it is kept without a start, and the error
-            // noted (R6).
+            // noted.
             Ok(pids) => Some(
                 pids.into_iter()
                     .filter_map(|pid| {
@@ -222,7 +222,7 @@ fn process_ids() -> Result<Vec<i32>> {
 }
 
 // Read from /proc, not by running `ps`: a subprocess could hang and stall
-// the stop past every bound (the critic's P2 on d502ae21). A /proc that
+// the stop past every bound. A /proc that
 // cannot be read is a listing failure, which takes the group fallback.
 #[cfg(not(target_os = "macos"))]
 fn process_ids() -> Result<Vec<i32>> {
@@ -275,7 +275,7 @@ pub fn attempted(root: &Path, request: &Request) -> bool {
         .exists()
 }
 
-/// The verdict, decided once by the first terminal fact (Rule B):
+/// The verdict, decided once by the first terminal fact (SPEC §5):
 /// - a recipe that reached its result, or timed out, keeps that verdict
 ///   whatever happened later; a later signal is only noted;
 /// - a signal (a `stop`, or one sent to the supervisor) before the result
@@ -326,7 +326,7 @@ pub(crate) fn take_notes() -> Vec<String> {
 }
 
 /// What a supervised run came to. Custody is always present once a session
-/// may have been spawned (S8).
+/// may have been spawned: an unrecorded stop could hide survivors.
 pub struct Finished {
     pub executed: Result<Ended>,
     pub collection: Option<Collection>,
