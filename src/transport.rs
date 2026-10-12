@@ -533,7 +533,7 @@ enum Followed {
 pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) {
     let id = record.id.clone();
     // After the place accepted the run, only its final record decides: any
-    // other failure leaves the receipt submitted (SPEC §4, §5).
+    // other failure leaves the receipt submitted (SPEC §4, §8).
     let followed = follow(root, place, record, json);
     let left = match followed {
         Ok(Followed::Final) => match complete(root, place, record) {

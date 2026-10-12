@@ -283,6 +283,7 @@ fn record_admission(result: &mut HostResult, admission: Option<crate::admission:
     result.admission = admission.and_then(|admission| serde_json::to_value(admission).ok());
 }
 
+/// Runs a submitted request to its final record, detached from any client.
 pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     // Its own session, no terminal: nothing the client's session does
     // reaches it.
@@ -357,8 +358,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     )
     .unwrap_or_else(|_| Err("supervisor panicked".into()));
     record_admission(&mut result, admission);
-    // One verdict, from the first terminal fact (SPEC §5). A stop's signal is
-    // the first stop's, whatever arrived after it.
+    // One verdict, from the first terminal fact (`run::verdict`). A stop's
+    // signal is the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
     let (outcome, exit_code, reason) = crate::run::verdict(
         &executed.map_err(|error| error.to_string()),
@@ -583,9 +584,10 @@ pub const RETIRING: &str = "retiring";
 
 /// Retires a seat whose caller's workspace is gone (SPEC §6, §9): tries its
 /// lock once; held → refused, naming the holder; free → deletes its seat
-/// directory (checkout and cache) under the lock and records `records/retired-<key>.json`. The lock
-/// file itself is never removed: unlinking a held flock file would let a new
-/// run lock a fresh file of the same name beside it.
+/// directory (checkout and cache) under the lock and records
+/// `records/retired-<key>.json`. The lock file itself is never removed:
+/// unlinking a held flock file would let a new run lock a fresh file of the
+/// same name beside it.
 pub fn retire(root: &Path, key: &str) -> Result<i32> {
     crate::config::identifier(key)?;
     let lock = root.join("locks").join(format!("seat.{key}"));

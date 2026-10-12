@@ -275,7 +275,8 @@ pub fn attempted(root: &Path, request: &Request) -> bool {
         .exists()
 }
 
-/// The verdict, decided once by the first terminal fact (SPEC §5):
+/// The verdict, decided once by the first terminal fact (README, Detached
+/// runs, output and the verdict):
 /// - a recipe that reached its result, or timed out, keeps that verdict
 ///   whatever happened later; a later signal is only noted;
 /// - a signal (a `stop`, or one sent to the supervisor) before the result
