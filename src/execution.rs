@@ -309,8 +309,20 @@ fn reset_checkout(seat: &Path, request: &Request) -> Result<()> {
 /// `url` entry served from the store through the checkout's git config.
 fn present_ship(bare: &Path, seat: &Path, request: &Request) -> Result<()> {
     let git = |args: &[&str]| repository::git(seat, args);
-    let made = git(&["config", "--local", "--get-all", "ferry.ref"]).unwrap_or_default();
-    for name in String::from_utf8(made)?.lines() {
+    // Exit 1 is "none made yet"; any other failure would leave last run's
+    // refs in the checkout, so it refuses (`ship-refs` injects one).
+    let kind = if fail_at("ship-refs") {
+        "--type=injected"
+    } else {
+        "--no-type"
+    };
+    let list = ["config", "--local", kind, "--get-all", "ferry.ref"];
+    let made = Command::new("git").current_dir(seat).args(list).output()?;
+    if !made.status.success() && made.status.code() != Some(1) {
+        let said = String::from_utf8_lossy(&made.stderr);
+        return Err(format!("listing last run's shipped refs: {}", said.trim()).into());
+    }
+    for name in String::from_utf8(made.stdout)?.lines() {
         if !request.ship.iter().any(|s| s.name.as_deref() == Some(name)) {
             repository::ref_name(name)?;
             git(&["update-ref", "-d", name])?;

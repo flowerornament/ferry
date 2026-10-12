@@ -458,6 +458,10 @@ fn a_session_owners_error_is_the_records_reason() {
             "session owner exited without result",
         ),
     ] {
+        // Injection exists only in debug builds.
+        if !fail_at.is_empty() && !cfg!(debug_assertions) {
+            continue;
+        }
         let dir = fixture();
         let hook = dir.path().join("prepare");
         fs::write(&hook, format!("#!/bin/sh\n{prepare}\n")).unwrap();
@@ -841,7 +845,8 @@ fn a_shipped_url_is_served_from_the_store_at_its_exact_commit() {
 }
 
 /// A ref a run shipped is gone from the seat when a later run there does
-/// not ship it; the seat clone's own config lists what Ferry made.
+/// not ship it; the seat clone's own config lists what Ferry made, and a
+/// list that cannot be read refuses.
 #[test]
 fn a_ref_no_longer_shipped_is_removed_from_the_seat() {
     let dir = fixture();
@@ -877,6 +882,23 @@ fn a_ref_no_longer_shipped_is_removed_from_the_seat() {
         .output()
         .unwrap();
     assert!(!left.status.success(), "the old ref is still in the seat");
+    // A list that cannot be read refuses: going on could keep a stale ref.
+    // (Injection exists only in debug builds.)
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let out = command(dir.path())
+        .env("FERRY_FAIL_AT", "ship-refs")
+        .args(["run", "pass", "--local", "--json"])
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "refused", "{record}");
+    let reason = record["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("listing last run's shipped refs"),
+        "{record}"
+    );
 }
 
 /// The keys `[[ship]]` replaced refuse, naming it, from ferry.toml and from a
