@@ -790,6 +790,7 @@ pub fn stop(
 /// that ran, which a later install on the place does not change. Artifacts
 /// are fetched and checked.
 pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> {
+    use crate::artifacts::{self, Artifact, Kind, Status};
     let out = place.verb(&["record", &record.id])?.output()?;
     if out.status.code() == Some(3) {
         return Err(format!("run {} is not final yet", record.id).into());
@@ -826,31 +827,43 @@ pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> 
     {
         note(&mut record.reason, format!("seat book: {error}"));
     }
-    if let Some(error) = result.artifacts_error {
-        note(
-            &mut record.reason,
-            format!("artifact collection failed: {error}"),
-        );
-    }
-    // The verdict is the place's; a failed transfer of its artifacts is a
-    // note on it, never a reason to withhold it.
-    if let Some(expected) = result.artifacts_sha256 {
-        let fetched = (|| -> Result<()> {
-            let destination = root.join(".ferry/runs").join(&record.id);
-            fs::create_dir_all(&destination)?;
-            let archive = destination.join("artifacts.tar");
-            fs::write(&archive, place.read(&record.id, "artifacts.tar")?)?;
-            if receipt::file_digest(&archive)? != expected {
-                return Err("artifact transfer integrity failed".into());
-            }
-            crate::artifacts::unpack(&archive, &destination)
-        })();
-        if let Err(error) = fetched {
-            note(
-                &mut record.reason,
-                format!("artifacts not fetched: {error}"),
-            );
+    // The verdict is the place's; its artifacts have their own status
+    // (SPEC §8), and only files that status vouches for stay on disk.
+    let status = result
+        .artifacts_status
+        .map(serde_json::from_value::<Status>)
+        .transpose();
+    let listed = result
+        .artifacts
+        .map(serde_json::from_value::<Vec<Artifact>>)
+        .transpose();
+    record.artifacts_status = Some(match (status, listed, result.artifacts_sha256) {
+        (Err(e), ..) | (_, Err(e), _) => {
+            artifacts::failed(Kind::Archive, None, format!("unreadable: {e}"))
         }
-    }
+        (Ok(Some(status)), ..) => status,
+        (Ok(None), Ok(Some(listed)), Some(_)) => {
+            let archive = if execution::fail_at("artifact-transfer") {
+                Err("artifact-transfer: injected by FERRY_FAIL_AT".into())
+            } else {
+                place.read(&record.id, "artifacts.tar")
+            };
+            let destination = root.join(".ferry/runs").join(&record.id);
+            let status = artifacts::fetch(archive, &listed, &destination);
+            if status == Status::Fetched {
+                record.artifacts = listed;
+            }
+            status
+        }
+        // A place before per-file artifacts sends no list or status.
+        (Ok(None), Ok(_), _) => {
+            let why = "the place predates per-file artifacts: install the same ferry on both ends";
+            artifacts::failed(
+                Kind::Collection,
+                None,
+                result.artifacts_error.as_deref().unwrap_or(why),
+            )
+        }
+    });
     Ok(())
 }

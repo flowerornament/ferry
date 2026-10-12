@@ -130,6 +130,12 @@ pub struct Receipt {
     /// place wrote it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pruned: Option<serde_json::Value>,
+    /// The run's artifacts as fetched and verified (SPEC §8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<crate::artifacts::Artifact>,
+    /// Whether they reached this caller: `none`, `fetched` or `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts_status: Option<crate::artifacts::Status>,
     /// The provider capabilities the project required.
     #[serde(default)]
     pub provider_requires: Vec<String>,

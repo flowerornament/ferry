@@ -2245,11 +2245,157 @@ fn injected_collection_and_artifact_failures_keep_the_verdict() {
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     let collection_error = record["collection"]["error"].as_str().unwrap();
     assert!(collection_error.contains("injected"), "{record}");
-    let reason = record["reason"].as_str().unwrap();
+    // Altered bytes are never fetched, and none stay on disk (SPEC §8).
+    let failed = &record["artifacts_status"]["failed"];
+    assert_eq!(failed["kind"], "digest", "{record}");
+    assert_eq!(failed["path"], "out.txt", "{record}");
+    assert!(record["artifacts"].is_null(), "{record}");
+    let id = record["id"].as_str().unwrap();
+    assert!(!d.join(".ferry/runs").join(id).exists(), "{record}");
+}
+
+/// A recipe with artifacts in a fresh repository: `extra` adds top-level
+/// ferry.toml lines; the recipe `probe` runs `script` and declares `artifacts`.
+fn artifact_fixture(script: &str, artifacts: &str, extra: &str) -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    git(d, &["init"]);
+    git(d, &["config", "user.name", "Ferry Test"]);
+    git(d, &["config", "user.email", "ferry@example.invalid"]);
+    let toml = format!(
+        "version=1\n{extra}[recipe.probe]\ncommand=['sh','-c','{script}']\nartifacts={artifacts}\n"
+    );
+    fs::write(d.join("ferry.toml"), toml).unwrap();
+    fs::write(d.join(".gitignore"), "out.txt\nkeep/\n").unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-m", "fixture"]);
+    dir
+}
+
+/// A run that ends before its recipe collects nothing, and says which:
+/// `none` when none are declared, else failed as not collected. A place
+/// from before per-file artifacts (no list in its record) is never
+/// `fetched`, even when its archive arrives.
+#[test]
+fn uncollected_artifacts_and_an_older_place_are_never_fetched() {
+    let refused = "[hooks]\nprepare='missing-prepare'\n";
+    for (artifacts, expected) in [
+        ("[]", serde_json::json!("none")),
+        ("['out.txt']", serde_json::json!("collection")),
+    ] {
+        let dir = artifact_fixture("echo built > out.txt", artifacts, refused);
+        let out = ferry(dir.path())
+            .args(["run", "probe", "--local", "--json"])
+            .output()
+            .unwrap();
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], "refused", "{record}");
+        let status = &record["artifacts_status"];
+        let got = if status.is_string() {
+            status.clone()
+        } else {
+            status["failed"]["kind"].clone()
+        };
+        assert_eq!(got, expected, "{record}");
+    }
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = artifact_fixture("echo built > out.txt", "['out.txt']", "");
+    let out = ferry(dir.path())
+        .env("FERRY_FAIL_AT", "record-read")
+        .args(["run", "probe", "--local", "--json"])
+        .output()
+        .unwrap();
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let path = dir
+        .path()
+        .join(".ferry/local/v1/records")
+        .join(format!("{id}.json"));
+    let mut place: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let fields = place.as_object_mut().unwrap();
+    assert!(fields.remove("artifacts").is_some(), "{place}");
+    fs::write(&path, place.to_string()).unwrap();
+    let out = ferry(dir.path()).args(["record", &id]).output().unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let failed = &record["artifacts_status"]["failed"];
     assert!(
-        reason.contains("collection") && reason.contains("artifact collection failed"),
+        failed["error"].as_str().unwrap().contains("predates"),
         "{record}"
     );
+}
+
+/// Artifacts are bound file by file with a status of their own (SPEC §8):
+/// fetched with each file's digest; `none` when none are declared; a pattern
+/// that matches nothing, or a file in a preserved path (which may be an
+/// earlier run's), is failed. The verdict stays the recipe's.
+#[test]
+fn artifacts_are_bound_per_file_with_a_status_apart_from_the_verdict() {
+    use sha2::{Digest, Sha256};
+    let run = |dir: &TempDir| {
+        let out = ferry(dir.path())
+            .args(["run", "probe", "--local", "--json"])
+            .output()
+            .unwrap();
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], "ran-pass", "{record}");
+        record
+    };
+    let dir = artifact_fixture("echo built > out.txt", "['out.txt']", "");
+    let record = run(&dir);
+    assert_eq!(record["artifacts_status"], "fetched", "{record}");
+    let sha256 = Sha256::digest(b"built\n")
+        .iter()
+        .fold(String::new(), |hex, b| hex + &format!("{b:02x}"));
+    let listed = serde_json::json!([{"path": "out.txt", "sha256": sha256}]);
+    assert_eq!(record["artifacts"], listed, "{record}");
+    let fetched = dir
+        .path()
+        .join(".ferry/runs")
+        .join(record["id"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(fetched.join("out.txt")).unwrap(),
+        "built\n"
+    );
+    let dir = artifact_fixture("true", "[]", "");
+    assert_eq!(run(&dir)["artifacts_status"], "none");
+    let dir = artifact_fixture("true", "['out*']", "");
+    let record = run(&dir);
+    let failed = &record["artifacts_status"]["failed"];
+    assert_eq!(failed["kind"], "empty-pattern", "{record}");
+    assert_eq!(failed["path"], "out*", "{record}");
+    let dir = artifact_fixture(
+        "mkdir -p keep; echo x > keep/out.txt",
+        "['keep/out.txt']",
+        "preserve=['keep']\n",
+    );
+    let record = run(&dir);
+    let failed = &record["artifacts_status"]["failed"];
+    assert_eq!(failed["kind"], "collection", "{record}");
+    assert!(
+        failed["error"].as_str().unwrap().contains("preserved"),
+        "{record}"
+    );
+    if cfg!(debug_assertions) {
+        let dir = artifact_fixture("echo built > out.txt", "['out.txt']", "");
+        let out = ferry(dir.path())
+            .env("FERRY_FAIL_AT", "artifact-transfer")
+            .args(["run", "probe", "--local", "--json"])
+            .output()
+            .unwrap();
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], "ran-pass", "{record}");
+        assert_eq!(
+            record["artifacts_status"]["failed"]["kind"], "transfer",
+            "{record}"
+        );
+        let id = record["id"].as_str().unwrap();
+        assert!(
+            !dir.path().join(".ferry/runs").join(id).exists(),
+            "{record}"
+        );
+    }
 }
 
 #[test]

@@ -143,6 +143,26 @@ collect = "scripts/ferry-collect"
   lease alone. It is an execution lock, not a machine feature: routing ignores
   it.
 
+### Artifacts (SPEC §8)
+
+A recipe's `artifacts = ["out/report.json", "logs/*.txt"]` are collected from
+the checkout once the recipe ends or times out, whatever its verdict, and
+fetched into `<repo>/.ferry/runs/<id>/`, which is emptied first. A run stopped
+or refused before its recipe ended collects none, and its status says so.
+
+- **Bound per file.** The place hashes each file; the caller checks the whole
+  archive, then every entry: a listed regular file inside the directory,
+  with its listed digest. The receipt's `artifacts` lists what was verified:
+  `[{path, sha256}]`.
+- **A status apart from the verdict.** `artifacts_status` is `none` (none
+  declared), `fetched`, or `{"failed": {kind, path, error}}` with kind
+  `collection`, `empty-pattern` (a pattern matched nothing), `transfer`,
+  `digest` or `archive` (a missing, unlisted or unsafe entry). A `ran-pass`
+  with failed artifacts is still a pass. Read the status, never the reason
+  or files already on disk; after a failure nothing is left there.
+- **Never stale.** A file in a `preserve` path fails collection: the checkout
+  reset keeps those, so it may be an earlier run's.
+
 ### An existing catalog or adapter
 
 If recipes already have a catalog, point to it:
@@ -476,8 +496,8 @@ A run belongs to its place, not to the connection that asked for it:
   for 5 min, the caller exits 255 and its receipt stays `submitted`. Once the
   place has accepted a run, only its final record gives the receipt a
   verdict: any other failure (reading that record, for one) leaves it
-  `submitted`, exit 255, with `ferry record <id>` as the next step. A failed
-  transfer of the run's artifacts is a note on its verdict.
+  `submitted`, exit 255, with `ferry record <id>` as the next step. Artifacts
+  have their own status and never change the verdict (see Artifacts).
 - **Stop.** The first INT, TERM or HUP of the caller asks the place to stop the
   run (`stopped` 128+signal), and the caller keeps following to the record.
   The first stop decides: a later one, from anyone and with any signal, is

@@ -34,8 +34,17 @@ pub struct HostResult {
     pub exit_code: i32,
     pub reason: Option<String>,
     pub binary_sha256: String,
+    /// The whole archive's digest, and a failure as text: what callers
+    /// before per-file artifacts read, so they still fetch (SPEC §6).
     pub artifacts_sha256: Option<String>,
     pub artifacts_error: Option<String>,
+    /// Each collected file and its digest (SPEC §8), and `none` or why
+    /// collection failed (absent once collected): kept as the place wrote
+    /// them, like `custody`, and read where they are used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts_status: Option<serde_json::Value>,
     #[serde(default)]
     pub collection: Option<crate::run::Collection>,
     #[serde(default)]
@@ -339,6 +348,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     )
     .unwrap_or_else(|_| Err("supervisor panicked".into()));
     record_admission(&mut result, admission);
+    uncollected(&mut result, &request);
     // One verdict, from the first terminal fact (SPEC §5). A stop's signal is
     // the first stop's, whatever arrived after it.
     let signal = execution::caught_signal().map(|caught| first_stop_signal(&dir).unwrap_or(caught));
@@ -384,26 +394,59 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     }
 }
 
-/// Archives the recipe's declared artifacts. A failure, the digest's
-/// included, is recorded in the result and never changes its verdict.
+/// The artifact status of a run that collected none: none declared, or the
+/// run ended before its recipe did (stopped, refused, lost).
+fn uncollected(result: &mut HostResult, request: &Request) {
+    use crate::artifacts::{Kind, Status, failed};
+    if result.artifacts_sha256.is_some() || result.artifacts_status.is_some() {
+        return;
+    }
+    let status = if request.recipe.artifacts.is_empty() {
+        Status::None
+    } else {
+        failed(
+            Kind::Collection,
+            None,
+            "not collected: the run ended before its recipe",
+        )
+    };
+    result.artifacts_status = serde_json::to_value(status).ok();
+}
+
+/// Archives the recipe's declared artifacts, each file hashed. A failure is
+/// recorded in the result and never changes its verdict.
 fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut HostResult) {
+    use crate::artifacts::{Kind, failed};
     if request.recipe.artifacts.is_empty() {
         return;
     }
     let output = record::run_dir(root, &request.id).join("artifacts.tar");
-    match crate::artifacts::collect(seat, &request.recipe.artifacts, &output) {
-        Ok(()) => {
-            let digest = if execution::fail_at("artifact-digest") {
-                Err(std::io::Error::other("injected by FERRY_FAIL_AT"))
-            } else {
-                receipt::file_digest(&output)
-            };
-            match digest {
-                Ok(digest) => result.artifacts_sha256 = Some(digest),
-                Err(e) => result.artifacts_error = Some(format!("digest: {e}")),
+    let patterns = &request.recipe.artifacts;
+    let collected =
+        crate::artifacts::collect(seat, patterns, &request.preserve, &output).and_then(|listed| {
+            let sha256 = receipt::file_digest(&output);
+            Ok((
+                listed,
+                sha256.map_err(|e| failed(Kind::Collection, None, e))?,
+            ))
+        });
+    match collected {
+        Ok((mut listed, sha256)) => {
+            // Debug builds: each file listed with a digest its bytes lack.
+            if execution::fail_at("artifact-digest") {
+                for artifact in &mut listed {
+                    artifact.sha256 = receipt::digest(b"injected");
+                }
             }
+            result.artifacts = serde_json::to_value(listed).ok();
+            result.artifacts_sha256 = Some(sha256);
         }
-        Err(e) => result.artifacts_error = Some(e.to_string()),
+        Err(status) => {
+            if let crate::artifacts::Status::Failed { error, .. } = &status {
+                result.artifacts_error = Some(error.clone());
+            }
+            result.artifacts_status = serde_json::to_value(status).ok();
+        }
     }
 }
 
