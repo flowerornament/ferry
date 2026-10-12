@@ -394,7 +394,7 @@ mod tests {
     /// A reservation proves a live run, not that it holds the lock: a
     /// finished run's leftover may hold it while a contender has not yet
     /// tried it. The refusal names the finished run, and the contender only
-    /// as a possibility (herald-1b's reproduction, 24bb602b, adapted).
+    /// as a possibility.
     #[test]
     fn a_reserved_contender_does_not_prove_it_holds_an_ended_runs_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -422,8 +422,8 @@ mod tests {
         );
     }
 
-    /// herald-1b's 11cfa73e: with only exclusive holders coming and going,
-    /// the probes never claim shared holders.
+    /// With only exclusive holders coming and going, the probes never claim
+    /// shared holders.
     #[test]
     fn exclusive_only_contention_never_proves_shared_holders() {
         use std::sync::{
@@ -460,9 +460,8 @@ mod tests {
         );
     }
 
-    /// murail-4a's a8eb64ff: a free lock is not proof of shared holders
-    /// (P1), and a probe that cannot open the lock is not proof of an
-    /// exclusive one (P2).
+    /// A free lock is not proof of shared holders, and a probe that cannot
+    /// open the lock is not proof of an exclusive one.
     #[test]
     fn a_free_host_lock_does_not_prove_shared_holders_exist() {
         let dir = tempfile::tempdir().unwrap();

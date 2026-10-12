@@ -362,22 +362,22 @@ mod tests {
     use std::{fs, os::unix::fs::MetadataExt, os::unix::fs::symlink, path::Path};
 
     /// At the point of deletion, independently of request validation, only a
-    /// plain relative path without a link on the way is inside (review S2).
+    /// plain relative path without a link on the way is inside.
     #[test]
     fn only_plain_paths_without_links_are_inside() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        fs::create_dir_all(root.join("slots/s/real")).unwrap();
-        symlink("/", root.join("slots/s/link")).unwrap();
-        assert_eq!(outside(root, Path::new("slots/s/real/x")), None);
-        assert_eq!(outside(root, Path::new("slots/s/absent/x")), None);
-        for rel in ["/etc", "slots/s/../../x", "slots/s/link/etc"] {
+        fs::create_dir_all(root.join("seats/s/real")).unwrap();
+        symlink("/", root.join("seats/s/link")).unwrap();
+        assert_eq!(outside(root, Path::new("seats/s/real/x")), None);
+        assert_eq!(outside(root, Path::new("seats/s/absent/x")), None);
+        for rel in ["/etc", "seats/s/../../x", "seats/s/link/etc"] {
             assert!(outside(root, Path::new(rel)).is_some(), "{rel}");
         }
     }
 
-    /// herald-1b's diagnostic (eedc813a): a preserve path whose ancestor in
-    /// the slot is a symbolic link is never deleted through it.
+    /// A preserve path whose ancestor in the seat is a symbolic link is
+    /// never deleted through it.
     #[test]
     fn cap_must_not_delete_through_a_preserve_parent_symlink() {
         let owned = tempfile::tempdir().unwrap();
@@ -398,20 +398,20 @@ mod tests {
     #[test]
     fn another_device_is_never_inside_measured_or_deleted() {
         let root = tempfile::tempdir().unwrap();
-        let (root, mount) = (root.path(), Path::new("slots/s/mount"));
+        let (root, mount) = (root.path(), Path::new("seats/s/mount"));
         fs::create_dir_all(root.join(mount)).unwrap();
         fs::write(root.join(mount).join("data"), [0u8; 16]).unwrap();
         let dev = fs::metadata(root).unwrap().dev();
         let other = dev.wrapping_add(1);
         assert_eq!(outside_on(root, mount, dev), None);
         assert!(outside_on(root, mount, other).is_some_and(|why| why.contains("another device")));
-        assert_eq!(size_until(&root.join("slots"), None, other), Some(0));
+        assert_eq!(size_until(&root.join("seats"), None, other), Some(0));
         let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let slots = root.join("slots");
-        assert_eq!(foreign(&slots, other, later), Ok(Some(slots.clone())));
-        assert_eq!(foreign(&slots, dev, later), Ok(None));
+        let seats = root.join("seats");
+        assert_eq!(foreign(&seats, other, later), Ok(Some(seats.clone())));
+        assert_eq!(foreign(&seats, dev, later), Ok(None));
         // Past its time it fails closed (ferry-xtx.24).
-        assert!(foreign(&slots, dev, std::time::Instant::now()).is_err());
+        assert!(foreign(&seats, dev, std::time::Instant::now()).is_err());
     }
 
     /// A delete proves containment again at its own moment: a directory
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn a_delete_rechecks_containment_at_its_moment() {
         let (root, away) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (root, build) = (root.path(), Path::new("slots/s/build"));
+        let (root, build) = (root.path(), Path::new("seats/s/build"));
         fs::create_dir_all(root.join(build)).unwrap();
         assert_eq!(outside(root, &build.join("cache")), None);
         fs::remove_dir(root.join(build)).unwrap();
@@ -431,7 +431,7 @@ mod tests {
         assert!(away.path().join("cache/sentinel").exists());
     }
 
-    /// A measurement gives up once its time is over (review P2).
+    /// A measurement gives up once its time is over.
     #[test]
     fn a_measurement_past_its_time_gives_up() {
         let root = tempfile::tempdir().unwrap();
