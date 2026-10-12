@@ -160,7 +160,9 @@ its status says so.
   `collection`, `empty-pattern` (a pattern matched nothing), `transfer`,
   `digest` or `archive` (a missing, unlisted or unsafe entry). A `ran-pass`
   with failed artifacts is still a pass. Read the status, never the reason
-  or files already on disk; after a failure nothing is left there.
+  or files already on disk. After a failure nothing is left there, unless
+  the earlier directory could not be removed: that is reported as `archive`
+  failed, and what remains is never vouched for.
 - **Never stale.** A file in a `preserve` path fails collection: the checkout
   reset keeps those, so it may be an earlier run's.
 
