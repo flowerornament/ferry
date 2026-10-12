@@ -68,9 +68,10 @@ final record, and `ferry record <id>` completes the receipt later.
   is a note, never a new verdict.
 - **Locks live as long as the work.** The session inherits the seat lock and
   host lease; release is `close()`, after the final record.
-- **Refuse before effect.** A refusal (125) happens before anything runs or is
-  deleted. A seat's contents are deleted only by `admission::remove`, which
-  re-proves containment and never crosses a device.
+- **Refuse before effect.** A refusal (125) happens before the recipe runs;
+  the only deletes before that are the seat cap's, recorded as `pruned`. A
+  seat's contents are deleted only by `admission::remove`, which re-proves
+  containment and never crosses a device.
 - **Records parse across versions.** Fields a place writes in a shape that
   may change (`custody`, `admission`, `pruned`, `artifacts`) are kept as the
   JSON it wrote, and read where they are used.
