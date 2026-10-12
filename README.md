@@ -147,12 +147,13 @@ collect = "scripts/ferry-collect"
 
 A recipe's `artifacts = ["out/report.json", "logs/*.txt"]` are collected from
 the checkout once the recipe ends or times out, whatever its verdict, and
-fetched into `<repo>/.ferry/runs/<id>/`, which is emptied first. A run stopped
-or refused before its recipe ended collects none, and its status says so.
+fetched into `<repo>/.ferry/runs/<id>/`, which is emptied first whatever the
+status. A run stopped or refused before its recipe ended collects none, and
+its status says so.
 
-- **Bound per file.** The place hashes each file; the caller checks the whole
-  archive, then every entry: a listed regular file inside the directory,
-  with its listed digest. The receipt's `artifacts` lists what was verified:
+- **Bound per file.** The place hashes each file; the caller checks every
+  entry: a listed regular file inside the directory, with its listed digest,
+  and every listed file present. The receipt's `artifacts` lists what was verified:
   `[{path, sha256}]`.
 - **A status apart from the verdict.** `artifacts_status` is `none` (none
   declared), `fetched`, or `{"failed": {kind, path, error}}` with kind

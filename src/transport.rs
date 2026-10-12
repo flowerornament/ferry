@@ -837,32 +837,48 @@ pub fn complete(root: &Path, place: &Place, record: &mut Receipt) -> Result<()> 
         .artifacts
         .map(serde_json::from_value::<Vec<Artifact>>)
         .transpose();
-    record.artifacts_status = Some(match (status, listed, result.artifacts_sha256) {
-        (Err(e), ..) | (_, Err(e), _) => {
-            artifacts::failed(Kind::Archive, None, format!("unreadable: {e}"))
-        }
-        (Ok(Some(status)), ..) => status,
-        (Ok(None), Ok(Some(listed)), Some(_)) => {
-            let archive = if execution::fail_at("artifact-transfer") {
-                Err("artifact-transfer: injected by FERRY_FAIL_AT".into())
-            } else {
-                place.read(&record.id, "artifacts.tar")
-            };
-            let destination = root.join(".ferry/runs").join(&record.id);
-            let status = artifacts::fetch(archive, &listed, &destination);
-            if status == Status::Fetched {
-                record.artifacts = listed;
+    // Emptied on every path, files and list, so nothing earlier outlives a
+    // status; one that cannot be emptied vouches for nothing.
+    let destination = root.join(".ferry/runs").join(&record.id);
+    let cleared = match fs::remove_dir_all(&destination) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    record.artifacts.clear();
+    record.artifacts_status = Some(if let Err(e) = cleared {
+        artifacts::failed(
+            Kind::Archive,
+            None,
+            format!("an earlier run directory remains: {e}"),
+        )
+    } else {
+        match (status, listed, result.artifacts_sha256) {
+            (Err(e), ..) | (_, Err(e), _) => {
+                artifacts::failed(Kind::Archive, None, format!("unreadable: {e}"))
             }
-            status
-        }
-        // A place before per-file artifacts sends no list or status.
-        (Ok(None), Ok(_), _) => {
-            let why = "the place predates per-file artifacts: install the same ferry on both ends";
-            artifacts::failed(
-                Kind::Collection,
-                None,
-                result.artifacts_error.as_deref().unwrap_or(why),
-            )
+            (Ok(Some(status)), ..) => status,
+            (Ok(None), Ok(Some(listed)), Some(_)) => {
+                let archive = if execution::fail_at("artifact-transfer") {
+                    Err("artifact-transfer: injected by FERRY_FAIL_AT".into())
+                } else {
+                    place.read(&record.id, "artifacts.tar")
+                };
+                let status = artifacts::fetch(archive, &listed, &destination);
+                if status == Status::Fetched {
+                    record.artifacts = listed;
+                }
+                status
+            }
+            // A place before per-file artifacts sends no list or status.
+            (Ok(None), Ok(_), _) => {
+                let why =
+                    "the place predates per-file artifacts: install the same ferry on both ends";
+                artifacts::failed(
+                    Kind::Collection,
+                    None,
+                    result.artifacts_error.as_deref().unwrap_or(why),
+                )
+            }
         }
     });
     Ok(())

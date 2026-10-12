@@ -2301,6 +2301,9 @@ fn uncollected_artifacts_and_an_older_place_are_never_fetched() {
     if !cfg!(debug_assertions) {
         return;
     }
+    // Completed again from a submitted receipt, its own records edited to
+    // reach each branch: an earlier directory and list never outlive it,
+    // whatever the status; a place without a list is never `fetched`.
     let dir = artifact_fixture("echo built > out.txt", "['out.txt']", "");
     let out = ferry(dir.path())
         .env("FERRY_FAIL_AT", "record-read")
@@ -2308,20 +2311,74 @@ fn uncollected_artifacts_and_an_older_place_are_never_fetched() {
         .output()
         .unwrap();
     let id = receipt(&out)["id"].as_str().unwrap().to_owned();
-    let path = dir
+    let read = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    };
+    let receipt_path = dir.path().join(format!(".ferry/receipts/{id}.json"));
+    let place_path = dir
         .path()
-        .join(".ferry/local/v1/records")
-        .join(format!("{id}.json"));
-    let mut place: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    let fields = place.as_object_mut().unwrap();
-    assert!(fields.remove("artifacts").is_some(), "{place}");
-    fs::write(&path, place.to_string()).unwrap();
+        .join(format!(".ferry/local/v1/records/{id}.json"));
+    let (submitted, place) = (read(&receipt_path), read(&place_path));
+    let runs = dir.path().join(".ferry/runs").join(&id);
+    let again = |status: Option<serde_json::Value>, list: bool| {
+        let mut edited = place.clone();
+        let fields = edited.as_object_mut().unwrap();
+        match status {
+            Some(status) => fields.insert("artifacts_status".into(), status),
+            None => fields.remove("artifacts_status"),
+        };
+        if !list {
+            fields.remove("artifacts");
+        }
+        fs::write(&place_path, edited.to_string()).unwrap();
+        let mut earlier = submitted.clone();
+        earlier["artifacts"] = serde_json::json!([{"path": "stale", "sha256": "0"}]);
+        fs::write(&receipt_path, earlier.to_string()).unwrap();
+        fs::create_dir_all(&runs).unwrap();
+        fs::write(runs.join("stale"), "earlier").unwrap();
+        let out = ferry(dir.path()).args(["record", &id]).output().unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(record["outcome"], "ran-pass", "{record}");
+        assert!(record["artifacts"].is_null(), "{record}");
+        record["artifacts_status"]["failed"].clone()
+    };
+    let empty =
+        serde_json::json!({"failed": {"kind": "empty-pattern", "path": "out*", "error": "e"}});
+    assert_eq!(again(Some(empty), true)["kind"], "empty-pattern");
+    assert!(!runs.exists());
+    assert_eq!(again(Some(serde_json::json!(5)), true)["kind"], "archive");
+    assert!(!runs.exists());
+    let older = again(None, false);
+    assert!(
+        older["error"].as_str().unwrap().contains("predates"),
+        "{older}"
+    );
+    assert!(!runs.exists());
+    // A directory that cannot be emptied vouches for nothing: nothing fetched.
+    let locked = runs.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("stale"), "earlier").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    fs::write(&place_path, place.to_string()).unwrap();
+    fs::write(&receipt_path, submitted.to_string()).unwrap();
+    let out = ferry(dir.path()).args(["record", &id]).output().unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let failed = &record["artifacts_status"]["failed"];
+    assert_eq!(failed["kind"], "archive", "{record}");
+    assert!(
+        failed["error"].as_str().unwrap().contains("remains"),
+        "{record}"
+    );
+    assert!(record["artifacts"].is_null(), "{record}");
+    // A file where the directory goes (herald-1b's case) is no exception.
+    fs::remove_dir_all(&runs).unwrap();
+    fs::write(&runs, "not a directory").unwrap();
+    fs::write(&receipt_path, submitted.to_string()).unwrap();
     let out = ferry(dir.path()).args(["record", &id]).output().unwrap();
     let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(record["outcome"], "ran-pass", "{record}");
-    let failed = &record["artifacts_status"]["failed"];
-    assert!(
-        failed["error"].as_str().unwrap().contains("predates"),
+    assert_eq!(
+        record["artifacts_status"]["failed"]["kind"], "archive",
         "{record}"
     );
 }
