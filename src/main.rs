@@ -452,8 +452,11 @@ fn execute(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Action::ExecuteSession { spec, result } => {
-            crate::run::execute_session(&spec, &result)?;
-            Ok(0)
+            let owned = crate::run::execute_session(&spec, &result);
+            if let Err(error) = &owned {
+                crate::run::left_error(&result, error.as_ref());
+            }
+            owned.map(|()| 0)
         }
     }
 }

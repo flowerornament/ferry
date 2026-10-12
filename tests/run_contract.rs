@@ -71,15 +71,17 @@ fn fixture() -> TempDir {
     dir
 }
 fn run(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ferry"))
+    command(root).args(args).output().unwrap()
+}
+fn command(root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ferry"));
+    command
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_STATE_HOME", root.join("state"))
-        .args(args)
-        .output()
-        .unwrap()
+        .env("XDG_STATE_HOME", root.join("state"));
+    command
 }
 const SOURCE_REV: &str = match option_env!("FERRY_SOURCE_REV") {
     Some(rev) => rev,
@@ -421,6 +423,60 @@ fn collection_runs_after_recipe_failure_timeout_and_prepare_refusal() {
             fs::read_to_string(slot.join("collected")).unwrap(),
             "collected\n"
         );
+    }
+}
+
+/// A session that ends with no result keeps its own error as the reason
+/// (SPEC §5): refused before the recipe was attempted, lost after it.
+/// Without the error file (`owner-error` injected), it says only that the
+/// owner exited.
+#[test]
+fn a_session_owners_error_is_the_records_reason() {
+    for (prepare, recipe, fail_at, outcome, code, reason) in [
+        (
+            "exit 1",
+            "true",
+            "",
+            "refused",
+            125,
+            "prepare hook failed: exit status: 1",
+        ),
+        (
+            "exit 0",
+            "/nonexistent/recipe",
+            "",
+            "lost",
+            255,
+            "No such file",
+        ),
+        (
+            "exit 1",
+            "true",
+            "owner-error",
+            "refused",
+            125,
+            "session owner exited without result",
+        ),
+    ] {
+        let dir = fixture();
+        let hook = dir.path().join("prepare");
+        fs::write(&hook, format!("#!/bin/sh\n{prepare}\n")).unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let toml =
+            format!("version=1\n[hooks]\nprepare='prepare'\n[recipe.pass]\ncommand=['{recipe}']\n");
+        fs::write(dir.path().join("ferry.toml"), toml).unwrap();
+        git(dir.path(), &["add", "ferry.toml", "prepare"]);
+        git(dir.path(), &["commit", "-m", "owner error"]);
+        let out = command(dir.path())
+            .env("FERRY_FAIL_AT", fail_at)
+            .args(["run", "pass", "--local", "--json"])
+            .output()
+            .unwrap();
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], outcome, "{record}");
+        assert_eq!(record["exit_code"], code, "{record}");
+        let text = record["reason"].as_str().unwrap_or_default();
+        assert!(text.contains(reason), "{record}");
     }
 }
 

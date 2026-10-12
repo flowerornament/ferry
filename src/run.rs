@@ -609,7 +609,11 @@ fn run_session(
         }
         // Not reaped here: the stop still signals the session by its id.
         if owner.leader_exited() {
-            return Err("session owner exited without result".into());
+            // Its own error when it left one (SPEC §5), else only the fact.
+            let error = fs::read_to_string(result_path.with_extension("error"));
+            return Err(error
+                .unwrap_or_else(|_| "session owner exited without result".into())
+                .into());
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -676,6 +680,15 @@ fn copy_output(mut pipe: std::io::PipeReader, log: &RunLog) {
                 output.bytes += take as u64;
             }
         }
+    }
+}
+
+/// The session owner's error, written beside its result (`result.error`,
+/// SPEC §9) before it exits, so the record gives the cause, not only that
+/// it exited. Best effort: without it the record says the owner exited.
+pub fn left_error(result: &Path, error: &dyn std::error::Error) {
+    if !fail_at("owner-error") {
+        let _ = fs::write(result.with_extension("error"), error.to_string());
     }
 }
 
