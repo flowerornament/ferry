@@ -3,12 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
-#[derive(Debug, thiserror::Error)]
-pub enum Refusal {
-    #[error("{0}")]
-    Declaration(String),
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
@@ -57,11 +51,9 @@ pub struct ShipUrl {
 
 /// The keys `[[ship]]` replaced (`companion_refs`, `mirror`): present,
 /// they refuse, naming the new form.
-pub fn retired(keys: [&Option<serde::de::IgnoredAny>; 2]) -> Result<(), Refusal> {
+pub fn retired(keys: [&Option<serde::de::IgnoredAny>; 2]) -> Result<(), String> {
     if keys.iter().any(|key| key.is_some()) {
-        return Err(Refusal::Declaration(
-            "[companion_refs]/[[mirror]] are retired: use [[ship]] (see README)".into(),
-        ));
+        return Err("[companion_refs]/[[mirror]] are retired: use [[ship]] (see README)".into());
     }
     Ok(())
 }
@@ -127,20 +119,16 @@ impl Environment {
     pub fn capture(
         &self,
         input: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-    ) -> Result<BTreeMap<String, String>, Refusal> {
+    ) -> Result<BTreeMap<String, String>, String> {
         for name in self.forwards.iter().chain(&self.local).chain(&self.watches) {
             if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                return Err(Refusal::Declaration(
-                    "invalid environment declaration".into(),
-                ));
+                return Err("invalid environment declaration".into());
             }
         }
         if !self.forwards.is_disjoint(&self.local)
             || self.forwards.iter().any(|name| reserved(name))
         {
-            return Err(Refusal::Declaration(
-                "conflicting environment declarations".into(),
-            ));
+            return Err("conflicting environment declarations".into());
         }
         let mut forwarded = BTreeMap::new();
         for (name, value) in input {
@@ -149,16 +137,14 @@ impl Environment {
                 continue;
             }
             if self.forwards.contains(name) {
-                let value = value.into_string().map_err(|_| {
-                    Refusal::Declaration(format!("non-UTF-8 forwarded variable {name}"))
-                })?;
+                let value = value
+                    .into_string()
+                    .map_err(|_| format!("non-UTF-8 forwarded variable {name}"))?;
                 forwarded.insert(name.to_owned(), value);
             } else if !value.is_empty()
                 && self.watches.iter().any(|prefix| name.starts_with(prefix))
             {
-                return Err(Refusal::Declaration(format!(
-                    "unlisted watched variable {name}"
-                )));
+                return Err(format!("unlisted watched variable {name}"));
             }
         }
         Ok(forwarded)
@@ -198,18 +184,16 @@ fn recipe_table() -> String {
 pub fn catalog_recipes(
     value: &toml::Value,
     table: &str,
-) -> Result<BTreeMap<String, Recipe>, Refusal> {
+) -> Result<BTreeMap<String, Recipe>, String> {
     let entries = value
         .get(table)
         .and_then(toml::Value::as_table)
-        .ok_or_else(|| Refusal::Declaration("catalog table missing".into()))?;
+        .ok_or("catalog table missing")?;
     entries
         .iter()
         .map(|(name, entry)| {
             identifier(name)?;
-            let source = entry
-                .as_table()
-                .ok_or_else(|| Refusal::Declaration("catalog entry must be a table".into()))?;
+            let source = entry.as_table().ok_or("catalog entry must be a table")?;
             let mut declaration = toml::Table::new();
             for key in ["command", "requires", "routable", "artifacts"] {
                 if let Some(value) = source.get(key) {
@@ -218,7 +202,7 @@ pub fn catalog_recipes(
             }
             let recipe = toml::Value::Table(declaration)
                 .try_into()
-                .map_err(|e| Refusal::Declaration(format!("invalid catalog recipe {name}: {e}")))?;
+                .map_err(|e| format!("invalid catalog recipe {name}: {e}"))?;
             Ok((name.clone(), recipe))
         })
         .collect()
@@ -273,27 +257,25 @@ pub fn route<'a>(
     machines: &'a Machines,
     on: Option<&'a str>,
     local: bool,
-) -> Result<Route<'a>, Refusal> {
+) -> Result<Route<'a>, String> {
     if local && on.is_some() {
-        return Err(Refusal::Declaration("--local conflicts with --on".into()));
+        return Err("--local conflicts with --on".into());
     }
     if local {
         return Ok(Route::Local);
     }
     if on.is_some() && !recipe.routable {
-        return Err(Refusal::Declaration("recipe is not routable".into()));
+        return Err("recipe is not routable".into());
     }
     if let Some(name) = on {
         let machine = machines
             .host
             .get(name)
-            .ok_or_else(|| Refusal::Declaration(format!("unknown machine: {name}")))?;
+            .ok_or_else(|| format!("unknown machine: {name}"))?;
         if supports(recipe, machine) {
             return Ok(Route::Remote(name));
         }
-        return Err(Refusal::Declaration(format!(
-            "machine {name} lacks required features"
-        )));
+        return Err(format!("machine {name} lacks required features"));
     }
     if !recipe.routable || machines.host.is_empty() {
         return Ok(Route::Local);
@@ -303,7 +285,7 @@ pub fn route<'a>(
         .iter()
         .find(|(_, m)| supports(recipe, m))
         .map(|(name, _)| Route::Remote(name.as_str()))
-        .ok_or_else(|| Refusal::Declaration("no configured machine meets requirements".into()))
+        .ok_or_else(|| "no configured machine meets requirements".into())
 }
 fn supports(recipe: &Recipe, machine: &Machine) -> bool {
     let mut required = recipe.requires.clone();
@@ -312,7 +294,7 @@ fn supports(recipe: &Recipe, machine: &Machine) -> bool {
     required.is_subset(&machine.capabilities())
 }
 
-pub fn identifier(value: &str) -> Result<(), Refusal> {
+pub fn identifier(value: &str) -> Result<(), String> {
     if value.is_empty()
         || matches!(value, "." | "..")
         || value.starts_with('-')
@@ -320,9 +302,7 @@ pub fn identifier(value: &str) -> Result<(), Refusal> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
-        return Err(Refusal::Declaration(format!(
-            "invalid identifier: {value:?}"
-        )));
+        return Err(format!("invalid identifier: {value:?}"));
     }
     Ok(())
 }
@@ -336,7 +316,7 @@ pub fn invalid_env(name: &str, value: &str) -> bool {
 }
 impl Hooks {
     /// Every hook is a plain relative path inside the checkout.
-    pub fn check(&self) -> Result<(), Refusal> {
+    pub fn check(&self) -> Result<(), String> {
         let hooks = [&self.prepare, &self.env, &self.collect];
         hooks
             .into_iter()
@@ -344,36 +324,30 @@ impl Hooks {
             .try_for_each(|hook| relative_path(hook))
     }
 }
-pub fn relative_path(value: &str) -> Result<(), Refusal> {
+pub fn relative_path(value: &str) -> Result<(), String> {
     if value.is_empty()
         || Path::new(value)
             .components()
             .any(|c| !matches!(c, Component::Normal(_)))
     {
-        return Err(Refusal::Declaration(format!(
-            "path must stay inside checkout: {value:?}"
-        )));
+        return Err(format!("path must stay inside checkout: {value:?}"));
     }
     Ok(())
 }
 
-pub fn preserve_path(value: &str) -> Result<(), Refusal> {
+pub fn preserve_path(value: &str) -> Result<(), String> {
     relative_path(value)?;
     if value
         .split('/')
         .any(|part| matches!(part, ".git" | ".jj" | ".ferry"))
     {
-        return Err(Refusal::Declaration(
-            "cannot preserve version-control or Ferry state".into(),
-        ));
+        return Err("cannot preserve version-control or Ferry state".into());
     }
     if value
         .chars()
         .any(|c| matches!(c, '*' | '?' | '[' | ']' | '\\' | '!' | '\n' | '\r'))
     {
-        return Err(Refusal::Declaration(
-            "preserve must name literal directories".into(),
-        ));
+        return Err("preserve must name literal directories".into());
     }
     Ok(())
 }

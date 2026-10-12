@@ -1,5 +1,5 @@
 //! Exact-commit resolution and committed declarations for git and colocated jj.
-use crate::config::{Config, Recipe, Refusal, identifier, relative_path};
+use crate::config::{Config, Recipe, identifier, relative_path};
 use crate::execution::Shipped;
 use std::process::Stdio;
 use std::{
@@ -46,10 +46,10 @@ fn adapter(root: &Path, sha: &str, path: &str) -> Result<Vec<u8>> {
 pub fn output(command: &mut Command) -> Result<Vec<u8>> {
     let result = command.output()?;
     if !result.status.success() {
-        return Err(Refusal::Declaration(format!(
+        return Err(format!(
             "command failed: {}",
             String::from_utf8_lossy(&result.stderr).trim()
-        ))
+        )
         .into());
     }
     Ok(result.stdout)
@@ -101,9 +101,7 @@ pub fn commit(root: &Path, revision: Option<&str>) -> Result<String> {
         let text = String::from_utf8(bytes)?;
         let lines: Vec<_> = text.lines().collect();
         if lines.len() != 1 || !lines[0].ends_with(" false") {
-            return Err(
-                Refusal::Declaration("revision must name one conflict-free commit".into()).into(),
-            );
+            return Err("revision must name one conflict-free commit".into());
         }
         lines[0].split_whitespace().next().unwrap_or("").to_owned()
     } else {
@@ -114,7 +112,7 @@ pub fn commit(root: &Path, revision: Option<&str>) -> Result<String> {
         )?)?
     };
     if !is_commit(&value) {
-        return Err(Refusal::Declaration("invalid commit identity".into()).into());
+        return Err("invalid commit identity".into());
     }
     Ok(value)
 }
@@ -138,11 +136,11 @@ pub fn source_commit(root: &Path, source: &crate::config::Source) -> Result<Stri
         &["rev-parse", "--verify", "--end-of-options", &reference],
     )?)?;
     if !is_commit(&value) {
-        return Err(Refusal::Declaration("invalid tracking commit identity".into()).into());
+        return Err("invalid tracking commit identity".into());
     }
     let kind = git_at(&dir, &["cat-file", "-t", &value])?;
     if kind != b"commit\n" {
-        return Err(Refusal::Declaration("tracking ref must name a commit object".into()).into());
+        return Err("tracking ref must name a commit object".into());
     }
     Ok(value)
 }
@@ -183,7 +181,7 @@ pub fn ship(
         }) {
             let what = twice.name.as_ref().or(twice.url.as_ref()).cloned();
             let message = format!("[[ship]] declares {} twice", what.unwrap_or_default());
-            return Err(Refusal::Declaration(message).into());
+            return Err(message.into());
         }
         let object = Shipped { name, url, commit };
         let mut recorded = serde_json::to_value(&object)?;
@@ -204,16 +202,13 @@ pub fn declaration(
         "ferry.toml",
     )?)?)?;
     if config.version != 1 {
-        return Err(Refusal::Declaration("unsupported ferry.toml version".into()).into());
+        return Err("unsupported ferry.toml version".into());
     }
     crate::config::retired([&config.companion_refs, &config.mirror])?;
     config.hooks.check()?;
     let recipes = if let Some(catalog) = &config.catalog {
         if !config.recipe.is_empty() {
-            return Err(Refusal::Declaration(
-                "catalog and inline recipes duplicate ownership".into(),
-            )
-            .into());
+            return Err("catalog and inline recipes duplicate ownership".into());
         }
         match (&catalog.path, &catalog.adapter) {
             (Some(path), None) => {
@@ -265,7 +260,7 @@ pub fn declaration(
     for (name, recipe) in &recipes {
         identifier(name)?;
         if recipe.command.is_empty() || recipe.command[0].is_empty() {
-            return Err(Refusal::Declaration(format!("recipe {name} has no command")).into());
+            return Err(format!("recipe {name} has no command").into());
         }
         for artifact in &recipe.artifacts {
             relative_path(artifact)?;

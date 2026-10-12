@@ -1,6 +1,6 @@
 //! Locked real checkouts and recipe sessions shared by caller and host.
 use crate::{
-    config::{Hooks, Recipe, Refusal, identifier, preserve_path},
+    config::{Hooks, Recipe, identifier, preserve_path},
     receipt, repository,
 };
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ pub struct Shipped {
 
 pub fn validate(request: &Request) -> Result<()> {
     if request.protocol != receipt::PROTOCOL {
-        return Err(Refusal::Declaration("protocol mismatch".into()).into());
+        return Err("protocol mismatch".into());
     }
     for value in [&request.id, &request.token, &request.seat] {
         identifier(value)?;
