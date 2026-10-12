@@ -114,6 +114,14 @@ caller:  follow output.log by offset until record final ─► receipt ─► ex
 **Why:** each step either rests on one mechanism or is reported. No step
 depends on the client being present.
 
+**The verdict is the first terminal fact** the supervisor observes: the
+recipe's exit (`ran-pass` or `ran-fail`), a stop (`stopped`) or the deadline
+(`timeout`). A later fact never changes it; a stop that arrives after the exit
+is a note. A session that ends with none of these before the recipe was
+attempted is `refused` (125), and after it `lost` (255), with the session's
+own error as the reason when it left one (a session killed from outside
+leaves none, and the reason says so).
+
 ## 6. Protocol (caller ↔ place, over ssh or a local exec)
 
 | Verb | In | Out |
@@ -166,7 +174,7 @@ records/<id>.reserved.json  {state:reserved, id, token, commit, seat, binary_sha
 records/<id>.json           reserved fields + {outcome, exit_code, reason, commit, seat,
                             recipe, args, place:{source_rev, exe, sha256}, lease:{mode, wait_ms,
                             acquired_ms, released_ms}, admission:{floor, available}, custody,
-                            output:{bytes, capped}, artifacts:[{path, sha256}], stopped_by?, deadline}
+                            output:{bytes, capped}, artifacts:[{path, sha256}], artifacts_error?, stopped_by?, deadline}
 ```
 
 - **Finalize:** write a temporary file, fsync, `link`/no-replace rename into
@@ -180,6 +188,17 @@ records/<id>.json           reserved fields + {outcome, exit_code, reason, commi
   final). It is replaced atomically by `state: final`, which carries the final
   record's verdict and evidence fields in the receipt's own schema. A
   receipt with no `state` is final.
+- **Artifacts:** the place hashes each collected file into `artifacts`. The
+  caller unpacks into an emptied `<repo>/.ferry/runs/<id>/`, verifies every
+  file against that list and refuses any file not in it. The receipt carries
+  the verified `artifacts:[{path, sha256}]` and `artifacts_status`: `none` (the
+  recipe declares none), `fetched` (every declared file is present and
+  verified), or `failed` with a kind and path: collection failed, a declared
+  pattern matched nothing, the transfer failed, a digest differed, or the
+  archive held a missing, unlisted or unsafe entry. The
+  status is separate from the verdict: a `ran-pass` with `failed` artifacts
+  is still a pass, and a consumer that needs the files reads the status, never
+  the reason text or files already on disk.
 - **Live supervisor:** a pid with no recorded start time is treated as alive;
   only proof reconciles.
 
@@ -193,10 +212,11 @@ records" impossible.
   locks/      seat.<key> host host.gate       —
   seats/<key>/checkout/ seats/<key>/cache/    cache  (bounded by Ferry: see below)
   seats/<key>/measured                        cache  (the cap's last measurement)
-  runs/<id>/  request.json output.log artifacts/  record
+  runs/<id>/  request.json output.log artifacts.tar  record (with result.json, result.error and stop.json)
   records/    <id>.reserved.json <id>.json    record (operator retention)
   store/      repo.git                        cache
 <repo>/.ferry/receipts/                       record (the caller's)
+<repo>/.ferry/runs/<id>/                      the run's fetched artifacts (the caller's)
 <repo>/.ferry/local/v1/                       the local route's <state>
 ```
 
@@ -208,7 +228,7 @@ Nothing else is written; Ferry writes nowhere outside these.
   appends `{key, place, repo_path, seat}` to the caller's `seats.jsonl`.
   `ferry seats prune` retires, through the place's `retire` verb, each seat
   whose `repo_path` no longer exists. `retire` only tries the seat lock: a
-  busy seat is skipped and reported. It deletes the slot and its cache and
+  busy seat is skipped and reported. It deletes `seats/<key>/` and
   writes `records/retired-<key>.json`. A caller retires only seats it
   recorded, never another caller's.
 - **Size:** at the start of a run, while the run holds the seat lock, if the
@@ -274,6 +294,6 @@ working tree.
     recorded device). An unreadable or unmounted workspace is kept and
     reported. It never touches another caller's seat, and skips a busy one.
 15. **Seat size:** over `seat_cap_bytes`, a run starts cold with `pruned`
-    recorded. Nothing outside `slots/<key>` and `caches/<key>` is ever
+    recorded. Nothing outside `seats/<key>/` is ever
     measured or deleted: not through a symbolic link, not through an
     unvalidated preserve path.
