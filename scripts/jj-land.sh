@@ -140,8 +140,7 @@ if [ "$dry_run" = 1 ]; then
 fi
 
 jj bookmark move "$bookmark" --to "$pinned_candidate"
-# Local-only until a forge remote is chosen: without one, landing moves the
-# bookmark and stops.
+# Without the remote, landing moves the bookmark and stops.
 if ! jj git remote list | awk '{print $1}' | grep -qx "$remote"; then
   echo "land: LANDED ${pinned_candidate:0:12} -> $bookmark (no remote $remote; nothing pushed)"
   exit 0

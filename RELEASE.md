@@ -1,7 +1,8 @@
 # Release contract
 
-Ferry is local-only today. This describes the release boundary learned from
-Hail and Peat; it does not claim a published package or populated cache.
+Ferry's source is in a private GitHub repository, and `just land` pushes
+`main` there. This describes the release boundary learned from Hail and Peat;
+it does not claim a published package or populated cache.
 
 Cargo.toml owns the version. Nix reads it rather than keeping another version
 variable. Cargo.lock and rust-toolchain.toml pin source and compiler inputs.
@@ -15,9 +16,9 @@ that another machine can substitute it.
 
 Tagging and moving a release pointer are separate explicit publication acts,
 after version, changelog, clean-tree, checks, package and cache verification.
-Do not create a forge remote, upload a cache or publish a release without the
-user choosing that destination. Runtime Ferry neither provisions hosts nor
-performs these publication acts.
+Do not make the repository public, add another forge remote, upload a cache
+or publish a release without the user choosing that destination. Runtime
+Ferry neither provisions hosts nor performs these publication acts.
 
 Packaging exposes a normal Nix package/app and an optional Home Manager
 module (`programs.ferry`, with the agent skill) for installation. It must not duplicate
@@ -28,7 +29,7 @@ targets are not advertised merely because the source compiles on one machine.
 ## Install, upgrade and rollback
 
 One reviewed, landed commit is installed through Nix on both ends. Nothing is
-copied by hand, and nothing reaches a forge.
+copied by hand, and no install fetches from the forge.
 
 **Caller.** The machine's Nix configuration takes ferry as a flake input
 pinned by commit, `git+file:///path/to/ferry?rev=<commit>`, and installs

@@ -7,7 +7,7 @@ build:
     nix build --no-link --print-out-paths .
 
 # Publish the described jj change: run `just check` on exactly it, then move main
-# (and push it, once a forge remote named origin exists)
+# and push it to origin (without an origin remote, it lands locally only)
 land *args:
     scripts/jj-land.sh {{args}}
 

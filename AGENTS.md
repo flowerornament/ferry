@@ -2,8 +2,10 @@
 
 Run a recipe at an exact commit on a machine that has the required features.
 
-This repository is local-only until the user chooses a forge remote. Never
-publish it. Use jj; do not mutate Herald or Murail from this checkout.
+The source is in a private GitHub repository (`flowerornament/ferry`, remote
+`origin`); keep it private until the user says otherwise. `just land` is the
+only way anything reaches it. Use jj; do not mutate Herald or Murail from
+this checkout.
 Current extraction is tracked on Herald's herald-4e6mw bead.
 
 ## Check
@@ -47,10 +49,13 @@ there.
   while the check ran. One land at a time per repository: it holds
   `.jj/land.lock` (flock, released on exit or crash) from the pin to the
   publish, so a second land waits instead of gating a stale candidate.
-  With no `origin` remote it pushes nothing: ferry is
-  local-only, so never add a remote or run `jj git push`. The implementer
-  lands after the coordinator's GO; contract changes also need the consumer
-  reviewers' GO (murail-2a, murail-4a), by execution.
+  It then pushes `main` to `origin`; if the push fails, `main` moves back.
+  When `main` differs from `main@origin` it refuses: run `jj git fetch`, then
+  `jj rebase -d main`. Never push by hand (`jj git push`, `git push`): that
+  skips the gate. The root commit has an empty committer, so jj refuses to
+  push it; it is already on `origin`, so only a new remote meets it. The
+  implementer lands after the coordinator's GO; contract changes also need
+  the consumer reviewers' GO (murail-2a, murail-4a), by execution.
 - **Install:** only landed commits install, through `scripts/ferry-install`
   on hosts and the caller's Nix configuration (RELEASE.md). Announce a window
   to the seats that run Ferry first, and qualify with `just qualify-install`.

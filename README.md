@@ -563,8 +563,9 @@ just land            # gate exactly the described change, then move main (one la
   inject failures at fallible points; release builds never read it.
 - **Process conventions.** `AGENTS.md` describes them: one jj workspace per
   agent, the design gate, and stopping processes only by exact pid.
-- **No forge.** This repository is local-only; there is no published package
-  or forge remote.
+- **Private forge.** The source is in a private GitHub repository, and
+  `just land` is the only way `main` reaches it. There is no published
+  package.
 
 ## Design and direction
 
