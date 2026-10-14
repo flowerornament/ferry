@@ -202,7 +202,22 @@ record:   custody = { tier: "session",
   any session member still alive after the KILL. The pass reports; it never
   stops or retries.
 - **Complete or unknown.** Only a process born at or after the run's start
-  can be its descendant; older ones are skipped. The list is complete only
+  can be its descendant; older ones are skipped. An unreadable process is
+  also skipped when its parent is neither pid 1 nor a process of the place's
+  user, and only when that is observed coherently: the child's parent pid
+  and start time, and the parent's uid and start time, are read and still
+  match after the read. A parent that cannot be read, has gone, was reused or
+  changed during the read leaves the process unreadable, so the pass is
+  `"unknown"`. The reasoning: a process the run started, keeping the place
+  user's credentials all the way down, has as parent another one it started,
+  pid 1, or a same-user subreaper (such as `systemd --user`). This keeps the
+  user's own `sshd-session` per login (non-dumpable, its parent root's
+  `sshd`) from making every Linux pass unknown. Residue: an unreadable
+  escapee whose current parent has another uid is not listed. That covers a
+  root-owned subreaper other than pid 1 (some container inits) and any
+  credential-changing helper in its ancestry (`sudo`, a setuid program). So
+  the list is complete for the run's descendants that kept the user's
+  credentials, not proof of all descendants. The list is complete only
   when the pass read the marker of every such live process. If listing
   fails, if a live eligible process's environment cannot be read, or if a
   pid's start time changes while it is read, `survivors` is `"unknown"`,
@@ -392,7 +407,9 @@ working tree.
     live eligible process whose environment cannot be read (Linux: a
     non-dumpable child; macOS: a platform binary started by the recipe),
     each give `survivors: "unknown"` with `custody.error` naming it, never
-    `[]`, and the run's outcome is unchanged.
+    `[]`, and the run's outcome is unchanged. So does an unreadable process
+    whose parent cannot be read or changes during the read (injected): it is
+    never skipped as "not the user's".
 17. **Collect's id:** collect sees the recipe's `FERRY_ID`, and a run leaves
     exactly one `runs/<id>/`.
 18. **`status`:** with a shared run, two waiting exclusive runs and a
