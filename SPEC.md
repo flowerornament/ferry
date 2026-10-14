@@ -90,14 +90,19 @@ lock taken and nothing changed. It shows:
 - **Disk:** available bytes, the floor and the seat cap.
 - **Live runs:** each record that is reserved but not final, with its
   supervisor alive. For each: id, seat, recipe, exclusive or shared, phase
-  (`waiting` before the recipe is attempted, `running` after), start and
-  deadline. A waiting exclusive run is named as the holder of the host gate.
+  (below), start and deadline.
 - **Seats:** each `seats/<key>/` with its size, its last run and that run's
   outcome. The caller labels a seat with its workspace from its own
   `seats.jsonl`; other callers' seats show their key only.
 - **Leftovers:** processes of the place's user that carry a `FERRY_ID` whose
-  record is final or unknown, with pid, start time, run, seat and command
-  (§7).
+  record under this state root is final, with pid, start time, run, seat and
+  command (§7). A marked process with no record here (another state root,
+  such as a local run or a test's temporary root) is shown apart as
+  `record: none`, not as a leftover. Unreadable processes are counted.
+- **Phase** of a live run, from files that already exist: `waiting` (no
+  `output.log` yet: locks, admission, checkout, objects), `preparing` (the
+  log, no `result.attempted`: hooks), `running` (attempted). The gate's
+  holder is the live run named in `host.gate`.
 
 It probes no lock: a probe could make a starting run's seat look busy. It is
 a report, never a gate input. It stops nothing; a leftover is stopped by
@@ -182,12 +187,28 @@ record:   custody = { tier: "session",
 
 - **The marker.** Every hook, the recipe and everything they start inherit
   `FERRY_ID=<run id>`; collect gets the same id as the recipe (§10). After
-  the session stops, one pass over the place user's processes lists those
-  that still carry this run's id: `/proc/<pid>/environ` on Linux, `ps -E`
-  on macOS. That finds a process however it left the session (setsid,
-  double fork, re-parented to init or launchd), and needs no setup or
-  privilege. The pass reports; it never stops or retries. When it cannot
-  list processes, `survivors` is `"unknown"`.
+  the session stops, one pass reads the exec-time environment of the place
+  user's processes, in-process with no subprocess (`/proc/<pid>/environ`
+  on Linux, `sysctl KERN_PROCARGS2` on macOS), and lists those that still
+  carry this run's id. That finds a process however it left the session
+  (setsid, double fork, re-parented to init or launchd), and needs no setup
+  or privilege. `survivors` is that list merged, by pid and start time, with
+  any session member still alive after the KILL. The pass reports; it never
+  stops or retries.
+- **Complete or unknown.** Only a process born at or after the run's start
+  can be its descendant; older ones are skipped. The list is complete only
+  when the pass read the marker of every such live process. If listing
+  fails, if a live eligible process's environment cannot be read, or if a
+  pid's start time changes while it is read, `survivors` is `"unknown"`,
+  never a list, and `custody.error` names what was found and what could not
+  be read. A process that exited during the pass is skipped. `"unknown"` is
+  a report, never a refusal.
+- **Strength by OS (PRINCIPLES 9).** Linux reads any same-user process
+  except a non-dumpable one. macOS will not show the environment of Apple's
+  own platform binaries (`/bin/sh`, `/bin/sleep`, the agents launchd starts
+  for the user), so on a Mac place a run during which any such process was
+  born records `"unknown"`. That is the honest Mac strength; `status` still
+  lists the leftovers it can read.
 - **Locks.** Only the seat's lock is inherited. A survivor that keeps it
   holds the seat busy, and the next run's refusal names the run it outlived.
   It cannot hold `host` or `host.gate`, so it can never close the place to
@@ -315,9 +336,9 @@ working tree.
 |---|---|---|
 | exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (listed as a survivor when it carries the marker); a commit ever shipped on the place is fetchable by hash through a served `[[ship]]` URL even if this run did not declare it (refs are isolated, objects are not) |
 | one run per seat | inherited seat flock | work that unlocks its own descriptor |
-| exclusive host | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record) |
+| exclusive host (among Ferry runs; not a quiet host) | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record); a killed supervisor: its session runs on without `host` until its deadline, and the record reconciles to `lost` |
 | every run ends | an absolute deadline | a killed supervisor: reconciled as `lost` |
-| nothing left running | session stop; the marker pass reports what left it | a session leaver that dropped the marker |
+| run sessions stopped; marked survivors reported | session stop; the marker pass | a marked survivor is reported and left running (the project's or operator's to stop); a leaver that dropped the marker is not listed; an incomplete pass is `"unknown"` |
 | complete output | one capped writer to a file | beyond the cap: `capped` |
 | one honest record | reserve, final once, reconcile | — |
 | client independence | the detached supervisor | — |
@@ -357,6 +378,11 @@ working tree.
     next run on the seat is admitted, and `status` lists it as a leftover
     until it is stopped. One whose environment was cleared is not listed: the
     residue, asserted so a later change cannot claim it.
+16a. **An incomplete pass:** an injected failure to list processes, and a
+    live eligible process whose environment cannot be read (Linux: a
+    non-dumpable child; macOS: a platform binary started by the recipe),
+    each give `survivors: "unknown"` with `custody.error` naming it, never
+    `[]`, and the run's outcome is unchanged.
 17. **Collect's id:** collect sees the recipe's `FERRY_ID`, and a run leaves
     exactly one `runs/<id>/`.
 18. **`status`:** with a shared run, a waiting exclusive run and a leftover
