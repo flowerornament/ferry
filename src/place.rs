@@ -320,7 +320,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             // The work inherits the seat's lock only; the host's stay here,
             // so nothing a run leaves can close the place (SPEC §3).
             let finished = crate::run::run_released(root, &seat, &request, &stop, lock, deadline);
-            if let Some(error) = &finished.custody.error {
+            if let Some(error) = &finished.custody.stop_error {
                 note(
                     &mut result.reason,
                     format!("custody release failed: {error}"),

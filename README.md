@@ -467,22 +467,33 @@ its own.
 
 **At the end of a run,** the run's session (and then the collect hook's) is
 stopped: SIGTERM to every member, up to 10 s for them to leave, SIGKILL, and
-up to 2 s for them to be gone. The receipt's `custody` records:
+up to 2 s for them to be gone. Then one **marker pass** reads the
+exec-time environment of every process of the place's user born since the
+supervisor (`/proc/<pid>/environ` on Linux, `KERN_PROCARGS2` on macOS) and
+lists those carrying this run's `FERRY_ID`: every hook, the recipe and what
+they start inherit it, however they leave the session (`setsid`, a double
+fork). The receipt's `custody` records:
 - `tier`: `session`;
-- `survivors`: the members still alive after that, by pid and start time
-  (`null` if it could not be read), or `"unknown"` if the session could not
-  be listed at the end;
-- `error`: what failed on the way (a signal, a listing). The stop never
-  gives up early: it goes on to the KILL and the leader's reaping, and the
-  verdict stands.
+- `survivors`: the session's members still alive and the marked processes,
+  one entry each, by pid, start time (`null` if it could not be read) and,
+  when read, `command`; or `"unknown"`, when the session could not be listed
+  at the end, or an eligible process could not be read or changed during
+  the read. **macOS withholds the environment of its own platform binaries**
+  (`/bin/sleep`, `/bin/sh`), so on a Mac that runs anything else the result
+  is often `unknown`: never a list that might be short;
+- `error`: what failed on the way (a signal, a listing), and why the pass was
+  unknown, with what it did see. The stop never gives up early, and the
+  verdict stands. Only a failed stop is noted in the reason.
 
-Ferry proves nothing beyond the session. A process that left it (`setsid`,
-a double fork) is not chased. If it keeps the run's locks, the seat stays
-busy until it exits, and the next run's refusal names the run it outlived
-("held after run <id> ended"): stop it by its exact pid. One that also
-closed its descriptors holds nothing, and can write into a later run's
-checkout or the seat's cache unseen; the scope tier will cure that. There is no taint,
-owner marker, idle record, quarantine or `seat recover`.
+The pass reports; it never stops anything. A survivor that keeps the seat's
+lock keeps the seat busy until it exits, and the next run's refusal names
+the run it outlived ("held after run <id> ended"): stop it by its exact pid.
+One that also closed its descriptors holds nothing, and can write into a
+later run's checkout or the seat's cache. A process started with a cleared
+environment (`env -i`) carries no marker and is not listed (on macOS the
+pass then reads it as withheld: `unknown`). What a run
+starts is its project's to keep inside the run, or to stop in its collect
+hook (SPEC §7). There is no taint, quarantine or `seat recover`.
 
 **The seat lock outlives a killed supervisor.** It is inherited by the
 recipe's processes, on every platform. A killed supervisor therefore frees

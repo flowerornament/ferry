@@ -27,7 +27,9 @@ transport::run_on ── submit{request} ──────────►  plac
   │                                                    session owner: prepare → env → recipe → (result.json | result.error)
   │                                                    copy output ── runs/<id>/output.log (capped)
   │                                                    end/timeout/stop → custody: stop session (§7)
-  │                                                    collect hook, artifacts (§8)  ── runs/<id>/artifacts.tar
+  │                                                    collect hook, own session, stopped ── runs/<id>/collect.*
+  │                                                    custody::mark: one marker pass (FERRY_ID) → survivors
+  │                                                    artifacts (§8)  ── runs/<id>/artifacts.tar
   │                                                  run::verdict: first terminal fact (§5)
   │                                                  record::finalize (once)   ── records/<id>.json
 transport::follow ◄── output.log by offset ──────  place::follow
@@ -51,7 +53,7 @@ final record, and `ferry record <id>` completes the receipt later.
 | `place` | The place's verbs and the supervisor; the place record (`HostResult`). | §5, §6 |
 | `execution` | The request; prepare (locks, admission, checkout reset, ship); debug fault points. | §5, §9 |
 | `run` | The session: spawn with the seat lock inherited, deadline loop, output copier, verdict. | §3, §5 |
-| `custody` | What a session stop left alive, as recorded evidence. | §7 |
+| `custody` | What a session stop and the marker pass left alive, as recorded evidence; the one `unsafe` call (macOS `KERN_PROCARGS2`). | §7 |
 | `lock` | Seat lock (inherited by the work) and host lease (shared or exclusive, the supervisor's) as flock files. | §3, §5 |
 | `record` | Reserve, finalize once, reconcile a lost supervisor; busy-holder naming. | §8 |
 | `receipt` | The caller's receipt, digests, run ids, capabilities. | §8 |

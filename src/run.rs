@@ -142,6 +142,7 @@ impl SessionOwner {
                             Ok(start) => Some(crate::custody::Survivor {
                                 pid,
                                 start: u64::try_from(start).ok(),
+                                command: None,
                             }),
                             Err(_)
                                 if kill(Pid::from_raw(pid), None)
@@ -151,7 +152,11 @@ impl SessionOwner {
                             }
                             Err(error) => {
                                 errors.push(format!("start of survivor {pid}: {error}"));
-                                Some(crate::custody::Survivor { pid, start: None })
+                                Some(crate::custody::Survivor {
+                                    pid,
+                                    start: None,
+                                    command: None,
+                                })
                             }
                         }
                     })
@@ -192,7 +197,7 @@ fn session_list(sid: u32) -> Result<Vec<i32>> {
 /// A zombie has exited and holds nothing, though it is listed until its
 /// parent reaps it: a session member that is a zombie is not a survivor.
 #[cfg(target_os = "linux")]
-fn zombie(pid: i32) -> bool {
+pub(crate) fn zombie(pid: i32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         stat.rsplit_once(')')
             .and_then(|(_, fields)| fields.split_whitespace().next())
@@ -201,12 +206,12 @@ fn zombie(pid: i32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn zombie(_pid: i32) -> bool {
+pub(crate) fn zombie(_pid: i32) -> bool {
     false
 }
 
 #[cfg(target_os = "macos")]
-fn process_ids() -> Result<Vec<i32>> {
+pub(crate) fn process_ids() -> Result<Vec<i32>> {
     // Apple's ps executable cannot be spawned in the Darwin Nix sandbox.
     // Read the process table directly, without weakening the sandbox.
     Ok(
@@ -221,7 +226,7 @@ fn process_ids() -> Result<Vec<i32>> {
 // the stop past every bound. A /proc that
 // cannot be read is a listing failure, which takes the group fallback.
 #[cfg(not(target_os = "macos"))]
-fn process_ids() -> Result<Vec<i32>> {
+pub(crate) fn process_ids() -> Result<Vec<i32>> {
     Ok(fs::read_dir("/proc")?
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
         .collect())
@@ -362,6 +367,8 @@ pub fn run_released(
                 Output::default(),
             )
         });
+    // After every session of the run is stopped, collect's included.
+    crate::custody::mark(&request.id);
     let custody = crate::custody::take();
     Finished {
         executed,

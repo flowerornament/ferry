@@ -2507,11 +2507,7 @@ fn a_failed_teardown_after_the_verdict_is_a_note() {
         "{record}"
     );
     // KILL still followed, and nothing quarantines the host.
-    assert_eq!(
-        record["custody"]["survivors"],
-        serde_json::json!([]),
-        "{record}"
-    );
+    assert_no_survivors(&record);
     let next = ferry(dir.path())
         .args(["run", "pass", "--local", "--json"])
         .output()
@@ -2581,6 +2577,253 @@ fn locks_reach_the_recipe_but_not_the_supervisors_other_children() {
     );
 }
 
+/// A record's survivors as SPEC §7 allows them here: exact on Linux; on
+/// macOS, which withholds its platform binaries' environment from the marker
+/// pass, `unknown` (None) is always allowed, never a wrong list.
+fn survivors(record: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    match &record["custody"]["survivors"] {
+        serde_json::Value::Array(list) => Some(list.clone()),
+        unknown if cfg!(target_os = "macos") && unknown == "unknown" => None,
+        other => panic!("survivors {other} in {record}"),
+    }
+}
+
+/// No survivor: `[]`, or on macOS `unknown` with no session member among
+/// what the pass saw, so the session stop is still checked there.
+fn assert_no_survivors(record: &serde_json::Value) {
+    assert!(
+        survivors(record).is_none_or(|list| list.is_empty()),
+        "{record}"
+    );
+    let error = record["custody"]["error"].as_str().unwrap_or_default();
+    assert!(!error.contains("session survivors"), "{record}");
+}
+
+/// A recipe or hook line that leaves a python in its own session (`setsid`,
+/// re-parented once the line's shell exits), recording its pid. `closed`:
+/// it closes every inherited fd first, so it holds no lock; `cleared`: it
+/// starts under `env -i`, so it carries no marker.
+fn escapee(pidfile: &Path, closed: bool, cleared: bool) -> String {
+    let python = if cleared {
+        "env -i \"$(command -v python3)\""
+    } else {
+        "python3"
+    };
+    let close = if closed {
+        "os.closerange(3, 4096)\n"
+    } else {
+        ""
+    };
+    format!(
+        "{python} -c 'import os,time\nos.setsid()\n{close}open(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+        p = pidfile.display()
+    )
+}
+
+/// The marker pass lists what left the session (SPEC §7, §12.9): a
+/// recipe's escapee is listed by pid and command, never `[]`, and holding
+/// the seat lock it keeps the seat busy, naming the run it outlived.
+#[test]
+fn a_recipes_escapee_is_listed_by_its_marker() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("escapee.pid");
+    let dir = fixture(&escapee(&pidfile, false, false), "");
+    let escaped = Owned(pidfile);
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    let first = receipt(&out);
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
+    let pid = escaped.pid().unwrap();
+    if let Some(list) = survivors(&first) {
+        assert!(
+            list.iter().any(|s| s["pid"] == pid
+                && s["start"].is_number()
+                && s["command"].as_str().is_some_and(|c| c.contains("python"))),
+            "{first}"
+        );
+    }
+    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains(&format!(
+            "held after run {} ended",
+            first["id"].as_str().unwrap()
+        )),
+        "{record}"
+    );
+}
+
+/// The collect hook's escapee carries the run's own id (SPEC §12.9).
+#[test]
+fn a_collect_hooks_escapee_is_listed_by_its_marker() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("escapee.pid");
+    let dir = with_collect(&escapee(&pidfile, true, false), "echo ran");
+    let escaped = Owned(pidfile);
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let pid = escaped.pid().unwrap();
+    if let Some(list) = survivors(&record) {
+        assert!(list.iter().any(|s| s["pid"] == pid), "{record}");
+    }
+}
+
+/// An escapee that closed its fds (SPEC §12.16) is listed, and holds
+/// nothing: the next run on the seat is admitted. One under `env -i` is not
+/// listed: the residue, asserted so a later change cannot claim it.
+#[test]
+fn an_escapee_without_fds_is_listed_and_one_without_its_marker_is_not() {
+    let scratch = tempfile::tempdir().unwrap();
+    for cleared in [false, true] {
+        let pidfile = scratch.path().join(format!("escapee-{cleared}.pid"));
+        let dir = fixture(&escapee(&pidfile, true, cleared), "");
+        let escaped = Owned(pidfile);
+        let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], "ran-pass", "{record}");
+        let pid = escaped.pid().unwrap();
+        // `kill(pid, 0)`, not `gone`: `gone` spawns `ps`, which the Darwin
+        // Nix build cannot, and would then call a live process gone.
+        assert!(
+            kill(Pid::from_raw(pid), None).is_ok(),
+            "the escapee (cleared {cleared}) ended early: {record}"
+        );
+        if let Some(list) = survivors(&record) {
+            assert_eq!(list.iter().any(|s| s["pid"] == pid), !cleared, "{record}");
+        }
+        let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
+        assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    }
+}
+
+/// A marked process that is not dumpable (ssh-agent makes itself so) cannot
+/// be read: the pass is `unknown`, never a list without it (Linux, where the
+/// list is otherwise exact).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_marked_process_that_cannot_be_read_makes_the_pass_unknown() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("hidden.pid");
+    let dir = fixture(
+        &format!(
+            "python3 -c 'import ctypes,os,time\nos.setsid()\nos.closerange(3, 4096)\nctypes.CDLL(None).prctl(4, 0, 0, 0, 0)\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let _hidden = Owned(pidfile);
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["custody"]["survivors"], "unknown", "{record}");
+    assert!(
+        record["custody"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unreadable")),
+        "{record}"
+    );
+}
+
+/// The pass's fallible points (SPEC §7, §12.16a): a listing that fails, an
+/// eligible process that cannot be read, and one whose start changes during
+/// the read each make the survivors `unknown`, never a list; the error keeps
+/// what was seen, the session's survivors included.
+#[test]
+fn a_marker_pass_that_cannot_see_everything_is_unknown() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    for (points, said) in [
+        ("marker-list", "list processes"),
+        ("marker-read", "unreadable"),
+        ("marker-restart", "start changed"),
+        ("session-kill,marker-read", "session survivors ["),
+    ] {
+        let pidfile = scratch.path().join(format!("{points}.pid"));
+        // Only the merge case needs a session survivor (one that ignores
+        // TERM, under `session-kill`); the others run a plain recipe.
+        let script = if points.starts_with("session-kill") {
+            format!(
+                "sh -c 'trap \"\" TERM; echo $$ > {p}.tmp; mv {p}.tmp {p}; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+                p = pidfile.display()
+            )
+        } else {
+            "echo ran".to_owned()
+        };
+        let dir = fixture(&script, "");
+        let _member = Owned(pidfile);
+        let out = bounded_output(
+            ferry(dir.path())
+                .env("FERRY_FAIL_AT", points)
+                .args(["run", "probe", "--local", "--json"]),
+        );
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], "ran-pass", "{points}: {record}");
+        assert_eq!(
+            record["custody"]["survivors"], "unknown",
+            "{points}: {record}"
+        );
+        let error = record["custody"]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("marker pass") && error.contains(said),
+            "{points}: {record}"
+        );
+    }
+}
+
+/// A stop ends the recipe, and collect still runs after it under the same
+/// run id: nothing the stop leaves under `runs/<id>/` reaches collect.
+#[test]
+fn collect_runs_after_a_stop() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (started, collected) = (
+        scratch.path().join("started"),
+        scratch.path().join("collected"),
+    );
+    let dir = with_collect(
+        &format!("touch {}", collected.display()),
+        &format!("touch {}; sleep 60", started.display()),
+    );
+    let caller = Caller(
+        ferry(dir.path())
+            .args([
+                "run",
+                "probe",
+                "--local",
+                "--json",
+                "--timeout-seconds",
+                "120",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until("the recipe started", || started.exists());
+    let id = only_receipt_file(dir.path())["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let out = bounded_output(ferry(dir.path()).args(["stop", &id]));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(caller);
+    let mut record = serde_json::Value::Null;
+    wait_until("the record is final", || {
+        let out = bounded_output(ferry(dir.path()).args(["record", &id]));
+        record = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        record["state"] == "final"
+    });
+    assert!(record["stopped_by"].is_object(), "{record}");
+    assert_eq!(record["collection"]["exit_code"], 0, "{record}");
+    assert!(collected.exists(), "collect did not run after the stop");
+}
+
 /// Whether `pid` is gone: no such process, or a zombie (dead, not yet
 /// reaped by its new parent; `kill(pid, 0)` still succeeds on one). Bench
 /// once caught a zombie here (ferry-xtx.25: a test artifact).
@@ -2618,11 +2861,7 @@ fn a_session_member_that_ignores_term_is_killed_after_the_grace() {
     let record = receipt(&out);
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     assert_eq!(record["custody"]["tier"], "session", "{record}");
-    assert_eq!(
-        record["custody"]["survivors"],
-        serde_json::json!([]),
-        "{record}"
-    );
+    assert_no_survivors(&record);
     assert!(
         started.elapsed() >= limits::STOP_GRACE,
         "{:?}",
@@ -2715,11 +2954,7 @@ fn a_failed_kill_to_one_member_still_empties_the_session() {
     let record = receipt(&out);
     assert_eq!(record["state"], "final", "{record}");
     assert_eq!(record["outcome"], "ran-pass", "{record}");
-    assert_eq!(
-        record["custody"]["survivors"],
-        serde_json::json!([]),
-        "{record}"
-    );
+    assert_no_survivors(&record);
     assert!(
         record["custody"]["error"]
             .as_str()
@@ -2768,13 +3003,14 @@ fn a_live_survivor_whose_start_cannot_be_read_is_still_reported() {
         .trim()
         .parse()
         .unwrap();
-    // The loop's own `sleep` may be listed too; every entry is kept.
-    let survivors = record["custody"]["survivors"].as_array().unwrap();
-    assert!(
-        survivors.contains(&serde_json::json!({"pid": pid, "start": null})),
-        "{record}"
-    );
-    assert!(survivors.iter().all(|s| s["start"].is_null()), "{record}");
+    // The loop's own `sleep` may be listed too; every entry is kept, with
+    // the start the session's listing could not read left empty.
+    if let Some(list) = survivors(&record) {
+        assert!(
+            list.iter().any(|s| s["pid"] == pid && s["start"].is_null()),
+            "{record}"
+        );
+    }
     assert!(
         record["custody"]["error"]
             .as_str()
@@ -2809,11 +3045,7 @@ fn a_hanging_ps_cannot_stall_the_stop() {
         .unwrap();
     let record = receipt(&out);
     assert_eq!(record["outcome"], "ran-pass", "{record}");
-    assert_eq!(
-        record["custody"]["survivors"],
-        serde_json::json!([]),
-        "{record}"
-    );
+    assert_no_survivors(&record);
     assert!(
         started.elapsed() < limits::TEARDOWN,
         "{:?}",
@@ -2853,16 +3085,13 @@ fn a_survivor_holding_its_lock_is_named_and_keeps_the_seat_busy() {
         .trim()
         .parse()
         .unwrap();
-    let survivors = first["custody"]["survivors"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        survivors
-            .iter()
-            .any(|s| s["pid"] == pid && s["start"].is_number()),
-        "{first}"
-    );
+    if let Some(list) = survivors(&first) {
+        assert!(
+            list.iter()
+                .any(|s| s["pid"] == pid && s["start"].is_number()),
+            "{first}"
+        );
+    }
     let out = ferry(dir.path())
         .args(["run", "pass", "--local", "--json"])
         .output()

@@ -369,8 +369,12 @@ pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
 /// ticks since boot elsewhere. With the pid it identifies a process.
 #[cfg(target_os = "macos")]
 pub fn start_time(pid: i32) -> Result<u128> {
-    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0)?;
-    Ok(u128::from(info.pbi_start_tvsec) * 1_000_000 + u128::from(info.pbi_start_tvusec))
+    Ok(bsd_start(&libproc::proc_pid::pidinfo(pid, 0)?))
+}
+
+#[cfg(target_os = "macos")]
+pub fn bsd_start(info: &libproc::bsd_info::BSDInfo) -> u128 {
+    u128::from(info.pbi_start_tvsec) * 1_000_000 + u128::from(info.pbi_start_tvusec)
 }
 
 /// A process's start time: microseconds since the epoch on macOS, clock
