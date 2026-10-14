@@ -211,10 +211,13 @@ record:   custody = { tier: "session",
   a report, never a refusal.
 - **Strength by OS (PRINCIPLES 9).** Linux reads any same-user process
   except a non-dumpable one. macOS will not show the environment of Apple's
-  own platform binaries (`/bin/sh`, `/bin/sleep`, the agents launchd starts
-  for the user), so on a Mac place a run during which any such process was
-  born records `"unknown"`. That is the honest Mac strength; `status` still
-  lists the leftovers it can read.
+  own platform binaries (`/bin/sh`, `/bin/sleep`, `git`, the agents launchd
+  starts for the user): the read succeeds with argv and no environment, and
+  that counts as unreadable, never as "no marker". On a shared Mac some such
+  process of the user is born during almost every run, so a Mac place
+  records `"unknown"` nearly always. That is the honest Mac strength;
+  `status` still lists the leftovers it can read. Acceptance on macOS is
+  "listed or `"unknown"`, never `[]`"; on Linux it is exact.
 - **Locks.** Only the seat's lock is inherited. A survivor that keeps it
   holds the seat busy, and the next run's refusal names the run it outlived.
   It cannot hold `host` or `host.gate`, so it can never close the place to
@@ -342,8 +345,8 @@ working tree.
 |---|---|---|
 | exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (listed as a survivor when it carries the marker); a commit ever shipped on the place is fetchable by hash through a served `[[ship]]` URL even if this run did not declare it (refs are isolated, objects are not) |
 | one run per seat | inherited seat flock | work that unlocks its own descriptor |
-| exclusive host (among Ferry runs; not a quiet host) | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record); a killed supervisor: its session runs on without `host` until its deadline, and the record reconciles to `lost` |
-| every run ends | an absolute deadline | a killed supervisor: reconciled as `lost` |
+| exclusive host (among Ferry runs; not a quiet host) | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record); a killed supervisor: its session runs on without `host` until the recipe exits (nothing enforces the deadline without the supervisor), and the record reconciles to `lost` |
+| every run ends | an absolute deadline | a killed supervisor: the record is reconciled as `lost`, and its recipe runs until it exits (ferry-8d6) |
 | run sessions stopped; marked survivors reported | session stop; the marker pass | a marked survivor is reported and left running (the project's or operator's to stop); a leaver that dropped the marker is not listed; an incomplete pass is `"unknown"` |
 | complete output | one capped writer to a file | beyond the cap: `capped` |
 | one honest record | reserve, final once, reconcile | — |
@@ -364,7 +367,7 @@ working tree.
    hook) starts a child that leaves the session (setsid and double fork,
    re-parented) and keeps its fds. The seat stays busy, and the next run's
    refusal names the run it outlived. The run's record lists the survivor by
-   pid and command, never `[]`. An exclusive run on another seat is admitted
+   pid and command (on macOS: listed or `"unknown"`), never `[]`. An exclusive run on another seat is admitted
    while it lives: the survivor holds neither `host` nor `host.gate`.
 10. **A nested run on the same place:** 125.
 11. **Old caller with a new place, and a new caller with an old place:** the
@@ -380,7 +383,8 @@ working tree.
     recorded. Nothing outside `seats/<key>/` is ever
     measured or deleted: not through a symbolic link, not through an
     unvalidated preserve path.
-16. **A survivor that closed its fds:** the record lists it (marker), the
+16. **A survivor that closed its fds:** the record lists it (marker; on
+    macOS listed or `"unknown"`, never `[]`), the
     next run on the seat is admitted, and `status` lists it as a leftover
     until it is stopped. One whose environment was cleared is not listed: the
     residue, asserted so a later change cannot claim it.
