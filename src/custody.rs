@@ -217,7 +217,7 @@ fn seen(pid: i32, uid: u32, since: u128, marker: &str) -> Seen {
         environment(pid)
     };
     let unreadable = |why: String| {
-        if gone() || foreign(pid, uid, parent, owner) {
+        if gone() || foreign(pid, start, uid, parent, owner) {
             Seen::Other
         } else {
             Seen::Unreadable(why)
@@ -270,10 +270,11 @@ fn owner(pid: i32) -> std::io::Result<(u32, u128)> {
 /// §7): its parent is neither pid 1 nor a process of this user. A run's
 /// process has another of the run's, pid 1 or this user's subreaper as its
 /// parent; sshd-session's is root's sshd. Only a parent read twice the same
-/// (its pid, then its start) proves it: a failed or changing read counts the
-/// process as unreadable.
+/// (its pid, then its start), with the process itself still the one `born`
+/// then, proves it: a failed or changing read counts it as unreadable.
 fn foreign(
     pid: i32,
+    born: u128,
     uid: u32,
     parent: impl Fn(i32) -> std::io::Result<i32>,
     owner: impl Fn(i32) -> std::io::Result<(u32, u128)>,
@@ -284,7 +285,9 @@ fn foreign(
     let Ok((parent_uid, start)) = owner(up) else {
         return false;
     };
-    let same = parent(pid).ok() == Some(up) && owner(up).ok() == Some((parent_uid, start));
+    let same = parent(pid).ok() == Some(up)
+        && owner(up).ok() == Some((parent_uid, start))
+        && owner(pid).ok().map(|(_, again)| again) == Some(born);
     same && up != 1 && parent_uid != uid
 }
 
@@ -422,21 +425,21 @@ mod tests {
         use super::foreign;
         use std::{cell::Cell, io};
         let root_sshd = |_| Ok((0, 7));
-        assert!(foreign(9, 501, |_| Ok(40), root_sshd));
+        assert!(foreign(9, 7, 501, |_| Ok(40), root_sshd));
         assert!(
-            !foreign(9, 501, |_| Ok(1), root_sshd),
+            !foreign(9, 7, 501, |_| Ok(1), root_sshd),
             "pid 1 adopts the run's"
         );
         assert!(
-            !foreign(9, 501, |_| Ok(40), |_| Ok((501, 7))),
+            !foreign(9, 7, 501, |_| Ok(40), |_| Ok((501, 7))),
             "a subreaper of ours"
         );
         assert!(
-            !foreign(9, 501, |_| Err(io::Error::other("no")), root_sshd),
+            !foreign(9, 7, 501, |_| Err(io::Error::other("no")), root_sshd),
             "no parent read"
         );
         assert!(
-            !foreign(9, 501, |_| Ok(40), |_| Err(io::Error::other("no"))),
+            !foreign(9, 7, 501, |_| Ok(40), |_| Err(io::Error::other("no"))),
             "no parent owner"
         );
         let reads = Cell::new(0);
@@ -444,13 +447,24 @@ mod tests {
             reads.set(reads.get() + 1);
             Ok(if reads.get() > 1 { 41 } else { 40 })
         };
-        assert!(!foreign(9, 501, moving, root_sshd), "re-parented mid-read");
+        assert!(
+            !foreign(9, 7, 501, moving, root_sshd),
+            "re-parented mid-read"
+        );
         let starts = Cell::new(0_u128);
         let restarted = |_| {
             starts.set(starts.get() + 1);
             Ok((0, starts.get()))
         };
-        assert!(!foreign(9, 501, |_| Ok(40), restarted), "parent pid reused");
+        assert!(
+            !foreign(9, 7, 501, |_| Ok(40), restarted),
+            "parent pid reused"
+        );
+        let child = |p| Ok(if p == 9 { (501, 8) } else { (0, 7) });
+        assert!(
+            !foreign(9, 7, 501, |_| Ok(40), child),
+            "the process itself reused"
+        );
     }
 
     #[test]
