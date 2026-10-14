@@ -140,8 +140,15 @@ if [ "$dry_run" = 1 ]; then
 fi
 
 jj bookmark move "$bookmark" --to "$pinned_candidate"
+# A land from a secondary workspace never updates the colocated checkout's
+# git refs, and scripts that read commits with git there would see the old
+# tip. Export once the bookmark is final; a failure is only a note.
+export_git() {
+  jj git export >/dev/null 2>&1 || echo "land: note: jj git export failed; git's $bookmark may lag"
+}
 # Without the remote, landing moves the bookmark and stops.
 if ! jj git remote list | awk '{print $1}' | grep -qx "$remote"; then
+  export_git
   echo "land: LANDED ${pinned_candidate:0:12} -> $bookmark (no remote $remote; nothing pushed)"
   exit 0
 fi
@@ -149,4 +156,5 @@ if ! jj git push --remote "$remote" --bookmark "$bookmark"; then
   jj bookmark move "$bookmark" --to "$pinned_target" --allow-backwards
   refuse "push failed; $bookmark moved back to ${pinned_target:0:12}; land again"
 fi
+export_git
 echo "land: PUBLISHED ${pinned_candidate:0:12} -> $bookmark"
