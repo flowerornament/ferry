@@ -207,7 +207,21 @@ pub fn census(all: bool) -> Result<Census, String> {
         marked: vec![],
         unreadable: std::collections::BTreeMap::new(),
     };
+    let mut again = vec![];
     for pid in pids {
+        match seen(pid, uid, since) {
+            Seen::Other => {}
+            Seen::Marked(ids, survivor) => census.marked.push((ids, survivor)),
+            Seen::Unreadable(_) => again.push(pid),
+        }
+    }
+    // A child forked by a non-dumpable process (a login's sshd-session) is
+    // unreadable until it execs or exits: read the unreadable ones once
+    // more, after one short pause for the whole pass.
+    if !again.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for pid in again {
         match seen(pid, uid, since) {
             Seen::Other => {}
             Seen::Marked(ids, survivor) => census.marked.push((ids, survivor)),
