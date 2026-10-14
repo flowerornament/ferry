@@ -101,8 +101,14 @@ lock taken and nothing changed. It shows:
   `record: none`, not as a leftover. Unreadable processes are counted.
 - **Phase** of a live run, from files that already exist: `waiting` (no
   `output.log` yet: locks, admission, checkout, objects), `preparing` (the
-  log, no `result.attempted`: hooks), `running` (attempted). The gate's
-  holder is the live run named in `host.gate`.
+  log, no `result.attempted`: hooks), `running` (attempted).
+- **The gate.** `host.gate` names the last exclusive run that took it; the
+  name is not cleared. `status` calls that run the gate's holder only when
+  its reservation's supervisor (pid and start time) is alive; otherwise the
+  holder is `unknown`, never a stale name. Every other live exclusive run is
+  a `requester`, waiting for the gate or the host. Exclusive means "no other
+  Ferry run here", not a quiet host and not the absence of an earlier run's
+  leftovers.
 
 It probes no lock: a probe could make a starting run's seat look busy. It is
 a report, never a gate input. It stops nothing; a leftover is stopped by
@@ -385,7 +391,10 @@ working tree.
     `[]`, and the run's outcome is unchanged.
 17. **Collect's id:** collect sees the recipe's `FERRY_ID`, and a run leaves
     exactly one `runs/<id>/`.
-18. **`status`:** with a shared run, a waiting exclusive run and a leftover
-    on the place, it names each (the waiting run as the gate's holder) and
-    takes no lock: a run submitted during `status` is never refused busy
-    because of it. Same output on the Mac place and bench.
+18. **`status`:** with a shared run, two waiting exclusive runs and a
+    leftover on the place, it names each: the one holding the gate as its
+    holder, the other as a requester. With `host.gate` naming a run whose
+    supervisor is gone, the holder is `unknown`. It takes no lock: a run
+    submitted during `status` is never refused busy because of it. The Mac
+    place and bench give the same schema and meaning (`--json`), not the
+    same values.
