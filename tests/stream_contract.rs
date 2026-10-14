@@ -2697,6 +2697,36 @@ fn an_escapee_without_fds_is_listed_and_one_without_its_marker_is_not() {
     }
 }
 
+/// Every wait in the stop path is bounded (PRINCIPLES 5): a marker pass
+/// that hangs (a read blocked on a process stuck in the kernel) is abandoned
+/// at `MARKER_BOUND`, and the record is final with the survivors `unknown`.
+#[test]
+fn a_hanging_marker_pass_is_abandoned_at_its_bound() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("echo ran", "");
+    let started = Instant::now();
+    let out = bounded_output(
+        ferry(dir.path())
+            .env("FERRY_FAIL_AT", "marker-hang")
+            .args(["run", "probe", "--local", "--json"]),
+    );
+    let took = started.elapsed();
+    let record = receipt(&out);
+    assert_eq!(record["state"], "final", "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["custody"]["survivors"], "unknown", "{record}");
+    assert!(
+        record["custody"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("marker pass timed out")),
+        "{record}"
+    );
+    assert!(took >= limits::MARKER_BOUND, "{took:?}");
+    assert!(took < limits::MARKER_BOUND * 3, "{took:?}");
+}
+
 /// The pass's fallible points (SPEC §7, §12.16a): a listing that fails, an
 /// eligible process that cannot be read, and one whose start changes during
 /// the read each make the survivors `unknown`, never a list; the error keeps
