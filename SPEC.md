@@ -35,7 +35,7 @@ workspace is gone, and a seat's caches are capped (§9).
 | **Recipe** | `name → {argv, requires, exclusive, timeout, wait, artifacts, preserve}` read from the commit | runs only where `requires ⊆ provides`, on every route | the repository decides what may run |
 | **Place** | `local` or an ssh destination; `provides` = declared ∪ detected ∪ binary capabilities; `host.toml` | describes itself through the binary that will run the work | the facts come from the doer |
 | **Seat** | `(caller, repo path, name) → checkout + cache` | reset to the commit each run; `preserve` dirs kept | warm and exact, never shared |
-| **Lock** | flock: `seat.<key>`, `host`, `host.gate` | held means busy; the work inherits the fds; release by `close()` | the kernel is the only judge |
+| **Lock** | flock: `seat.<key>`, `host`, `host.gate` | held means busy; the work inherits the seat's fd only, the supervisor alone holds `host` and `host.gate`; release by `close()` | the kernel is the only judge, and a leftover can hold no more than its own seat |
 | **Run** | `id → phase, deadline` | detached from the client; ends by its deadline or `stop` | its lifetime is not the connection's |
 | **Record** | `<id>.reserved.json` → `<id>.json` | reserved before any effect, final exactly once | one honest account per attempt |
 
@@ -47,7 +47,7 @@ ferry run <recipe> [--on <place>] [--exclusive] [--seat <name>] [--commit <rev>]
 ferry follow <run>                      re-attach: tail the output until the record is final
 ferry stop <run> [--other --reason <why>]
 ferry record [<run> | last] [--json]
-ferry status [--on <place>] [--json]
+ferry status [--on <place>] [--json]   what the place sees now (read-only)
 ferry check  [--on <place>]
 ferry seats prune [--on <place>]        retire this caller's seats whose workspace is gone
 ferry recipes · ferry places
@@ -84,6 +84,29 @@ infrastructure loss, by the record's `outcome`. Exit codes are for people:
 a recipe's own code can coincide with 3, 124, 125 or 255, so a program
 decides by `--json` (`state`, then `outcome`), never by the exit code alone.
 
+**`status`:** one read of the place's state root and process table, with no
+lock taken and nothing changed. It shows:
+
+- **Disk:** available bytes, the floor and the seat cap.
+- **Live runs:** each record that is reserved but not final, with its
+  supervisor alive. For each: id, seat, recipe, exclusive or shared, phase
+  (`waiting` before the recipe is attempted, `running` after), start and
+  deadline. A waiting exclusive run is named as the holder of the host gate.
+- **Seats:** each `seats/<key>/` with its size, its last run and that run's
+  outcome. The caller labels a seat with its workspace from its own
+  `seats.jsonl`; other callers' seats show their key only.
+- **Leftovers:** processes of the place's user that carry a `FERRY_ID` whose
+  record is final or unknown, with pid, start time, run, seat and command
+  (§7).
+
+It probes no lock: a probe could make a starting run's seat look busy. It is
+a report, never a gate input. It stops nothing; a leftover is stopped by
+its exact pid, by the operator.
+
+**Why:** "who holds the gate, why is this seat busy, what is idle, what
+outlived its run" must each be one command, and the answers already exist
+in records, run directories and the marker.
+
 **Refusals (125)** each print `what / why / next`:
 
 - unknown recipe or place;
@@ -107,7 +130,7 @@ super:   seat lock (try; held → refuse busy)
          floor check (host.toml) ─► reset checkout (keep preserve) ─► objects
          hooks: prepare → env → recipe argv+args → collect     stdout+stderr → output.log
          deadline = submit + wait + timeout + grace, absolute, checked every phase
-         end/timeout/stop: stop session (+ scope) ─► collect artifacts ─► final record ─► close locks ─► exit
+         end/timeout/stop: stop session ─► collect (own session, stopped) ─► marker pass ─► artifacts ─► final record ─► close locks ─► exit
 caller:  follow output.log by offset until record final ─► receipt ─► exit code
 ```
 
@@ -151,20 +174,46 @@ streams do not.
 ## 7. Custody
 
 ```
-at end:  stop session (TERM → grace 10 s → KILL) ; Linux + systemd: stop the run's scope
-record:  custody = { tier: "scope" | "session",
-                     survivors: [{pid, start}] | "unknown" }
+at end:   stop session (TERM → grace 10 s → KILL)      recipe's, then collect's
+          one marker pass: processes carrying FERRY_ID=<this run>
+record:   custody = { tier: "session",
+                      survivors: [{pid, start, command}] | "unknown" }
 ```
 
-- A survivor that still holds a lock keeps it held, so the seat stays busy,
-  and the next run's busy refusal names the run it outlived. The record does
-  not attribute locks to survivors: the kernel lock is the evidence, and
-  attributing it would mean reading other processes' descriptors.
-- A survivor that closed its descriptors is outside Ferry's knowledge: it is
-  reported where it is visible and never chased.
+- **The marker.** Every hook, the recipe and everything they start inherit
+  `FERRY_ID=<run id>`; collect gets the same id as the recipe (§10). After
+  the session stops, one pass over the place user's processes lists those
+  that still carry this run's id: `/proc/<pid>/environ` on Linux, `ps -E`
+  on macOS. That finds a process however it left the session (setsid,
+  double fork, re-parented to init or launchd), and needs no setup or
+  privilege. The pass reports; it never stops or retries. When it cannot
+  list processes, `survivors` is `"unknown"`.
+- **Locks.** Only the seat's lock is inherited. A survivor that keeps it
+  holds the seat busy, and the next run's refusal names the run it outlived.
+  It cannot hold `host` or `host.gate`, so it can never close the place to
+  other seats. The cost: a survivor of an exclusive run can overlap the next
+  run unseen by the lease. The record lists it.
+- **Residue.** A process that drops or rewrites its environment (for
+  example `env -i`) carries no marker and is outside Ferry's knowledge;
+  `survivors` lists only what the marker shows. A process that also closed
+  its fds holds nothing, and the next run is admitted.
+
+**Responsibility for what a run starts:**
+
+| Party | Owns |
+|---|---|
+| Ferry | the run's session: stop it at the end, the deadline or a stop; list marked survivors in the record and in `status`; let a survivor hold only its own seat |
+| The project's committed recipes and hooks | everything they start: it stays in the run's session (no `-d`, `nohup`, `setsid`, `daemon()`), or the project's collect hook stops it; the marker is never removed |
+| The operator | a survivor that broke that contract: stop it by exact pid; host policy |
 
 **Why:** proving absence cost more machinery than everything else combined
-(ten critic rounds). The OS offers stronger containment as a tier.
+(ten critic rounds), and containment (a cgroup, a user per run) is
+different on each OS and needs host setup. A marker pass works the same on
+macOS and Linux, catches the escapes seen so far, and only reports. On
+2026-10-13 a stopped run's detached devenv Postgres held its seat and the
+shared host lease for 16 hours while its record said `survivors: []`; an
+exclusive request then queued behind it closed bench to every seat. A
+stronger OS tier stays possible (PRINCIPLES 6) and is not planned.
 
 ## 8. Records and receipts
 
@@ -256,16 +305,19 @@ working tree.
 - **`seats.jsonl`** (caller state, `~/.local/state/ferry/`): one line per seat
   this caller used: `{key, place, repo_path, seat, last_used_ms}`.
 - **Hook environment:** `FERRY_ID FERRY_SEAT FERRY_COMMIT FERRY_WORKDIR
-  FERRY_CACHE_DIR FERRY_TMP`, plus `FERRY_EXIT_CODE` for collect.
+  FERRY_CACHE_DIR FERRY_TMP`, plus `FERRY_EXIT_CODE` for collect. Every hook
+  and the recipe see the same `FERRY_ID`, the run's own, collect included
+  (it is the §7 marker).
 
 ## 11. Guarantees and residues
 
 | Guarantee | Mechanism | Residue (reported) |
 |---|---|---|
-| exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (until the scope tier); a commit ever shipped on the place is fetchable by hash through a served `[[ship]]` URL even if this run did not declare it (refs are isolated, objects are not) |
-| one run per seat; exclusive host | inherited flock | work that unlocks its own descriptor |
+| exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (listed as a survivor when it carries the marker); a commit ever shipped on the place is fetchable by hash through a served `[[ship]]` URL even if this run did not declare it (refs are isolated, objects are not) |
+| one run per seat | inherited seat flock | work that unlocks its own descriptor |
+| exclusive host | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record) |
 | every run ends | an absolute deadline | a killed supervisor: reconciled as `lost` |
-| nothing left running | session stop; scope tier | outside a scope: a session leaver that closed its fds |
+| nothing left running | session stop; the marker pass reports what left it | a session leaver that dropped the marker |
 | complete output | one capped writer to a file | beyond the cap: `capped` |
 | one honest record | reserve, final once, reconcile | — |
 | client independence | the detached supervisor | — |
@@ -281,8 +333,12 @@ working tree.
 6. **Deadline:** `timeout` 124 even with no client; the session is stopped.
 7. **Seat busy:** immediate 125 naming the run.
 8. **Exclusive:** no other run holds `host` while it executes.
-9. **A survivor holding a lock:** the seat stays busy; the run's record lists
-   the survivor, and the next run's refusal names the run it outlived.
+9. **A survivor holding a lock:** a recipe (and, separately, a collect
+   hook) starts a child that leaves the session (setsid and double fork,
+   re-parented) and keeps its fds. The seat stays busy, and the next run's
+   refusal names the run it outlived. The run's record lists the survivor by
+   pid and command, never `[]`. An exclusive run on another seat is admitted
+   while it lives: the survivor holds neither `host` nor `host.gate`.
 10. **A nested run on the same place:** 125.
 11. **Old caller with a new place, and a new caller with an old place:** the
     refusal (125, naming the old `source_rev`), never a mixed state root.
@@ -297,3 +353,13 @@ working tree.
     recorded. Nothing outside `seats/<key>/` is ever
     measured or deleted: not through a symbolic link, not through an
     unvalidated preserve path.
+16. **A survivor that closed its fds:** the record lists it (marker), the
+    next run on the seat is admitted, and `status` lists it as a leftover
+    until it is stopped. One whose environment was cleared is not listed: the
+    residue, asserted so a later change cannot claim it.
+17. **Collect's id:** collect sees the recipe's `FERRY_ID`, and a run leaves
+    exactly one `runs/<id>/`.
+18. **`status`:** with a shared run, a waiting exclusive run and a leftover
+    on the place, it names each (the waiting run as the gate's holder) and
+    takes no lock: a run submitted during `status` is never refused busy
+    because of it. Same output on the Mac place and bench.
