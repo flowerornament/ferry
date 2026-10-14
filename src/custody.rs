@@ -16,7 +16,8 @@ pub struct Survivor {
     /// serde's buffering, and a start time fits.
     #[serde(default)]
     pub start: Option<u64>,
-    /// Its command line, when the marker pass read it.
+    /// Its executable as it was run (`argv[0]`, capped), when the marker pass
+    /// read it: never its arguments, which may carry secrets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }
@@ -104,9 +105,21 @@ pub fn take() -> Release {
 
 /// Adds the marker pass to this run's custody: its survivors merge with the
 /// session's (one entry per pid and start), or the survivors become
-/// `unknown`, with what was seen kept in the error.
-pub fn mark(id: &str) {
-    let marked = marked(id);
+/// `unknown`, with what was seen kept in the error. A read can block on a
+/// process stuck in the kernel, so the pass runs on its own thread, bounded
+/// by `MARKER_BOUND` and the run's deadline; past that it is abandoned (the
+/// supervisor exits soon after) and the survivors are `unknown`.
+pub fn mark(id: &str, deadline_ms: u128) {
+    let left = deadline_ms.saturating_sub(crate::receipt::now_ms());
+    let bound = crate::limits::MARKER_BOUND.min(std::time::Duration::from_millis(
+        u64::try_from(left).unwrap_or(u64::MAX),
+    ));
+    let (sent, received) = std::sync::mpsc::channel();
+    let id = id.to_owned();
+    std::thread::spawn(move || sent.send(marked(&id)));
+    let marked = received
+        .recv_timeout(bound)
+        .unwrap_or_else(|_| Err(format!("marker pass timed out after {bound:?}")));
     let Ok(mut found) = FOUND.lock() else {
         return;
     };
@@ -151,6 +164,9 @@ fn marked(id: &str) -> Result<Vec<Survivor>, String> {
     let marker = format!("FERRY_ID={id}");
     let me = i32::try_from(std::process::id()).map_err(|e| e.to_string())?;
     let (uid, since) = owner(me).map_err(|e| format!("own start: {e}"))?;
+    while fail_at("marker-hang") {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
     let pids = if fail_at("marker-list") {
         Err("injected by FERRY_FAIL_AT".into())
     } else {
@@ -201,7 +217,7 @@ fn seen(pid: i32, uid: u32, since: u128, marker: &str) -> Seen {
         environment(pid)
     };
     let unreadable = |why: String| {
-        if gone() {
+        if gone() || foreign(pid, uid, parent, owner) {
             Seen::Other
         } else {
             Seen::Unreadable(why)
@@ -250,7 +266,45 @@ fn owner(pid: i32) -> std::io::Result<(u32, u128)> {
     Ok((info.pbi_uid, crate::record::bsd_start(&info)))
 }
 
-/// A process's exec-time environment and command line.
+/// Whether an unreadable process provably did not come from the run (SPEC
+/// §7): its parent is neither pid 1 nor a process of this user. A run's
+/// process has another of the run's, pid 1 or this user's subreaper as its
+/// parent; sshd-session's is root's sshd. Only a parent read twice the same
+/// (its pid, then its start) proves it: a failed or changing read counts the
+/// process as unreadable.
+fn foreign(
+    pid: i32,
+    uid: u32,
+    parent: impl Fn(i32) -> std::io::Result<i32>,
+    owner: impl Fn(i32) -> std::io::Result<(u32, u128)>,
+) -> bool {
+    let Ok(up) = parent(pid) else {
+        return false;
+    };
+    let Ok((parent_uid, start)) = owner(up) else {
+        return false;
+    };
+    let same = parent(pid).ok() == Some(up) && owner(up).ok() == Some((parent_uid, start));
+    same && up != 1 && parent_uid != uid
+}
+
+/// A process's parent: readable even when the process is not dumpable.
+#[cfg(not(target_os = "macos"))]
+fn parent(pid: i32) -> std::io::Result<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(1)?.parse().ok())
+        .ok_or_else(|| std::io::Error::other("no parent in stat"))
+}
+
+#[cfg(target_os = "macos")]
+fn parent(pid: i32) -> std::io::Result<i32> {
+    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0)
+        .map_err(std::io::Error::other)?;
+    i32::try_from(info.pbi_ppid).map_err(std::io::Error::other)
+}
+
+/// A process's exec-time environment and `argv[0]`.
 #[cfg(not(target_os = "macos"))]
 fn environment(pid: i32) -> Result<(Vec<String>, String), String> {
     let read = |what: &str| {
@@ -264,8 +318,8 @@ fn environment(pid: i32) -> Result<(Vec<String>, String), String> {
             .collect()
     };
     let environment = strings(&read("environ")?);
-    let command = strings(&read("cmdline")?).join(" ");
-    Ok((environment, command))
+    let command = strings(&read("cmdline")?).into_iter().next();
+    Ok((environment, command.unwrap_or_default()))
 }
 
 #[cfg(target_os = "macos")]
@@ -300,7 +354,7 @@ fn parse_procargs(buffer: &[u8]) -> Result<(Vec<String>, String), String> {
     if environment.is_empty() {
         return Err("its environment is withheld".into());
     }
-    Ok((environment, argv.join(" ")))
+    Ok((environment, argv.into_iter().next().unwrap_or_default()))
 }
 
 /// The one `unsafe` in Ferry (a test counts it): `sysctl(3)` for
@@ -361,12 +415,50 @@ mod tests {
         bytes
     }
 
+    /// An unreadable process is skipped only on a stable, foreign parent;
+    /// a parent that cannot be read, or changes, never skips it.
+    #[test]
+    fn only_a_stable_foreign_parent_skips_an_unreadable_process() {
+        use super::foreign;
+        use std::{cell::Cell, io};
+        let root_sshd = |_| Ok((0, 7));
+        assert!(foreign(9, 501, |_| Ok(40), root_sshd));
+        assert!(
+            !foreign(9, 501, |_| Ok(1), root_sshd),
+            "pid 1 adopts the run's"
+        );
+        assert!(
+            !foreign(9, 501, |_| Ok(40), |_| Ok((501, 7))),
+            "a subreaper of ours"
+        );
+        assert!(
+            !foreign(9, 501, |_| Err(io::Error::other("no")), root_sshd),
+            "no parent read"
+        );
+        assert!(
+            !foreign(9, 501, |_| Ok(40), |_| Err(io::Error::other("no"))),
+            "no parent owner"
+        );
+        let reads = Cell::new(0);
+        let moving = |_| {
+            reads.set(reads.get() + 1);
+            Ok(if reads.get() > 1 { 41 } else { 40 })
+        };
+        assert!(!foreign(9, 501, moving, root_sshd), "re-parented mid-read");
+        let starts = Cell::new(0_u128);
+        let restarted = |_| {
+            starts.set(starts.get() + 1);
+            Ok((0, starts.get()))
+        };
+        assert!(!foreign(9, 501, |_| Ok(40), restarted), "parent pid reused");
+    }
+
     #[test]
     fn procargs_with_an_environment_parse() {
         let bytes = procargs(2, &["/bin/x", "x", "-y", "FERRY_ID=r1", "HOME=/h"]);
         let (environment, command) = parse_procargs(&bytes).unwrap();
         assert_eq!(environment, ["FERRY_ID=r1", "HOME=/h"]);
-        assert_eq!(command, "x -y");
+        assert_eq!(command, "x");
     }
 
     /// macOS's platform binaries: the arguments, with no environment.

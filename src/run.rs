@@ -368,7 +368,7 @@ pub fn run_released(
             )
         });
     // After every session of the run is stopped, collect's included.
-    crate::custody::mark(&request.id);
+    crate::custody::mark(&request.id, deadline_ms);
     let custody = crate::custody::take();
     Finished {
         executed,

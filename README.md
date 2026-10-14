@@ -476,11 +476,15 @@ fork). The receipt's `custody` records:
 - `tier`: `session`;
 - `survivors`: the session's members still alive and the marked processes,
   one entry each, by pid, start time (`null` if it could not be read) and,
-  when read, `command`; or `"unknown"`, when the session could not be listed
-  at the end, or an eligible process could not be read or changed during
-  the read. **macOS withholds the environment of its own platform binaries**
-  (`/bin/sleep`, `/bin/sh`), so on a Mac that runs anything else the result
-  is often `unknown`: never a list that might be short;
+  when read, `command` (its `argv[0]` only: arguments may carry secrets); or
+  `"unknown"`, when the session could not be listed at the end, an eligible
+  process could not be read or changed during the read, or the pass took
+  longer than 10 s (or the run's deadline). An unreadable process whose
+  parent is neither pid 1 nor a process of the place's user (a login's
+  `sshd-session`) cannot be the run's and is skipped. **macOS withholds the
+  environment of its own platform binaries** (`/bin/sleep`, `/bin/sh`), so
+  on a Mac that runs anything else the result is often `unknown`: never a
+  list that might be short;
 - `error`: what failed on the way (a signal, a listing), and why the pass was
   unknown, with what it did see. The stop never gives up early, and the
   verdict stands. Only a failed stop is noted in the reason.

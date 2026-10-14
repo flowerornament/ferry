@@ -2697,34 +2697,6 @@ fn an_escapee_without_fds_is_listed_and_one_without_its_marker_is_not() {
     }
 }
 
-/// A marked process that is not dumpable (ssh-agent makes itself so) cannot
-/// be read: the pass is `unknown`, never a list without it (Linux, where the
-/// list is otherwise exact).
-#[cfg(target_os = "linux")]
-#[test]
-fn a_marked_process_that_cannot_be_read_makes_the_pass_unknown() {
-    let scratch = tempfile::tempdir().unwrap();
-    let pidfile = scratch.path().join("hidden.pid");
-    let dir = fixture(
-        &format!(
-            "python3 -c 'import ctypes,os,time\nos.setsid()\nos.closerange(3, 4096)\nctypes.CDLL(None).prctl(4, 0, 0, 0, 0)\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
-            p = pidfile.display()
-        ),
-        "",
-    );
-    let _hidden = Owned(pidfile);
-    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
-    let record = receipt(&out);
-    assert_eq!(record["outcome"], "ran-pass", "{record}");
-    assert_eq!(record["custody"]["survivors"], "unknown", "{record}");
-    assert!(
-        record["custody"]["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("unreadable")),
-        "{record}"
-    );
-}
-
 /// The pass's fallible points (SPEC §7, §12.16a): a listing that fails, an
 /// eligible process that cannot be read, and one whose start changes during
 /// the read each make the survivors `unknown`, never a list; the error keeps

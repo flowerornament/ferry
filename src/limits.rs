@@ -15,6 +15,10 @@ pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// How long a session's output writer gets after the session stop.
 pub const DRAIN: Duration = Duration::from_secs(2);
 
+/// The marker pass's bound (SPEC §7): past it, or past the run's deadline,
+/// the survivors are `unknown` and the pass is abandoned.
+pub const MARKER_BOUND: Duration = Duration::from_secs(10);
+
 /// The most a run's output log holds; later output is read and dropped.
 pub const OUTPUT_CAP: u64 = 1 << 30;
 
@@ -26,12 +30,14 @@ pub const WAIT: Duration = Duration::from_mins(30);
 pub const MAX_TIMEOUT: Duration = Duration::from_hours(6);
 
 /// Everything after the recipe: the stop of its session and of the collect
-/// hook's, the collect hook, the output drains, and a margin. Part of the
+/// hook's, the collect hook, the output drains, the marker pass, and a
+/// margin. Part of the
 /// absolute deadline.
 pub const TEARDOWN: Duration = Duration::from_secs(
     (STOP_GRACE.as_secs() + KILL_GRACE.as_secs()) * 2
         + COLLECT_TIMEOUT.as_secs()
         + DRAIN.as_secs() * 2
+        + MARKER_BOUND.as_secs()
         + 10,
 );
 
