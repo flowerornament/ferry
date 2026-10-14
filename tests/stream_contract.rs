@@ -2193,6 +2193,34 @@ fn the_collect_hooks_output_is_in_the_runs_log() {
     assert_eq!(record["output"]["bytes"], log.len(), "{record}");
 }
 
+/// Collect is part of the run (SPEC §10, §12.17): it sees the run's own
+/// `FERRY_ID` and request file, and the run leaves exactly one run directory.
+#[test]
+fn the_collect_hook_sees_the_runs_own_id_and_request() {
+    let dir = with_collect(
+        "echo \"id=$FERRY_ID file=$FERRY_REQUEST_FILE\"; grep -q FERRY_EXIT_CODE \"$FERRY_REQUEST_FILE\" && echo collects-request || echo runs-request",
+        "echo ran",
+    );
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert_eq!(record["collection"]["exit_code"], 0, "{record}");
+    let id = record["id"].as_str().unwrap();
+    let log = String::from_utf8(output_log(dir.path(), id)).unwrap();
+    assert!(
+        log.contains(&format!("id={id} file="))
+            && log.contains(&format!("/runs/{id}/request.json\n")),
+        "{log}"
+    );
+    assert!(log.contains("runs-request"), "{log}");
+    let runs: Vec<_> = fs::read_dir(dir.path().join(".ferry/local/v1/runs"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(runs, [std::ffi::OsString::from(id)]);
+}
+
 // --- Failures inside the run keep the verdict ---
 
 #[test]

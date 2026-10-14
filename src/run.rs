@@ -397,7 +397,8 @@ fn run(
         Ok(log) => log,
         Err(error) => return (Err(error), None, Output::default()),
     };
-    let outcome = run_session(root, workdir, request, stop, lock, &log, deadline_ms);
+    let spec = crate::record::run_dir(root, &request.id).join("request.json");
+    let outcome = run_session(&spec, workdir, request, stop, lock, &log, deadline_ms);
     let collection = request
         .hooks
         .collect
@@ -461,7 +462,6 @@ fn run_collect(
     log: &RunLog,
 ) -> Result<(i32, bool)> {
     let mut collect = request.clone();
-    collect.id = receipt::run_id()?;
     collect.hooks.prepare = None;
     collect.hooks.collect = None;
     collect.args.clear();
@@ -485,7 +485,7 @@ fn run_collect(
     // Collection has its own bounded session after recipe teardown, including
     // timeout or preparation failure. Never reinterpret the recipe verdict.
     match run_session(
-        root,
+        &crate::record::run_dir(root, &request.id).join("collect.json"),
         workdir,
         &collect,
         &AtomicBool::new(false),
@@ -557,8 +557,12 @@ fn open_log(root: &Path, request: &Request) -> Result<RunLog> {
     )))))
 }
 
+/// Runs one session from the request it writes at `spec`. The recipe's is
+/// `runs/<id>/request.json`, with `result.*` beside it; collect, under the
+/// same run id, uses `collect.json` and `collect.result.*`, so it never
+/// overwrites the recipe's.
 fn run_session(
-    root: &Path,
+    spec: &Path,
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
@@ -566,13 +570,14 @@ fn run_session(
     log: &RunLog,
     deadline_ms: u128,
 ) -> Result<Ended> {
-    let run_dir = crate::record::run_dir(root, &request.id);
-    fs::create_dir_all(&run_dir)?;
-    let spec = run_dir.join("request.json");
-    fs::write(&spec, serde_json::to_vec(request)?)?;
-    let result_path = run_dir.join("result.json");
+    fs::write(spec, serde_json::to_vec(request)?)?;
+    let result_path = if spec.ends_with("request.json") {
+        spec.with_file_name("result.json")
+    } else {
+        spec.with_extension("result.json")
+    };
     let (reader, writer) = std::io::pipe()?;
-    let (spawned, restored) = spawn_session(workdir, &spec, &result_path, lock, writer)?;
+    let (spawned, restored) = spawn_session(workdir, spec, &result_path, lock, writer)?;
     let child = spawned?;
     let mut owner = SessionOwner {
         child,
@@ -726,7 +731,11 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         ("FERRY_WORKDIR".to_owned(), workdir.display().to_string()),
         ("FERRY_CACHE_DIR".to_owned(), cache.display().to_string()),
         ("FERRY_ID".to_owned(), request.id.clone()),
-        ("FERRY_REQUEST_FILE".to_owned(), spec.display().to_string()),
+        // The run's request, for collect too.
+        (
+            "FERRY_REQUEST_FILE".to_owned(),
+            spec.with_file_name("request.json").display().to_string(),
+        ),
     ]);
     env.extend(request.forwarded_env.clone());
     if request.ship.iter().any(|shipped| shipped.url.is_some()) {

@@ -352,13 +352,16 @@ receipts or records.
 ## Hooks and environment
 
 Hooks are committed executables, with paths relative to the checkout. They run
-inside the run's own session, in this order: prepare, env, the recipe, collect.
+in this order: prepare, env, the recipe (in the run's session), then collect
+(in its own session, after the recipe's is stopped).
 A run stopped before its session is spawned (a stop while it waits for locks
 or prepares its seat) runs none of them, collect included: nothing ran.
 
 - **env** prints a JSON object of environment strings, never shell code.
 - **Inputs:** `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, `FERRY_WORKDIR`,
-  `FERRY_CACHE_DIR`; collect also gets `FERRY_EXIT_CODE`.
+  `FERRY_CACHE_DIR`, `FERRY_REQUEST_FILE`; collect also gets
+  `FERRY_EXIT_CODE`. Every hook and the recipe see the run's own `FERRY_ID`
+  (SPEC §10) and request file, collect included.
 - **Identity:** the checkout path's basename is not an identity (every
   seat's is `checkout`). A stable per-seat identity is `FERRY_SEAT`, the
   same value the pre-M1 slot directory was named after; `FERRY_ID` is per
