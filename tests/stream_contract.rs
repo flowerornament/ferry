@@ -1341,6 +1341,39 @@ fn an_exclusive_runs_leaver_holds_its_seat_but_not_the_host() {
     );
 }
 
+/// An exclusive lock held by a helper process, released when dropped. One
+/// held by the test process itself is shared, until exec, with every child
+/// a parallel test spawns (Linux), so its release cannot be timed: such a
+/// child can still hold it a moment after `drop`.
+struct Holder(std::process::Child);
+impl Holder {
+    fn exclusive(path: &Path) -> Self {
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys,time\nf=open(sys.argv[1],'a+')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(600)",
+            ])
+            .arg(path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        assert_eq!(line.trim(), "held");
+        Self(child)
+    }
+}
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The run in `runs` paused at `point` (its `<at>.paused` marker), as its
 /// id and the marker's path.
 fn paused_at(runs: &Path, at: &str) -> (String, PathBuf) {
@@ -1609,21 +1642,13 @@ fn a_prepare_refusal_keeps_its_acquired_seat_until_finalization() {
 /// stays held until the refused record is final.
 #[test]
 fn a_host_wait_refusal_keeps_its_seat_until_finalization() {
-    use fs2::FileExt;
     if !cfg!(debug_assertions) {
         return;
     }
     let dir = fixture("echo ran", "");
     let locks = dir.path().join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
-    let host = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(locks.join("host"))
-        .unwrap();
-    host.lock_exclusive().unwrap();
+    let host = Holder::exclusive(&locks.join("host"));
     let mut first = Caller(
         ferry(dir.path())
             .env("FERRY_FAIL_AT", "pre-finalize")
@@ -1658,14 +1683,7 @@ fn a_partly_taken_host_lease_keeps_its_gate_until_finalization() {
     let dir = fixture("echo ran", "");
     let locks = dir.path().join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
-    let host = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(locks.join("host"))
-        .unwrap();
-    host.lock_exclusive().unwrap();
+    let host = Holder::exclusive(&locks.join("host"));
     let mut first = Caller(
         ferry(dir.path())
             .env("FERRY_FAIL_AT", "pre-finalize")
@@ -1731,7 +1749,6 @@ fn a_failed_finalize_keeps_the_locks_until_the_supervisor_exits() {
 /// only what that proves, never "held by shared runs" alone.
 #[test]
 fn an_exclusive_holder_released_between_probes_is_not_claimed_as_shared() {
-    use fs2::FileExt;
     if !cfg!(debug_assertions) {
         return;
     }
@@ -1739,14 +1756,7 @@ fn an_exclusive_holder_released_between_probes_is_not_claimed_as_shared() {
     let root = dir.path().join(".ferry/local/v1");
     let locks = root.join("locks");
     fs::create_dir_all(&locks).unwrap();
-    let host = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(locks.join("host"))
-        .unwrap();
-    host.lock_exclusive().unwrap();
+    let host = Holder::exclusive(&locks.join("host"));
     let caller = Caller(
         ferry(dir.path())
             .env("FERRY_FAIL_AT", "between-probes")
@@ -1862,18 +1872,10 @@ fn a_supervisor_panic_keeps_its_locks_until_finalization() {
 /// A run waiting for a host lock this test holds, paused at the host
 /// probe after its wait expired; returns the caller, the held lock file
 /// and the pause marker.
-fn paused_at_the_host_probe(dir: &Path) -> (Caller, fs::File, PathBuf) {
-    use fs2::FileExt;
+fn paused_at_the_host_probe(dir: &Path) -> (Caller, Holder, PathBuf) {
     let locks = dir.join(".ferry/local/v1/locks");
     fs::create_dir_all(&locks).unwrap();
-    let host = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(locks.join("host"))
-        .unwrap();
-    host.lock_exclusive().unwrap();
+    let host = Holder::exclusive(&locks.join("host"));
     let caller = Caller(
         ferry(dir)
             .env("FERRY_FAIL_AT", "host-probe")
@@ -2884,6 +2886,7 @@ fn a_marker_pass_that_cannot_see_everything_is_unknown() {
         ("marker-list", "list processes"),
         ("marker-read", "unreadable"),
         ("marker-restart", "start changed"),
+        ("marker-owner", "owner: injected"),
         ("session-kill,marker-read", "session survivors ["),
     ] {
         let pidfile = scratch.path().join(format!("{points}.pid"));

@@ -239,8 +239,17 @@ enum Seen {
 
 fn seen(pid: i32, uid: u32, since: u128) -> Seen {
     let gone = || kill(Pid::from_raw(pid), None) == Err(nix::errno::Errno::ESRCH);
-    let Ok((owner_uid, start)) = owner(pid) else {
-        return Seen::Other;
+    // Only a process proven gone is skipped unread: an owner that cannot
+    // be read (EPERM, a race) makes the pass unknown, never shorter.
+    let read = if fail_at("marker-owner") {
+        Err(std::io::Error::other("injected by FERRY_FAIL_AT"))
+    } else {
+        owner(pid)
+    };
+    let (owner_uid, start) = match read {
+        Ok(read) => read,
+        Err(_) if gone() => return Seen::Other,
+        Err(e) => return Seen::Unreadable(format!("owner: {e}")),
     };
     if owner_uid != uid || start < since || crate::run::zombie(pid) {
         return Seen::Other;
