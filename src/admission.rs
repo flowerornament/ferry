@@ -61,7 +61,7 @@ fn policy_path() -> Option<PathBuf> {
 // statvfs field widths differ between platforms (u32 or u64), so the
 // conversions are needed somewhere even where one is a no-op.
 #[allow(clippy::useless_conversion)]
-fn available(root: &Path) -> Result<u64> {
+pub(crate) fn available(root: &Path) -> Result<u64> {
     let stat = nix::sys::statvfs::statvfs(root)?;
     Ok(u64::from(stat.blocks_available()) * u64::from(stat.fragment_size()))
 }
@@ -151,7 +151,7 @@ const MEASURE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Bytes of regular files under `path` on device `dev`, never following
 /// links nor crossing into another device (a mount); 0 if absent. `None`
 /// once `until` has passed.
-fn size_until(path: &Path, until: Option<std::time::Instant>, dev: u64) -> Option<u64> {
+pub(crate) fn size_until(path: &Path, until: Option<std::time::Instant>, dev: u64) -> Option<u64> {
     if until.is_some_and(|until| std::time::Instant::now() >= until) {
         return None;
     }

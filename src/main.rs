@@ -12,6 +12,7 @@ mod record;
 mod repository;
 mod run;
 mod seats;
+mod status;
 mod transport;
 
 use clap::{Args, Parser, Subcommand};
@@ -44,6 +45,15 @@ enum Action {
     Seats {
         #[command(subcommand)]
         command: SeatsAction,
+    },
+    /// What a place sees now: disk, live runs, the gate, seats, leftovers.
+    /// Read-only: it takes no lock and stops nothing.
+    Status {
+        /// The place (default: this repository's local place).
+        #[arg(long)]
+        on: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Follow a run's output from any terminal until it ends.
     Follow {
@@ -116,6 +126,7 @@ enum PlaceVerb {
     Retire {
         key: String,
     },
+    Status,
 }
 #[derive(Args)]
 struct Run {
@@ -426,6 +437,7 @@ fn execute(cli: Cli) -> Result<i32> {
             );
             Ok(0)
         }
+        Action::Status { on, json } => status::show(on.as_deref(), &machines()?, json),
         Action::Follow { id } => attach(&id, true),
         Action::Record { id } => attach(&id, false),
         Action::Stop { id, reason, .. } => stop(&id, reason.as_deref()),
@@ -445,6 +457,10 @@ fn execute(cli: Cli) -> Result<i32> {
                 } => place::stop(&root, &id, &seat, &who, &why, other, signal),
                 PlaceVerb::Record { id } => place::print_record(&root, &id),
                 PlaceVerb::Retire { key } => place::retire(&root, &key),
+                PlaceVerb::Status => {
+                    println!("{}", status::place(&root));
+                    Ok(0)
+                }
             }
         }
         Action::HostInfo => {

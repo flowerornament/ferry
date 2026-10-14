@@ -81,7 +81,31 @@ ferry machines                      the configured machines
 ferry receipt <id>                  print a receipt
 ferry seats prune [--on <machine>]  retire this caller's seats whose workspace
                                     is gone (SPEC §9)
+ferry status [--on <machine>] [--json]
+                                    what a place sees now: disk, live runs, the
+                                    gate, seats, leftovers (default: this
+                                    repository's local place); read-only
 ```
+
+**`status`** reads the place's state root and process table once. It takes
+no lock and changes nothing, so it never makes a seat look busy.
+- **disk:** available bytes, the floor and the seat cap from `host.toml`, and
+  why admission would refuse now, if it would.
+- **runs:** each live run (reserved, not final, its supervisor alive) with its
+  seat, recipe, `exclusive`, phase and deadline. Phase comes from the files a
+  run has written: `waiting` (locks, admission, checkout), `preparing`
+  (hooks), `running` (the recipe started).
+- **gate:** `host.gate` keeps the name of the last exclusive run that took it.
+  That run is the `holder` only while it is live; otherwise `unknown`, never
+  a stale name. Every other live exclusive run is a `requester`.
+- **seats:** each seat with the run its lock file last named, that run's
+  outcome, the cap's last measurement, and its size from one walk bounded at
+  5 s in all (`null` past it). Seats this caller knows from its seat book carry
+  their workspace; other callers' show their key.
+- **leftovers:** processes carrying the `FERRY_ID` of a run that is no longer
+  live here, by pid, start, run and `argv[0]`. Those whose run this place does
+  not know (another state root) are counted apart under `record_none`, and
+  unreadable processes are counted. Stop a leftover by its exact pid.
 
 `ferry place`, `host-info` and `execute-session` are internal: the caller
 runs them on the machine. A caller older than its place is not served (SPEC
@@ -255,6 +279,7 @@ requires = ["admission"]
 | `detach` | detached runs (`ferry place` submit, follow, stop, record); a caller refuses a place without it (125, naming the place's `source_rev`) |
 | `retire` | the place's `retire` verb for `ferry seats prune`; prune refuses a place without it (125, naming its `source_rev`) |
 | `ship` | `[[ship]]` requests and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
+| `status` | the place's `status` verb; `ferry status` refuses a place without it (125, naming its `source_rev`) |
 
 A run is refused (125) before any hook runs if:
 - the caller does not know a required capability;

@@ -161,28 +161,11 @@ pub fn mark(id: &str, deadline_ms: u128) {
 /// that cannot be read, or whose start changes during the read, makes the
 /// pass unknown: the error names it and what matched before.
 fn marked(id: &str) -> Result<Vec<Survivor>, String> {
-    let marker = format!("FERRY_ID={id}");
-    let me = i32::try_from(std::process::id()).map_err(|e| e.to_string())?;
-    let (uid, since) = owner(me).map_err(|e| format!("own start: {e}"))?;
-    while fail_at("marker-hang") {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    let pids = if fail_at("marker-list") {
-        Err("injected by FERRY_FAIL_AT".into())
-    } else {
-        crate::run::process_ids()
-    }
-    .map_err(|e| format!("list processes: {e}"))?;
-    let mut found = vec![];
-    // Each reason with the pids it was given for.
-    let mut unreadable = std::collections::BTreeMap::<String, Vec<i32>>::new();
-    for pid in pids {
-        match seen(pid, uid, since, &marker) {
-            Seen::Other => {}
-            Seen::Marked(survivor) => found.push(survivor),
-            Seen::Unreadable(why) => unreadable.entry(why).or_default().push(pid),
-        }
-    }
+    let Census { marked, unreadable } = census(false)?;
+    let found: Vec<_> = marked
+        .into_iter()
+        .filter_map(|(ids, survivor)| ids.iter().any(|of| of == id).then_some(survivor))
+        .collect();
     if unreadable.is_empty() {
         return Ok(found);
     }
@@ -197,13 +180,50 @@ fn marked(id: &str) -> Result<Vec<Survivor>, String> {
     ))
 }
 
+/// What one pass over the place user's processes saw: each carrying a
+/// `FERRY_ID`, with every such entry (a raw `execve` may hold several), and
+/// each unreadable one by reason.
+pub struct Census {
+    pub marked: Vec<(Vec<String>, Survivor)>,
+    pub unreadable: std::collections::BTreeMap<String, Vec<i32>>,
+}
+
+/// One pass over the place user's processes: those born at or after this
+/// process (`all`: every one), read for a `FERRY_ID`.
+pub fn census(all: bool) -> Result<Census, String> {
+    let me = i32::try_from(std::process::id()).map_err(|e| e.to_string())?;
+    let (uid, own) = owner(me).map_err(|e| format!("own start: {e}"))?;
+    let since = if all { 0 } else { own };
+    while fail_at("marker-hang") {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let pids = if fail_at("marker-list") {
+        Err("injected by FERRY_FAIL_AT".into())
+    } else {
+        crate::run::process_ids()
+    }
+    .map_err(|e| format!("list processes: {e}"))?;
+    let mut census = Census {
+        marked: vec![],
+        unreadable: std::collections::BTreeMap::new(),
+    };
+    for pid in pids {
+        match seen(pid, uid, since) {
+            Seen::Other => {}
+            Seen::Marked(ids, survivor) => census.marked.push((ids, survivor)),
+            Seen::Unreadable(why) => census.unreadable.entry(why).or_default().push(pid),
+        }
+    }
+    Ok(census)
+}
+
 enum Seen {
     Other,
     Unreadable(String),
-    Marked(Survivor),
+    Marked(Vec<String>, Survivor),
 }
 
-fn seen(pid: i32, uid: u32, since: u128, marker: &str) -> Seen {
+fn seen(pid: i32, uid: u32, since: u128) -> Seen {
     let gone = || kill(Pid::from_raw(pid), None) == Err(nix::errno::Errno::ESRCH);
     let Ok((owner_uid, start)) = owner(pid) else {
         return Seen::Other;
@@ -230,18 +250,26 @@ fn seen(pid: i32, uid: u32, since: u128, marker: &str) -> Seen {
     if fail_at("marker-restart") || owner(pid).map(|(_, again)| again).ok() != Some(start) {
         return unreadable("its start changed during the read".into());
     }
-    if !environment.iter().any(|variable| variable == marker) {
+    let ids: Vec<String> = environment
+        .iter()
+        .filter_map(|variable| variable.strip_prefix("FERRY_ID="))
+        .map(str::to_owned)
+        .collect();
+    if ids.is_empty() {
         return Seen::Other;
     }
     let mut command = command;
     if let Some((cut, _)) = command.char_indices().nth(256) {
         command.truncate(cut);
     }
-    Seen::Marked(Survivor {
-        pid,
-        start: u64::try_from(start).ok(),
-        command: Some(command),
-    })
+    Seen::Marked(
+        ids,
+        Survivor {
+            pid,
+            start: u64::try_from(start).ok(),
+            command: Some(command),
+        },
+    )
 }
 
 /// A process's owner and start, as `record::start_time` counts it. The real

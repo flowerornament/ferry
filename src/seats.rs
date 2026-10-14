@@ -119,7 +119,7 @@ pub fn ensure(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()
 
 /// The latest line per key, in file order (later lines win). Unreadable
 /// lines are skipped.
-fn latest() -> Result<BTreeMap<String, Line>> {
+pub(crate) fn latest() -> Result<BTreeMap<String, Line>> {
     let text = match fs::read_to_string(book()?) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

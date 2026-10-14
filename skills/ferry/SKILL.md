@@ -94,6 +94,9 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 
 ## Refusals (125) and their next step
 
+- **First look:** `ferry status --on <machine>` shows, read-only, who holds
+  the gate and who waits for it, each live run's phase and deadline, every
+  seat with its last run and size, and processes left by ended runs (by pid).
 - **Seat busy:** `seat busy: run <id>, submitted <n> min ago` means your seat
   already has a run. `ferry follow <id>` or `ferry stop <id>`, or use another
   `--seat`. "Held after run <id> ended" means something that run started

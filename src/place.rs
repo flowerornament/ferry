@@ -238,7 +238,7 @@ pub fn submit(root: &Path) -> Result<i32> {
 /// teardown, from the moment the run was submitted. Debug builds read
 /// `FERRY_DEADLINE_MS` (from submit), so a control can make the deadline,
 /// not the timeout, end a run.
-fn deadline_ms(submitted_ms: u128, request: &Request) -> u128 {
+pub(crate) fn deadline_ms(submitted_ms: u128, request: &Request) -> u128 {
     if let Some(ms) = execution::debug_bound::<u128>("FERRY_DEADLINE_MS") {
         return submitted_ms + ms;
     }

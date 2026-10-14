@@ -727,6 +727,23 @@ pub fn retire(place: &Place, key: &str) -> Result<serde_json::Value> {
         .map_err(|_| format!("retire gave no reply ({})", failed(&out)).into())
 }
 
+/// Asks a place what it sees now (SPEC §4). A place without `status` is
+/// refused, naming its revision.
+pub fn status(place: &Place) -> Result<serde_json::Value> {
+    let info = place.info()?;
+    if !info.capabilities.iter().any(|c| c == "status") {
+        return Err(format!(
+            "the place runs ferry {}, which lacks status; install this caller's ferry ({}) there",
+            info.source_rev.as_deref().unwrap_or("of unknown revision"),
+            receipt::source_rev()
+        )
+        .into());
+    }
+    let out = place.verb(&["status"])?.output()?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|_| format!("status gave no reply ({})", failed(&out)).into())
+}
+
 /// How a place command failed: its exit status, and its stderr when it
 /// said something (an ssh failure or a place error is only there).
 fn failed(out: &std::process::Output) -> String {

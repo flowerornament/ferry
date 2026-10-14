@@ -242,21 +242,31 @@ fn reconcile_with(root: &Path, id: &str, boot: Option<&str>) -> Result<Option<Ve
 /// next run on that seat begins. Errors are left for the next reader.
 pub fn reconcile_seat(root: &Path, seat: &str) {
     let boot = boot_id();
-    for reservation in reservations(root, seat) {
+    for reservation in reservations(root, Some(seat)) {
         let _ = reconcile_with(root, &reservation.id, boot.as_deref());
     }
 }
 
-/// The readable reservations of `seat` (a reservation file is named by its
-/// run's id, so `id` is its name).
-fn reservations(root: &Path, seat: &str) -> Vec<Reservation> {
+/// The readable reservations of `seat`, or of every seat (a reservation
+/// file is named by its run's id, so `id` is its name).
+fn reservations(root: &Path, seat: Option<&str>) -> Vec<Reservation> {
     fs::read_dir(records(root))
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".reserved.json"))
         .filter_map(|e| serde_json::from_slice::<Reservation>(&fs::read(e.path()).ok()?).ok())
-        .filter(|r| r.seat == seat)
+        .filter(|r| seat.is_none_or(|seat| r.seat == seat))
+        .collect()
+}
+
+/// The runs whose reservation is not final and whose supervisor is alive,
+/// as read: nothing is reconciled, for `status` changes nothing.
+pub fn live(root: &Path) -> Vec<Reservation> {
+    let boot = boot_id();
+    reservations(root, None)
+        .into_iter()
+        .filter(|r| !final_path(root, &r.id).exists() && !gone(r, boot.as_deref()))
         .collect()
 }
 
@@ -275,7 +285,7 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     if !named.is_empty() {
         let _ = reconcile(root, named);
     }
-    let mut live = reservations(root, seat);
+    let mut live = reservations(root, Some(seat));
     live.retain(|r| r.id != own);
     if let Some(run) = live.iter().find(|r| r.id == named) {
         let minutes = crate::receipt::now_ms().saturating_sub(run.submitted_ms) / 60_000;
