@@ -1154,8 +1154,8 @@ fn a_run_refused_while_the_holder_starts_names_both_possible_holders() {
     assert_eq!(code.flatten(), Some(0));
 }
 
-/// The work inherits its locks on every platform (SPEC §3): what a run
-/// started and left running, still holding them, keeps the seat busy, and
+/// The work inherits its seat lock on every platform (SPEC §3): what a run
+/// started and left running, still holding it, keeps the seat busy, and
 /// the next run's refusal names the run it outlived. Both kernels: with the
 /// census gone (slice 4b), Linux leaves such a process alone too.
 #[test]
@@ -1252,7 +1252,7 @@ fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
 }
 
 /// A recipe line that leaves a setsid python running, holding the run's
-/// inherited lock descriptors, and records its pid.
+/// inherited seat lock, and records its pid.
 fn leaving(pidfile: &Path) -> String {
     format!(
         "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
@@ -1301,11 +1301,12 @@ fn runs_refused_together_behind_a_leaver_each_name_the_ended_run() {
     }
 }
 
-/// An exclusive run's leftover holds the host (critic L2): the holder's
-/// name is never cleared, and the shared probe fails, so a waiter on
-/// another seat refuses naming the ended exclusive run, not "shared runs".
+/// Only the seat's lock is inherited (SPEC §3, §12.9): an exclusive run's
+/// leaver keeps its own seat busy, naming the run it outlived, and cannot
+/// hold the host: an exclusive run on another seat is admitted while it
+/// lives.
 #[test]
-fn a_host_held_after_an_exclusive_run_names_that_run() {
+fn an_exclusive_runs_leaver_holds_its_seat_but_not_the_host() {
     let scratch = tempfile::tempdir().unwrap();
     let pidfile = scratch.path().join("leaver.pid");
     let dir = fixture(&leaving(&pidfile), "");
@@ -1318,23 +1319,25 @@ fn a_host_held_after_an_exclusive_run_names_that_run() {
     assert_eq!(first["outcome"], "ran-pass", "{first}");
     let out = bounded_output(ferry(dir.path()).args([
         "run",
-        "probe",
+        "pass",
         "--local",
         "--json",
+        "--exclusive",
         "--seat",
         "other",
         "--wait-seconds",
         "3",
     ]));
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
     let record = receipt(&out);
     assert_eq!(out.status.code(), Some(125), "{record}");
-    let reason = record["reason"].as_str().unwrap();
     assert!(
-        reason.contains(&format!(
-            "held after exclusive run {} ended (ran-pass) by something it started, or by an exclusive run that is starting",
+        record["reason"].as_str().unwrap().contains(&format!(
+            "held after run {} ended (ran-pass)",
             first["id"].as_str().unwrap()
         )),
-        "{reason}"
+        "{record}"
     );
 }
 
@@ -1432,18 +1435,19 @@ fn an_exclusive_run_holds_the_host_until_its_record_is_final() {
     );
 }
 
-/// A dead exclusive run is reconciled before it is named (critic L3): its
-/// finalize failed, its supervisor is gone, and a leaver it started holds
-/// the host. A waiter names it ended (lost), not live.
+/// A supervisor gone before its record is final (here a failed finalize; a
+/// killed one alike, SPEC §11) closes its host locks with it: a live leaver
+/// of its exclusive run holds no host, and an exclusive run on another seat
+/// is admitted.
 #[test]
-fn a_dead_exclusive_run_is_reconciled_before_it_is_named() {
+fn a_dead_exclusive_runs_leaver_does_not_hold_the_host() {
     if !cfg!(debug_assertions) {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
     let pidfile = scratch.path().join("leaver.pid");
     let dir = fixture(&leaving(&pidfile), "");
-    let _leaver = Owned(pidfile);
+    let _leaver = Owned(pidfile.clone());
     let out = ferry(dir.path())
         .env("FERRY_FAIL_AT", "finalize-link")
         .env("FERRY_UNREACHABLE_MS", "2000")
@@ -1469,21 +1473,22 @@ fn a_dead_exclusive_run_is_reconciled_before_it_is_named() {
     wait_until("its supervisor exited", || kill(supervisor, None).is_err());
     let out = bounded_output(ferry(dir.path()).args([
         "run",
-        "probe",
+        "pass",
         "--local",
         "--json",
+        "--exclusive",
         "--seat",
         "other",
         "--wait-seconds",
         "3",
     ]));
-    let record = receipt(&out);
-    assert_eq!(out.status.code(), Some(125), "{record}");
-    let reason = record["reason"].as_str().unwrap();
-    assert!(
-        reason.contains(&format!("held after exclusive run {id} ended (lost)")),
-        "{reason}"
-    );
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let leaver: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!gone(leaver), "the leaver ended before the admitted run");
 }
 
 /// After a normal exclusive run, shared runs holding the host are proven
@@ -2535,7 +2540,11 @@ fn locks_reach_the_recipe_but_not_the_supervisors_other_children() {
     let locks = locks.to_str().unwrap();
     assert!(
         recipe.contains(locks),
-        "the recipe did not inherit its locks"
+        "the recipe did not inherit its seat lock"
+    );
+    assert!(
+        !recipe.contains(&format!("{locks}host")),
+        "the recipe inherited a host lock:\n{recipe}"
     );
     assert!(!git.is_empty(), "the git wrapper never ran");
     assert!(

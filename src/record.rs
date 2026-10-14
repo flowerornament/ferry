@@ -314,8 +314,9 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
 /// proves (SPEC §5: a run's record is final before its locks close). A
 /// shared probe that succeeds proves only shared runs hold it. Otherwise
 /// the named exclusive run, reconciled first: live, it holds the lock;
-/// ended, something it started holds it, or an exclusive run that has not
-/// yet written its id.
+/// ended, it is closing its locks, an exclusive run has not yet written its
+/// id, or an older Ferry's leftover holds it (the work no longer inherits
+/// the host locks).
 pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
     use fs2::FileExt;
     let busy = |e: &std::io::Error| e.kind() == std::io::ErrorKind::WouldBlock;
@@ -352,7 +353,7 @@ pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
                 .and_then(|record| record["outcome"].as_str().map(str::to_owned))
                 .unwrap_or_else(|| "unknown".into());
             format!(
-                "held after exclusive run {named} ended ({outcome}) by something it started, or by an exclusive run that is starting"
+                "held after exclusive run {named} ended ({outcome}): it is closing its locks, an exclusive run is starting, or an older Ferry's leftover holds it"
             )
         }
         Ok(None) if reserved_path(root, named).exists() => {

@@ -317,9 +317,9 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             let (Some(lock), Some(host_lease)) = (&held.seat, &held.host) else {
                 return Err("prepare returned without its locks".into());
             };
-            // The work inherits both, on every platform (SPEC §3).
-            let locks: Vec<_> = std::iter::once(lock).chain(host_lease.files()).collect();
-            let finished = crate::run::run_released(root, &seat, &request, &stop, &locks, deadline);
+            // The work inherits the seat's lock only; the host's stay here,
+            // so nothing a run leaves can close the place (SPEC §3).
+            let finished = crate::run::run_released(root, &seat, &request, &stop, lock, deadline);
             if let Some(error) = &finished.custody.error {
                 note(
                     &mut result.reason,

@@ -1,4 +1,4 @@
-//! A run (SPEC §3 Run): its session spawned with the locks inherited, the
+//! A run (SPEC §3 Run): its session spawned with the seat lock inherited, the
 //! deadline loop, the output copier, the stop that ends the session, and the
 //! verdict, decided once.
 use crate::{
@@ -340,7 +340,7 @@ pub fn run_released(
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
-    locks: &[&fs::File],
+    lock: &fs::File,
     deadline_ms: u128,
 ) -> Finished {
     // A backstop: nothing in here should panic, but an unwind must still
@@ -348,7 +348,7 @@ pub fn run_released(
     let (executed, collection, output) =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert!(!fail_at("run-panic"), "injected by FERRY_FAIL_AT");
-            run(root, workdir, request, stop, locks, deadline_ms)
+            run(root, workdir, request, stop, lock, deadline_ms)
         }))
         .unwrap_or_else(|panic| {
             let what = panic
@@ -372,15 +372,15 @@ pub fn run_released(
     }
 }
 
-/// Runs the recipe session, then the collect hook's. `locks` are the seat
-/// lock and host lease descriptors: each session inherits them, so they stay
-/// held while the session lives even if this supervisor is killed.
+/// Runs the recipe session, then the collect hook's. Each session inherits
+/// the seat `lock`, so the seat stays busy while the session lives, even if
+/// this supervisor is killed.
 fn run(
     root: &Path,
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
-    locks: &[&fs::File],
+    lock: &fs::File,
     deadline_ms: u128,
 ) -> (Result<Ended>, Option<Collection>, Output) {
     // A stop that came while the run prepared: nothing is spawned, neither
@@ -397,12 +397,12 @@ fn run(
         Ok(log) => log,
         Err(error) => return (Err(error), None, Output::default()),
     };
-    let outcome = run_session(root, workdir, request, stop, locks, &log, deadline_ms);
+    let outcome = run_session(root, workdir, request, stop, lock, &log, deadline_ms);
     let collection = request
         .hooks
         .collect
         .as_ref()
-        .map(|hook| collect(root, workdir, request, hook, &outcome, locks, &log));
+        .map(|hook| collect(root, workdir, request, hook, &outcome, lock, &log));
     // Closed here, before the record: nothing writes the log after this.
     let output = log
         .lock()
@@ -421,10 +421,10 @@ fn collect(
     request: &Request,
     hook: &str,
     outcome: &Result<Ended>,
-    locks: &[&fs::File],
+    lock: &fs::File,
     log: &RunLog,
 ) -> Collection {
-    let mut collection = match run_collect(root, workdir, request, hook, outcome, locks, log) {
+    let mut collection = match run_collect(root, workdir, request, hook, outcome, lock, log) {
         Ok((code, timed_out)) => Collection {
             exit_code: Some(code),
             error: timed_out.then(|| "collection timed out".into()),
@@ -457,7 +457,7 @@ fn run_collect(
     request: &Request,
     hook: &str,
     outcome: &Result<Ended>,
-    locks: &[&fs::File],
+    lock: &fs::File,
     log: &RunLog,
 ) -> Result<(i32, bool)> {
     let mut collect = request.clone();
@@ -489,7 +489,7 @@ fn run_collect(
         workdir,
         &collect,
         &AtomicBool::new(false),
-        locks,
+        lock,
         log,
         u128::MAX,
     )? {
@@ -505,20 +505,18 @@ pub struct Collection {
     pub error: Option<String>,
 }
 
-/// Spawns the session owner with the locks inherited. Only the session
-/// inherits them: they close on exec again at once, so no other child of
-/// this supervisor (git, for one) can keep them. Returns the spawn, and
-/// whether close-on-exec was restored.
+/// Spawns the session owner with the seat lock inherited. Only the session
+/// inherits it: it closes on exec again at once, so no other child of this
+/// supervisor (git, for one) can keep it. Returns the spawn, and whether
+/// close-on-exec was restored.
 fn spawn_session(
     workdir: &Path,
     spec: &Path,
     result_path: &Path,
-    locks: &[&fs::File],
+    lock: &fs::File,
     output: std::io::PipeWriter,
 ) -> Result<(std::io::Result<std::process::Child>, Result<()>)> {
-    for lock in locks {
-        crate::lock::close_on_exec(lock, false)?;
-    }
+    crate::lock::close_on_exec(lock, false)?;
     // One pipe for both streams keeps the order they were written in.
     let spawned = Command::new(std::env::current_exe()?)
         .arg("execute-session")
@@ -529,9 +527,7 @@ fn spawn_session(
         .stdout(output.try_clone()?)
         .stderr(output)
         .spawn();
-    let restored = locks
-        .iter()
-        .try_for_each(|lock| crate::lock::close_on_exec(lock, true));
+    let restored = crate::lock::close_on_exec(lock, true);
     Ok((spawned, restored))
 }
 
@@ -566,7 +562,7 @@ fn run_session(
     workdir: &Path,
     request: &Request,
     stop: &AtomicBool,
-    locks: &[&fs::File],
+    lock: &fs::File,
     log: &RunLog,
     deadline_ms: u128,
 ) -> Result<Ended> {
@@ -576,7 +572,7 @@ fn run_session(
     fs::write(&spec, serde_json::to_vec(request)?)?;
     let result_path = run_dir.join("result.json");
     let (reader, writer) = std::io::pipe()?;
-    let (spawned, restored) = spawn_session(workdir, &spec, &result_path, locks, writer)?;
+    let (spawned, restored) = spawn_session(workdir, &spec, &result_path, lock, writer)?;
     let child = spawned?;
     let mut owner = SessionOwner {
         child,

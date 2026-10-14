@@ -50,9 +50,9 @@ final record, and `ferry record <id>` completes the receipt later.
 | `transport` | The caller's side: ssh options, ship, submit, follow, stop, record, retire. | §6 |
 | `place` | The place's verbs and the supervisor; the place record (`HostResult`). | §5, §6 |
 | `execution` | The request; prepare (locks, admission, checkout reset, ship); debug fault points. | §5, §9 |
-| `run` | The session: spawn with locks inherited, deadline loop, output copier, verdict. | §3, §5 |
+| `run` | The session: spawn with the seat lock inherited, deadline loop, output copier, verdict. | §3, §5 |
 | `custody` | What a session stop left alive, as recorded evidence. | §7 |
-| `lock` | Seat lock and host lease (shared or exclusive) as inherited flock files. | §3, §5 |
+| `lock` | Seat lock (inherited by the work) and host lease (shared or exclusive, the supervisor's) as flock files. | §3, §5 |
 | `record` | Reserve, finalize once, reconcile a lost supervisor; busy-holder naming. | §8 |
 | `receipt` | The caller's receipt, digests, run ids, capabilities. | §8 |
 | `admission` | Host policy: disk floor, per-seat cap, and every delete in a seat (contained, same device). | §9 |
@@ -66,8 +66,9 @@ final record, and `ferry record <id>` completes the receipt later.
   only once; a lost supervisor is reconciled to `lost` exactly once.
 - **The verdict is the first terminal fact** (`run::verdict`): a later fact
   is a note, never a new verdict.
-- **Locks live as long as the work.** The session inherits the seat lock and
-  host lease; release is `close()`, after the final record.
+- **The seat lock lives as long as the work.** The session inherits it; the
+  host lease stays with the supervisor, so a leftover holds no more than its
+  seat. Release is `close()`, after the final record.
 - **Refuse before effect.** A refusal (125) happens before the recipe runs;
   the only deletes before that are the seat cap's, recorded as `pruned`. A
   seat's contents are deleted only by `admission::remove`, which re-proves

@@ -666,11 +666,11 @@ fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
             Err(e) => panic!("probing {name}: {e}"),
         }
     };
-    // The session inherited the seat lock and host lease, on every
-    // platform: they stay held while the recipe lives, though its
-    // supervisor is gone.
+    // The session inherited the seat lock, on every platform: it stays
+    // held while the recipe lives, though its supervisor is gone. The host
+    // lease was the supervisor's alone and closed with it (SPEC §11).
     assert!(held(seat), "the seat lock freed while the recipe lives");
-    assert!(held("host"), "the host lease freed while the recipe lives");
+    assert!(!held("host"), "the host lease outlived its supervisor");
     // A new run on the seat refuses at once, never starting beside it: the
     // lock names the killed run, reconciled to lost, whose work holds it.
     let killed = fs::read_to_string(&caller_output)

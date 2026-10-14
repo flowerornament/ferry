@@ -431,18 +431,20 @@ refusal names the run that holds it when the lock file names a live run.
 Otherwise it says what it can prove. The lock may have outlived the run it
 names ("held after run <id> ended"), or a run that is starting may hold it.
 When the seat's live reservations make both possible, it names both: a
-reservation shows a run is alive, not that it has the lock. The work inherits the seat lock and the host lease on every
-platform, so whatever a run leaves running while holding them keeps them
-held. Its waits for the host lease end by its submit plus `--wait-seconds`
+reservation shows a run is alive, not that it has the lock. The work
+inherits the seat lock, on every platform, so whatever a run leaves running
+while holding it keeps the seat busy. It never inherits the host lease: only
+the supervisor holds it, so a leftover can never close the place to other
+seats (SPEC §3). Its waits for the host lease end by its submit plus `--wait-seconds`
 (default 30 min), apart from `--timeout-seconds`. Past it the run refuses
 (125), saying what a probe of the lock proves. If it is free now: "released
 as the wait ended; retry". If an exclusive probe fails but a shared one then
 succeeds, that proves only that no exclusive holder remained: "held by shared
 runs, or just released; retry". Otherwise it names the exclusive run that took it, reconciled first:
-a live one holds it; an ended one means something it started holds it, or
-an exclusive run that is starting. An error while probing names no holder
-("holder unknown"). No holder's name
-is ever cleared: the work inherits the lock and may outlive its run.
+a live one holds it; an ended one is closing its locks, or an exclusive run
+is starting. An error while probing names no holder ("holder unknown"). No
+holder's name is ever cleared: the work inherits the seat lock and may
+outlive its run.
 
 A run's record is final before its locks close (SPEC §5), on every path: each
 lock passes to the supervisor as it is taken, a refusal after that keeps it
@@ -479,11 +481,13 @@ closed its descriptors holds nothing, and can write into a later run's
 checkout or the seat's cache unseen; the scope tier will cure that. There is no taint,
 owner marker, idle record, quarantine or `seat recover`.
 
-**Locks outlive a killed supervisor.** The seat lock and host lease are
-inherited by the recipe's processes, on every platform. A killed supervisor
-therefore frees them only when the processes that kept them exit, so a new
-run on the seat is refused busy instead of starting beside live work.
-Release closes descriptors, never `LOCK_UN`.
+**The seat lock outlives a killed supervisor.** It is inherited by the
+recipe's processes, on every platform. A killed supervisor therefore frees
+it only when the processes that kept it exit, so a new run on the seat is
+refused busy instead of starting beside live work. The host lease closes
+with the supervisor: an exclusive run whose supervisor is killed no longer
+keeps other seats out (SPEC §11). Release closes descriptors, never
+`LOCK_UN`.
 
 ### Detached runs, output and the verdict
 
@@ -542,8 +546,8 @@ supervisor's pid), then `receipt`.
   hosts, and descendants that leave the run's session.
 - **A supervisor killed outright** stops nothing. Its run is reconciled to
   `lost`/255 by its caller or the next run on the seat.
-  - The inherited locks keep other runs out while its work lives, on every
-    platform.
+  - The inherited seat lock keeps other runs off its seat while its work
+    lives, on every platform; the host lease does not outlive it.
 - **Remote evidence is not publication authority.** A remote result does not
   certify a repository's own local gate.
 - **Timings:** never pool machine timings across platforms.

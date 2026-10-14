@@ -100,11 +100,11 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
   still holds the seat's lock: stop what it left running (its processes in
   the seat's checkout), by exact pid. An "or" lists runs that may be
   starting instead: Ferry names both when it cannot tell them apart.
-- **Host held after an exclusive run ended:** the same, for the host lease:
-  something an `--exclusive` run left running still holds it, or an
-  exclusive run is starting. "No exclusive holder at the probe: held by
-  shared runs, or just released" means wait or retry, with a longer
-  `--wait-seconds` if shared runs are long. "Released as the wait
+- **Host held after an exclusive run ended:** that run is closing its
+  locks, or an exclusive run is starting: retry. Work never inherits the
+  host lease, so a leftover cannot hold it. "No exclusive holder at the
+  probe: held by shared runs, or just released" means wait or retry, with a
+  longer `--wait-seconds` if shared runs are long. "Released as the wait
   ended; retry" means just that.
 
 - **Unmet requirement or unknown machine:** the recipe's `requires` are not

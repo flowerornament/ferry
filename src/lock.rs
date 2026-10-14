@@ -1,5 +1,6 @@
 //! Locks (SPEC §3 Lock): flock files under `locks/`. Held means busy; the
-//! work inherits the descriptors; release is by `close()`, never `LOCK_UN`.
+//! work inherits the seat's descriptor only; release is by `close()`, never
+//! `LOCK_UN`, which would free a seat lock the work still shares.
 use crate::execution::Request;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -87,8 +88,8 @@ pub(crate) fn acquire_as(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if crate::receipt::now_ms() >= ends_ms {
-                    // The holder's name is never cleared: the work inherits
-                    // the lock and may outlive its run (SPEC §3).
+                    // The holder's name is never cleared: an older Ferry's
+                    // work inherited the lock and may outlive its run.
                     let named = fs::read_to_string(path).unwrap_or_default();
                     let root = path.parent().and_then(Path::parent).unwrap_or(path);
                     crate::execution::pause_at(
@@ -123,12 +124,11 @@ pub(crate) fn acquire_as(
 /// covers sessions under this state root only: not other users, processes
 /// outside Ferry, or other machines sharing the hardware.
 ///
-/// Locks are released only by closing their descriptors (dropping the
-/// files), never by `LOCK_UN`: a session may share the open file
-/// description through inherited descriptors, and an explicit unlock would
-/// free it under that session.
+/// Only the supervisor holds it, never the work (SPEC §3), so it closes with
+/// the supervisor: a leftover of the run cannot hold it.
 pub struct HostLease {
-    held: Vec<fs::File>,
+    /// Open only to be closed: dropping the lease releases its locks.
+    _held: Vec<fs::File>,
     pub record: Lease,
 }
 
@@ -148,10 +148,6 @@ pub struct Lease {
 }
 
 impl HostLease {
-    /// The lock descriptors this lease holds, for a session to inherit.
-    pub fn files(&self) -> impl Iterator<Item = &fs::File> {
-        self.held.iter()
-    }
     /// The lease record, stamped with the release time while the lease is
     /// still held; the lease itself is released when this value is dropped.
     pub fn stamp(&self) -> Lease {
@@ -184,7 +180,7 @@ impl HostLease {
             vec![host]
         };
         Ok(Self {
-            held,
+            _held: held,
             record: Lease {
                 mode: if exclusive { "exclusive" } else { "shared" }.into(),
                 wait_ms: started.elapsed().as_millis(),
