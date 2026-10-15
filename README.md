@@ -1,9 +1,7 @@
 # Ferry
 
-Run this repository's recipe at this exact commit, on a machine that can run
+Run a repository's recipe at an exact commit, on a machine that can run
 it, and record exactly what happened.
-
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 Ferry is for agents and people who share build hosts. You declare recipes in
 the repository and machines once. Ferry gives each run:
