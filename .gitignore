@@ -12,3 +12,7 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Local operating notes for the maintainers' agents (never published)
+CLAUDE.local.md
+AGENTS.local.md

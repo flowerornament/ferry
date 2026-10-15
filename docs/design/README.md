@@ -6,8 +6,9 @@ are amended or superseded by a later dated document, never rewritten to match
 the code, so an older one can describe behaviour Ferry no longer has.
 
 For how Ferry works today, read [`SPEC.md`](../SPEC.md) (the normative
-target), [`README.md`](../README.md) (what ships) and
-[`ARCHITECTURE.md`](../ARCHITECTURE.md) (where it lives in the code).
+target), [`README.md`](../../README.md) and [`REFERENCE.md`](../REFERENCE.md)
+(what ships) and [`ARCHITECTURE.md`](../ARCHITECTURE.md) (where it lives in
+the code).
 [`PRINCIPLES.md`](../PRINCIPLES.md) decides design questions.
 
 **Reading notes.** These were written while Ferry served two consumer

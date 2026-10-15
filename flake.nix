@@ -1,5 +1,11 @@
 {
   description = "Ferry — exact-commit recipe execution with durable receipts";
+  nixConfig = {
+    extra-substituters = [ "https://flowerornament.cachix.org" ];
+    extra-trusted-public-keys = [
+      "flowerornament.cachix.org-1:gSODgIXgfRANrEGITBOF8XWaEKNy8hkNGfRVwqUG46c="
+    ];
+  };
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   inputs.rust-overlay.url = "github:oxalica/rust-overlay";
   inputs.rust-overlay.inputs.nixpkgs.follows = "nixpkgs";

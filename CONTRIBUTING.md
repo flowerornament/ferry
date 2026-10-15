@@ -4,7 +4,7 @@ Thanks for your interest. Ferry is small on purpose: it does one thing (run
 a repository's recipe at an exact commit, on a machine that can run it, and
 record exactly what happened) and leaves scheduling, retries, containment
 and disk policy to the projects and operators around it. Read
-[`PRINCIPLES.md`](PRINCIPLES.md) before proposing a new mechanism; a change
+[`docs/PRINCIPLES.md`](docs/PRINCIPLES.md) before proposing a new mechanism; a change
 that deletes code or makes an existing record more honest is the easiest
 kind to accept.
 
@@ -27,13 +27,14 @@ A refusal (exit 125) prints what, why and the next step; please include it.
 2. Make the change, with a test that fails without it. Behaviour changes
    need a real-CLI control in `tests/`, not only a unit test; a new fallible
    point needs a `FERRY_FAIL_AT` injection and a control for it.
-3. Update the living documents in the same change: `README.md` for anything
-   a user sees, `SPEC.md` if the target changes (amend it first), and
-   `ARCHITECTURE.md` if a module's job changes.
+3. Update the living documents in the same change: `README.md` or
+   `docs/REFERENCE.md` for anything a user sees, `docs/SPEC.md` if the target
+   changes (amend it first), and `docs/ARCHITECTURE.md` if a module's job
+   changes.
 4. Run `just check`. Code that is Linux-only is never compiled on a Mac, so
    run the check on Linux too if you touch it.
 5. Open a pull request that says what the change deletes or adds, which
-   `PRINCIPLES.md` points it touches, and which checks you ran where.
+   `docs/PRINCIPLES.md` points it touches, and which checks you ran where.
 
 [`AGENTS.md`](AGENTS.md) is the full working agreement that the maintainers
 and their coding agents follow (jj workspaces, the design gate, reviews by

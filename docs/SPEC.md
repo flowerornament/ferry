@@ -1,7 +1,7 @@
 # Ferry specification
 
 **Normative end state.** The code converges onto this document slice by
-slice; `README.md` describes the behaviour shipped today. The rationale and its
+slice; `README.md` and `REFERENCE.md` describe the behaviour shipped today. The rationale and its
 evidence are in `design/2026-10-09-ferry-minimal.md`, `PRINCIPLES.md` and the
 earlier design documents. "Why" lines give the reason in one sentence.
 

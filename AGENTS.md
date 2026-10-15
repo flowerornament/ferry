@@ -26,8 +26,8 @@ exactly that) and in a Darwin Nix build
 
 One Rust crate builds one binary, `ferry`. Callers use `ferry run` and its
 siblings; a place answers the hidden `ferry place …` verbs over SSH or a
-local exec. [`SPEC.md`](SPEC.md) is the behavioural target, and
-[`ARCHITECTURE.md`](ARCHITECTURE.md) maps it onto the modules.
+local exec. [`docs/SPEC.md`](docs/SPEC.md) is the behavioural target, and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) maps it onto the modules.
 Project-specific environment and artifact handling are hooks, not branches
 in Ferry. Recipe requirements have one home: the project's catalog.
 
@@ -86,9 +86,9 @@ Ferry's build hosts are shared by many agents.
   and recorded. Never `pkill -f`, `killall` or any name or pattern match: a
   pattern kills other agents' work.
 - **Freeing disk, retrying, queueing and containment** are operator and
-  project decisions, not Ferry's (see `PRINCIPLES.md`). Ask before deleting
+  project decisions, not Ferry's (see `docs/PRINCIPLES.md`). Ask before deleting
   anything on a shared host.
-- **Installs** happen only in an announced window (see `RELEASE.md`).
+- **Installs** happen only in an announced window (see `docs/RELEASE.md`).
 
 ## Done means landed
 
@@ -97,7 +97,7 @@ Ferry's build hosts are shared by many agents.
 
 ## Design gate
 
-Design questions are decided by [`PRINCIPLES.md`](PRINCIPLES.md). Every
+Design questions are decided by [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md). Every
 freeze description states:
 
 1. which principles it touches;
@@ -112,18 +112,19 @@ freeze description states:
 It also says what it deletes. Ferry grows only when the deletion-first
 alternatives are worse, and the freeze says by how many lines.
 
-A change that needs a principle to bend amends `PRINCIPLES.md` first, in its
+A change that needs a principle to bend amends `docs/PRINCIPLES.md` first, in its
 own reviewed change.
 
 ## Documents
 
-- **Living documents** are at the root in capitals and are kept true to the
-  code: README, AGENTS, CONTRIBUTING, PRINCIPLES, RELEASE, ARCHITECTURE.
-  `SPEC.md` is the normative target: every change cites the SPEC sections it
+- **Living documents** are kept true to the code: at the root README,
+  CHANGELOG, CONTRIBUTING, SECURITY and AGENTS; in `docs/` REFERENCE,
+  PRINCIPLES, ARCHITECTURE and RELEASE. `docs/SPEC.md` is the normative
+  target: every change cites the SPEC sections it
   implements, and a change to the target amends SPEC first, in its own
   reviewed change. Change living documents in the same commit as the
   behaviour they describe.
-- **Dated design documents** are in [`design/`](design/README.md) as
+- **Dated design documents** are in [`docs/design/`](docs/design/README.md) as
   `YYYY-MM-DD-topic.md`. Each references its issues, reviews and evidence.
   They are amended or superseded by a later dated document, never silently
   rewritten to match the code.

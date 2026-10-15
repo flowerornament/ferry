@@ -1,8 +1,10 @@
 # Release contract
 
-How Ferry is versioned, built, installed, upgraded and rolled back. There is
-no published crate or binary cache yet: install from source, pinned by
-commit.
+How Ferry is versioned, released, installed, upgraded and rolled back.
+Releases are tags `vX.Y.Z` on `main`, with notes from `CHANGELOG.md`,
+binaries for each advertised target, and Nix outputs in the
+`flowerornament` Cachix cache. The `release` branch always points at the
+latest tag. There is no crates.io package.
 
 Cargo.toml owns the version. Nix reads it rather than keeping another version
 variable. Cargo.lock and rust-toolchain.toml pin source and compiler inputs.
@@ -24,15 +26,37 @@ project recipes or bake any project's data into the binary. Target declarations
 must agree across packaging, binary releases and the installer; unsupported
 targets are not advertised merely because the source compiles on one machine.
 
+## Cutting a release
+
+From the colocated checkout (the one with `.git`):
+
+1. `just release-bump X.Y.Z` sets the version in `Cargo.toml` and
+   `Cargo.lock` and scaffolds the `CHANGELOG.md` entry. Fill it in, describe
+   the change, and land it (`just land`) like any other change.
+2. Wait for the **CI** and **Nix Cache** workflows on that commit. Nix Cache
+   builds every advertised system and pushes it to Cachix (it needs the
+   `CACHIX_AUTH_TOKEN` repository secret).
+3. `just release-verify`: versions agree, the changelog entry is filled, the
+   tree is clean, `just check` passes and the Nix build reports the version.
+4. `just release-tag X.Y.Z`: checks that every advertised output is in the
+   cache, tags `vX.Y.Z`, pushes the tag, and moves `release` to it. The
+   **Release** workflow then publishes the GitHub release with the changelog
+   entry as its notes and attaches the binaries.
+
+Only a landed commit on `main` is tagged. A tag is a publication act of its
+own; it installs nothing anywhere.
+
 ## Install, upgrade and rollback
 
 One reviewed, landed commit is installed through Nix on both ends. Nothing is
 copied by hand.
 
-**Caller.** The machine's Nix configuration takes ferry as a flake input
-pinned by commit, `github:flowerornament/ferry?rev=<commit>` (or
-`git+file:///path/to/ferry?rev=<commit>` for a local checkout), and installs
-`packages.<system>.default`.
+**Caller.** The machine's Nix configuration takes ferry as a flake input:
+`github:flowerornament/ferry?ref=refs/heads/release` to follow releases, or
+`github:flowerornament/ferry?rev=<commit>` (or
+`git+file:///path/to/ferry?rev=<commit>`) to pin one commit. It installs
+`packages.<system>.default`; with the Cachix substituter accepted, released
+outputs are downloaded rather than built.
 
 The flake also exports `homeManagerModules.default`, `programs.ferry`:
 

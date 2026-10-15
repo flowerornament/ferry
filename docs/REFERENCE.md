@@ -1,0 +1,491 @@
+# Ferry reference
+
+Configuration and behaviour in full. [README.md](../README.md) is the
+introduction; [SPEC.md](SPEC.md) is the normative target.
+
+- [Project configuration](#project-configuration)
+  ([artifacts](#artifacts-spec-8), [catalogs and adapters](#an-existing-catalog-or-adapter),
+  [shipped objects](#shipped-objects), [capabilities](#provider-capabilities))
+- [Machines](#machines) ([host policy](#host-policy-and-admission),
+  [seat bounds](#seat-bounds-spec-9))
+- [Hooks and environment](#hooks-and-environment)
+- [How a run is kept honest](#how-a-run-is-kept-honest)
+- [`ferry status`](#ferry-status)
+- [Development](#development)
+
+## Project configuration
+
+Commit `ferry.toml`:
+
+```toml
+version = 1
+
+[recipe.test]
+command = ["devenv", "shell", "--", "mix", "test"]
+requires = ["linux-x86_64"]
+routable = true
+
+[hooks]
+prepare = "scripts/ferry-prepare"
+env = "scripts/ferry-env"
+collect = "scripts/ferry-collect"
+```
+
+- **Read from the exact commit.** Recipes and requirements always come from
+  the commit being run, never the working tree.
+- **Explicit argv.** Ferry never infers a tool from a recipe's name.
+- **Only `routable = true` recipes go remote.** Publishing and certifying
+  recipes stay unroutable; for example, a repository's `just land` stays
+  local.
+- **`exclusive`.** `requires = ["exclusive"]` (or `--exclusive`) holds the host
+  lease alone. It is an execution lock, not a machine feature: routing ignores
+  it.
+
+### Artifacts (SPEC §8)
+
+A recipe's `artifacts = ["out/report.json", "logs/*.txt"]` are collected from
+the checkout once the recipe ends or times out, whatever its verdict, and
+fetched into `<repo>/.ferry/runs/<id>/`, which is emptied first whatever the
+status. A run stopped or refused before its recipe ended collects none, and
+its status says so.
+
+- **Bound per file.** The place hashes each file; the caller checks every
+  entry: a listed regular file inside the directory, with its listed digest,
+  and every listed file present. The receipt's `artifacts` lists what was verified:
+  `[{path, sha256}]`.
+- **A status apart from the verdict.** `artifacts_status` is `none` (none
+  declared), `fetched`, or `{"failed": {kind, path, error}}` with kind
+  `collection`, `empty-pattern` (a pattern matched nothing), `transfer`,
+  `digest` or `archive` (a missing, unlisted or unsafe entry). A `ran-pass`
+  with failed artifacts is still a pass. Read the status, never the reason
+  or files already on disk. After a failure nothing is left there, unless
+  the earlier directory could not be removed: that is reported as `archive`
+  failed, and what remains is never vouched for.
+- **Never stale.** A file in a `preserve` path fails collection: the checkout
+  reset keeps those, so it may be an earlier run's.
+
+### An existing catalog or adapter
+
+If recipes already have a catalog, point to it:
+
+```toml
+version = 1
+[catalog]
+path = ".config/gates.toml"
+table = "recipe"
+```
+
+If the catalog has another schema, set `[catalog] adapter =
+"scripts/ferry-catalog"`.
+- **What the adapter emits:** this committed executable runs caller-side in
+  fresh checkouts of the pinned commit and prints `{"version":1,"recipe":{...}}`.
+  It may also emit:
+  - a `ship` list (the `[[ship]]` entries below), for example dependencies
+    derived from the repository's lockfile. Entries from the adapter and
+    from `ferry.toml` are combined; the same ref or URL declared twice
+    refuses;
+  - an `environment` declaration;
+  - `preserve`, a list of ignored build directories kept across resets, for
+    example `["_build", "deps", ".devenv"]`.
+- **Checks:** Ferry checks repeatability, validates the whole contract before
+  routing, and records the digests of the adapter and the emitted contract.
+- **Purity is your responsibility.** The adapter must be a pure reader; Ferry
+  is not a sandbox.
+
+**Preserved directories** are a declared cache:
+- a run can depend on earlier runs in the same seat, not only on its commit;
+- paths must be literal ignored directories with no tracked files, never
+  `.git`, `.jj` or `.ferry`;
+- tracked files, HEAD and hidden index flags are still checked;
+- omit `preserve` for a clean run.
+
+### Shipped objects
+
+A run can ship more than its commit. Each `[[ship]]` entry is either an
+extra ref in the checkout or a dependency served at its URL:
+
+```toml
+[[ship]]          # an extra ref in the checkout
+ref = 'refs/remotes/origin/master'
+from = { remote = 'origin', branch = 'master' }   # or a revision: 'master@origin'
+
+[[ship]]          # a dependency, served from the place at its URL
+url = 'https://github.com/org/dep'
+path = 'deps/dep' # a caller-local repository
+commit = 'abc123…'
+```
+
+- **Which commit:** `from` as a table selects the caller's locally known
+  tracking ref, not the local branch or the remote's current state; a string
+  keeps the caller's revision syntax. Ferry does not fetch or fall back, and
+  the ref must name a commit directly (not a tag object).
+- **One store:** every object goes to the place's one store with the run's
+  commit, only after the place's capabilities are checked (`ship`, besides
+  `detach`), and is kept as `refs/ferry/ship/<commit>`, outside the heads a
+  seat's clone copies.
+- **In the checkout:** a `ref` entry is made in the seat's clone (and a ref
+  a later run no longer ships is removed); a `url` entry is served from a
+  bare repository of the run's own (it borrows the store's objects and holds
+  only this run's declared commits) through the checkout's git configuration
+  (`GIT_CONFIG_GLOBAL`), so the recipe fetches it at its URL. A recipe sees
+  its commit and its own declared entries, never another project's.
+- **In the receipt:** `ship`, one `{ref | url, commit, from}` per entry.
+
+### Provider capabilities
+
+A project can require capabilities of the Ferry that runs it, so that a
+rollback or an older binary on one end cannot silently run without them:
+
+```toml
+[provider]
+requires = ["admission"]
+```
+
+| capability | meaning |
+|---|---|
+| `args` | recipe arguments after `--` |
+| `refusal-event` | typed refusals before acceptance |
+| `custody` | seat custody records at release |
+| `lease` | the shared/exclusive host lease |
+| `admission` | host policy admission (`host.toml`), even when not configured |
+| `detach` | detached runs (`ferry place` submit, follow, stop, record); a caller refuses a place without it (125, naming the place's `source_rev`) |
+| `retire` | the place's `retire` verb for `ferry seats prune`; prune refuses a place without it (125, naming its `source_rev`) |
+| `ship` | `[[ship]]` requests and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
+| `status` | the place's `status` verb; `ferry status` refuses a place without it (125, naming its `source_rev`) |
+
+A run is refused (125) before any hook runs if:
+- the caller does not know a required capability;
+- the host's `host-info` lacks one (a host from before capabilities lists
+  none);
+- the host refuses the request.
+
+The table may sit in `ferry.toml` or in an adapter's contract, not both. The
+receipt records `provider_requires`.
+
+## Machines
+
+`$XDG_CONFIG_HOME/ferry/machines.toml` (default `~/.config/ferry`):
+
+```toml
+[host.bench]
+ssh = "bench"
+triple = "x86_64-unknown-linux-gnu"
+cores = 16
+features = ["linux", "x86_64", "quiet"]
+```
+
+- **`binary`** (default `.local/bin/ferry`, relative to the host's home) is
+  the path to `ferry` on the host. After `nix profile install`, set
+  `binary = ".nix-profile/bin/ferry"`.
+- **Routing:** Ferry chooses the first machine whose features contain every
+  requirement. `--on` names a machine; it does not bypass requirements.
+- **SSH:** aliases come from your SSH configuration. Ferry copies no
+  credentials and provisions nothing.
+- **Features are declarations,** not measurements.
+
+### Host policy and admission
+
+A machine's operator may set a disk floor in `~/.config/ferry/host.toml` on
+that machine. Each run is admitted under its seat lock, after the host lease,
+before checkout and hooks.
+
+```toml
+# Version 1: a guard. Below the floor, refuse (125).
+version = 1
+min_free_bytes = 42949672960
+# Optional: a seat whose preserve paths and cache exceed this starts cold.
+seat_cap_bytes = 21474836480
+```
+
+- **No file:** the run proceeds, and the receipt records `not-configured`.
+- **A malformed policy refuses** before anything is measured: an unknown
+  version or key.
+
+The receipt's `admission` records the policy read, the floor, the filesystem,
+the bytes available, and the result. Availability can change for reasons
+outside Ferry, so it is an observation.
+
+### Seat bounds (SPEC §9)
+
+Seats are bounded in count and in size; neither touches source, logs,
+receipts or records.
+
+- **Count.** Each accepted run appends one line to the caller's seat book,
+  `~/.local/state/ferry/seats.jsonl` (`{key, place, repo_path, seat,
+  last_used_ms}`; one `O_APPEND` write, never rewritten). A failed append is
+  retried when the run completes, and a failure then is a note. `ferry seats
+  prune [--on <machine>]` retires each recorded seat whose workspace is
+  provably gone: its name is absent from a parent directory that can be
+  listed and is on the device recorded with it. Anything else (a denied
+  lookup, a missing parent, an unmounted volume) is reported as `kept …
+  unknown` and never retired. So a workspace removed together with its
+  parent directory (say `~/tmp/x/` deleted whole) is never pruned: its seat
+  stays until an operator removes it on the place. The place's `retire` verb tries the seat's lock once and,
+  if it is free, deletes the seat's checkout and cache, records
+  `records/retired-<key>.json`, and keeps the lock file. A held seat is
+  skipped (busy). A run refused meanwhile is told the seat "is being
+  retired". Prune prints one line per seat and appends a tombstone for each
+  one retired; a later run on the same workspace revives it. Local seats live
+  inside their workspace and go with it, so they are not recorded. Exit 0 when
+  every candidate was retired or busy, 125 if a place refused otherwise
+  (including a place without the `retire` capability, named by revision),
+  255 if a place was unreachable. Prune only ever names this caller's seats.
+- **Size.** With `seat_cap_bytes` set, a run measures its seat's preserve
+  paths and cache under its seat lock, before the checkout, when the last
+  measurement is over an hour old. Only paths proven inside the seat are
+  measured or wiped: one behind a symbolic link, or on another device (a
+  volume mounted inside the seat), is skipped with a note, and every delete
+  proves this again at its own moment. A
+  run that has spent its wait budget, or a measurement over 30 s, is not
+  measured (a note). Over the cap, they are wiped and the run
+  starts cold: the receipt's `pruned` is `{bytes, cap}` and `reason` says so.
+  `pruned.bytes` is what was measured over the cap; after a partial wipe
+  (a path it could not delete, each a note) less than that was removed.
+  The cap can be exceeded by at most an hour of runs' growth. A failed wipe is
+  a note, and the run goes on with what is there.
+- **Keep `seats/` a real directory** on the state root's disk.
+  An operator who moves it to another disk through a symbolic link makes
+  every cap and retire on that place refuse: safe, but they never act. Move
+  the whole state root instead.
+
+## Hooks and environment
+
+Hooks are committed executables, with paths relative to the checkout. They run
+in this order: prepare, env, the recipe (in the run's session), then collect
+(in its own session, after the recipe's is stopped).
+A run stopped before its session is spawned (a stop while it waits for locks
+or prepares its seat) runs none of them, collect included: nothing ran.
+
+- **env** prints a JSON object of environment strings, never shell code.
+- **Inputs:** `FERRY_SEAT`, `FERRY_COMMIT`, `FERRY_ID`, `FERRY_WORKDIR`,
+  `FERRY_CACHE_DIR`, `FERRY_REQUEST_FILE`; collect also gets
+  `FERRY_EXIT_CODE`. Every hook and the recipe see the run's own `FERRY_ID`
+  (SPEC §10) and request file, collect included.
+- **Identity:** the checkout path's basename is not an identity (every
+  seat's is `checkout`). A stable per-seat identity is `FERRY_SEAT`;
+  `FERRY_ID` is per run.
+- **Sockets:** keep Unix sockets out of the checkout. A remote seat's path
+  (`~/.local/state/ferry/v1/seats/<key>/checkout`) is about 82 bytes on a
+  typical Linux host, and a socket path is limited to 107: put sockets
+  under `/tmp` or a short `$XDG_RUNTIME_DIR` path instead.
+- **Reserved:** `FERRY_*` and `GIT_CONFIG_GLOBAL`. A hook cannot replace the
+  run's identity or the seat-local git configuration that serves shipped
+  URLs.
+- **`FERRY_CACHE_DIR`** is a per-seat directory Ferry owns
+  (`<state>/seats/<seat>/cache`, mode 0700). Put regenerable build output there,
+  for example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`.
+- **The `environment` declaration** has three lists:
+  - `forwards`: caller variables sent to the recipe, recorded in the receipt,
+    so never put secrets there;
+  - `watches`: prefixes whose unlisted, nonempty variables refuse before any
+    push;
+  - `local`: variables deliberately kept on the caller.
+- **Projects own** their own database preparation and artifact collection. A
+  service a run starts and expects to outlive it belongs to the operator's
+  service manager (`PRINCIPLES.md`, worked example).
+
+## How a run is kept honest
+
+### Transport
+
+- **Exact objects only.** The caller pushes only the exact commit (and any
+  `[[ship]]` objects) to the machine's private bare repository, under
+  `refs/ferry/<repo key>-<seat>/<commit>`, never to origin. Two concurrent
+  runs of the same commit may race to create that ref. A push that loses the
+  race to an identical ref counts as published.
+- **One SSH connection per caller.** Ferry sets non-interactive SSH
+  (`BatchMode=yes`) itself. Each caller process gets its own control
+  connection in `~/.cache/ferry/ssh/<pid>/`, closed when the caller exits, so
+  one run never rides on a connection another run's caller owns.
+  - If that path would be too long for a Unix socket (a very long HOME), each
+    SSH command opens its own connection instead.
+- **A run token** binds the host's facts to this caller's receipt.
+- **The checkout is checked:** a seat lock protects a detached checkout, and
+  HEAD, a clean tree and hidden index flags are checked before execution.
+- **Local runs** use the same mechanism, in a clean checkout of the commit
+  under `.ferry/local/v1`, not the caller's working tree.
+
+### The host lease
+
+Every run holds a machine-wide lease while it runs. Ordinary runs share it. An
+exclusive run:
+1. closes a gate, so no new run starts;
+2. waits for in-flight runs to release their shared side;
+3. runs alone.
+
+There is no queue. Before it holds the gate, an exclusive run competes for it
+like any other run. Receipts record `lease.mode`, `wait_ms`, `acquired_ms` and
+`released_ms`, which is when the run's use of the lease ended, stamped just
+before its record is final; the locks themselves close after the record
+(SPEC §5).
+
+**Scope.** "Exclusive" means no other Ferry run under the same state root:
+one user's Ferry on one machine, or one repository's `.ferry/local/v1`. It is not
+a quiet-host certificate, and it does not quiet:
+- processes started outside Ferry;
+- other users;
+- other virtual machines on the same hardware;
+- Ferry binaries older than the lease.
+
+A run never waits for its seat: a held seat lock refuses at once (125). The
+refusal names the run that holds it when the lock file names a live run.
+Otherwise it says what it can prove. The lock may have outlived the run it
+names ("held after run <id> ended"), or a run that is starting may hold it.
+When the seat's live reservations make both possible, it names both: a
+reservation shows a run is alive, not that it has the lock. The work
+inherits the seat lock, on every platform, so whatever a run leaves running
+while holding it keeps the seat busy. It never inherits the host lease: only
+the supervisor holds it, so a leftover can never close the place to other
+seats (SPEC §3). Its waits for the host lease end by its submit plus `--wait-seconds`
+(default 30 min), apart from `--timeout-seconds`. Past it the run refuses
+(125), saying what a probe of the lock proves. If it is free now: "released
+as the wait ended; retry". If an exclusive probe fails but a shared one then
+succeeds, that proves only that no exclusive holder remained: "held by shared
+runs, or just released; retry". Otherwise it names the exclusive run that took it, reconciled first:
+a live one holds it; an ended one is closing its locks, or an exclusive run
+is starting. An error while probing names no holder ("holder unknown"). No
+holder's name is ever cleared: the work inherits the seat lock and may
+outlive its run.
+
+A run's record is final before its locks close (SPEC §5), on every path: each
+lock passes to the supervisor as it is taken, a refusal after that keeps it
+until the refusal is final, and a panic in the supervisor is caught so the
+record is still written first. If the record cannot be written, the locks
+close only when the supervisor exits, and a reconcile then proves the run
+lost. So a named run that is still live holds the
+lock it names, and a free lock's last holder is always already final.
+A place's refusal carries `why` and `next` apart (SPEC §6); the receipt's
+reason is `<why>; <next>`.
+
+### Custody: the session stop (SPEC §7)
+
+The supervisor is always a freshly spawned `ferry place supervise`, started
+by `place submit` in its own session, and the run's work has a session of
+its own.
+
+**At the end of a run,** the run's session (and then the collect hook's) is
+stopped: SIGTERM to every member, up to 10 s for them to leave, SIGKILL, and
+up to 2 s for them to be gone. Then one **marker pass** reads the
+exec-time environment of every process of the place's user born since the
+supervisor (`/proc/<pid>/environ` on Linux, `KERN_PROCARGS2` on macOS) and
+lists those carrying this run's `FERRY_ID`: every hook, the recipe and what
+they start inherit it, however they leave the session (`setsid`, a double
+fork). The receipt's `custody` records:
+- `tier`: `session`;
+- `survivors`: the session's members still alive and the marked processes,
+  one entry each, by pid, start time (`null` if it could not be read) and,
+  when read, `command` (its `argv[0]` only: arguments may carry secrets); or
+  `"unknown"`, when the session could not be listed at the end, an eligible
+  process could not be read or changed during the read, or the pass took
+  longer than 10 s (or the run's deadline). An unreadable process whose
+  parent is neither pid 1 nor a process of the place's user (a login's
+  `sshd-session`) cannot be the run's and is skipped. **macOS withholds the
+  environment of its own platform binaries** (`/bin/sleep`, `/bin/sh`), so
+  on a Mac that runs anything else the result is often `unknown`: never a
+  list that might be short;
+- `error`: what failed on the way (a signal, a listing), and why the pass was
+  unknown, with what it did see. The stop never gives up early, and the
+  verdict stands. Only a failed stop is noted in the reason.
+
+The pass reports; it never stops anything. A survivor that keeps the seat's
+lock keeps the seat busy until it exits, and the next run's refusal names
+the run it outlived ("held after run <id> ended"): stop it by its exact pid.
+One that also closed its descriptors holds nothing, and can write into a
+later run's checkout or the seat's cache. A process started with a cleared
+environment (`env -i`) carries no marker and is not listed (on macOS the
+pass then reads it as withheld: `unknown`). What a run
+starts is its project's to keep inside the run, or to stop in its collect
+hook (SPEC §7). There is no taint, quarantine or `seat recover`.
+
+**The seat lock outlives a killed supervisor.** It is inherited by the
+recipe's processes, on every platform. A killed supervisor therefore frees
+it only when the processes that kept it exit, so a new run on the seat is
+refused busy instead of starting beside live work. The host lease closes
+with the supervisor: an exclusive run whose supervisor is killed no longer
+keeps other seats out (SPEC §11). Release closes descriptors, never
+`LOCK_UN`.
+
+### Detached runs, output and the verdict
+
+A run belongs to its place, not to the connection that asked for it:
+
+- **Submit.** The caller sends the request (`place submit`, over SSH or as a
+  local exec). The place starts the supervisor paused, reserves the run id
+  with the supervisor's pid, then releases it and replies within seconds. A
+  retried submit with the same id and token gets the same run back.
+- **Follow.** The caller copies `runs/<id>/output.log` from a byte offset until
+  the record is final and every byte before it has arrived. After a dropped
+  connection it resumes from the bytes it has. If the place does not answer
+  for 5 min, the caller exits 255 and its receipt stays `submitted`. Once the
+  place has accepted a run, only its final record gives the receipt a
+  verdict: any other failure (reading that record, for one) leaves it
+  `submitted`, exit 255, with `ferry record <id>` as the next step. Artifacts
+  have their own status and never change the verdict (see Artifacts).
+- **Stop.** The first INT, TERM or HUP of the caller asks the place to stop the
+  run (`stopped` 128+signal), and the caller keeps following to the record.
+  The first stop decides: a later one, from anyone and with any signal, is
+  accepted and changes neither the signal nor `stopped_by`. If the stop cannot
+  be delivered, the caller prints `not stopped; continues until its deadline
+  in <n> min; ferry stop <id>` and exits 255. A second signal leaves at once
+  with 255. Either way the receipt stays `submitted`. A signal that comes
+  after the run is final changes nothing: the caller delivers the rest of
+  the output and exits with the run's code (a second signal leaves early,
+  still with it). A caller killed outright stops nothing: the run goes on to
+  its end or its deadline.
+- **Deadline.** Every run ends by `submitted + wait + timeout + teardown`
+  (`wait` is `--wait-seconds`, 30 min by default, the one bound on all its
+  lock waits), which submit returns. A
+  request without `--timeout-seconds` gets the place's maximum, 6 h (and none
+  may ask for more).
+
+**Output is data, never control.** The recipe's stdout and stderr share one
+pipe, so the log keeps the order they were written in. One writer copies its
+bytes into the log: no lines, no transcoding, nothing waits on a reader.
+- **Cap:** past 1 GiB, output is read and dropped; the record says
+  `output: {bytes, capped}`. A failed write is counted (`write_errors`).
+- **End:** after the session stop, the writer gets 2 s more. A process outside
+  the session that still holds the pipe is not waited for: the reason says
+  "output still open", and the log is closed before the record.
+- **The caller** writes the bytes exactly as logged, to stdout (to stderr with
+  `--json`). A closed stdout or stderr is data: the run goes on.
+
+**The verdict is decided once,** by the first terminal fact (above), on the
+place, and kept in its final record.
+
+**`--json`** emits version-one NDJSON events: `submitted` (with the
+supervisor's pid), then `receipt`.
+
+## `ferry status`
+
+**`status`** reads the place's state root and process table once. It takes
+no lock and changes nothing, so it never makes a seat look busy.
+- **disk:** available bytes, the floor and the seat cap from `host.toml`, and
+  why admission would refuse now, if it would.
+- **runs:** each live run (reserved, not final, its supervisor alive) with its
+  seat, recipe, `exclusive`, phase and deadline. Phase comes from the files a
+  run has written: `waiting` (locks, admission, checkout), `preparing`
+  (hooks), `running` (the recipe started).
+- **gate:** `host.gate` keeps the name of the last exclusive run that took it.
+  That run is the `holder` only while it is live; otherwise `unknown`, never
+  a stale name. Every other live exclusive run is a `requester`.
+- **seats:** each seat with the run its lock file last named, that run's
+  outcome, the cap's last measurement, and its size from one walk bounded at
+  5 s in all (`null` past it). Seats this caller knows from its seat book carry
+  their workspace; other callers' show their key.
+- **leftovers:** processes carrying the `FERRY_ID` of a run that is no longer
+  live here, by pid, start, run and `argv[0]`. Those whose run this place does
+  not know (another state root) are counted apart under `record_none`, and
+  unreadable processes are counted. Stop a leftover by its exact pid.
+
+Internal verbs: `ferry place`, `host-info` and `execute-session` are internal: the caller
+runs them on the machine. A caller older than its place is not served (SPEC
+§6): callers are never installed before their places.
+
+## Development
+
+- **Real execution required.** Transport changes need controls with real
+  execution, not only unit tests: exact commits, refusal versus recipe exit,
+  seat isolation, the session stop at the run's end or deadline, and the run
+  surviving client loss.
+- **Fault injection.** Debug builds read `FERRY_FAIL_AT=<point>[,…]` to
+  inject failures at fallible points; release builds never read it.

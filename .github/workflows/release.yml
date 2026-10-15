@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # The release itself, with the CHANGELOG section as its notes. The binaries
+  # are attached by the build jobs below; Nix users get the cached package.
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Check the tag matches Cargo.toml
+        run: test "$(python3 scripts/release.py version)" = "${GITHUB_REF_NAME#v}"
+
+      - name: Render release notes
+        run: python3 scripts/release.py notes "$GITHUB_REF_NAME" > release-notes.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
+        with:
+          body_path: release-notes.md
+
+  binaries:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-15 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          rustflags: ""
+
+      - name: Build
+        env:
+          FERRY_SOURCE_REV: ${{ github.sha }}
+        run: |
+          cargo build --release --locked
+          test "$(target/release/ferry --version)" = "ferry ${GITHUB_REF_NAME#v}"
+
+      - name: Package and attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="ferry-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$name/share/ferry/skills"
+          cp target/release/ferry LICENSE-MIT LICENSE-APACHE README.md "$name/"
+          cp -r skills/ferry "$name/share/ferry/skills/ferry"
+          tar -czf "$name.tar.gz" "$name"
+          gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" --clobber

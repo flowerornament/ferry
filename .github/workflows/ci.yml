@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The same gate as a local `just check`, in the flake's dev shell: rustfmt,
+  # strict Clippy, unit tests and the real-CLI contract tests (which need git,
+  # jj and python3, and procps and util-linux on Linux).
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+
+      - name: Check gate
+        run: nix develop --accept-flake-config -c just check
+
+  nix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+
+      - name: Flake package smoke test
+        run: |
+          out="$(nix build --accept-flake-config --no-link --print-out-paths .)"
+          "$out/bin/ferry" --version
+          "$out/bin/ferry" --help >/dev/null
+          nix run --accept-flake-config . -- --version
+
+      - name: Home Manager module smoke test
+        run: bash scripts/test-home-manager-module.sh
+
+      - name: Release script tests
+        run: python3 scripts/test_release.py
