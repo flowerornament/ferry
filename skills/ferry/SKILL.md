@@ -12,7 +12,8 @@ commit, on a machine that can run it, and writes a receipt saying exactly what
 happened. It is the safe way to share build hosts with other agents:
 - your run gets a private checkout (a **seat**);
 - timing runs get the host alone (the **host lease**);
-- whatever a run started is stopped when it ends.
+- a run's processes are stopped when it ends, and anything that escaped is
+  listed in its receipt, by pid.
 
 ## Run
 
@@ -41,7 +42,8 @@ ferry run test --on bench --json       # NDJSON events, for tools
   default) + timeout + teardown. It ends the run even with no caller.
 - **Waits are bounded.** A run never waits for its seat. Its waits for the
   host lease end `--wait-seconds` after it was submitted; then it is
-  refused (125) naming the run that holds the lease.
+  refused (125) with what a probe of the lock proves (its holder, shared
+  runs, or released).
 - **Exclusive waits.** An exclusive run waits for in-flight runs on that
   machine and keeps new ones out. Use it only for measurements.
 - **The run is the machine's, not your terminal's.** Closing the terminal or
@@ -75,6 +77,7 @@ ferry receipt <id>                     # the stored receipt (JSON)
 ferry record <id>                      # the receipt once final; exit 3 = no verdict yet
 ferry follow <id>                      # re-attach: the run's output, then its receipt
 ferry stop <id>                        # stop your run (another's: --other --reason '<why>')
+ferry status --on <machine>            # read-only: live runs, the gate, seats, leftovers
 ```
 
 **Receipt fields that matter:**
@@ -82,7 +85,8 @@ ferry stop <id>                        # stop your run (another's: --other --rea
 - `outcome`, `exit_code`, `reason`;
 - `commit`;
 - `host_source_rev`, `caller_source_rev`: which Ferry ran on each end;
-- `custody`: what the run left behind and what was stopped;
+- `custody`: what survived the stop (`survivors`, by pid, or `"unknown"`)
+  and any `error`;
 - `lease`: shared or exclusive, and how long it waited;
 - `admission`: host disk policy;
 - `pruned`: `{bytes, cap}` when the seat was over its cap and started cold;
@@ -119,10 +123,14 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
   floor. Tell the operator.
 - **Seat being retired:** `ferry seats prune` is retiring that seat (its
   workspace was gone). Run again in a moment; the seat starts cold.
-- **What a run left behind:** the receipt's `custody.survivors` lists the
-  run's session members still alive after the stop (pid and start). Stop them
-  by exact pid, never by pattern. There is no `ferry seat recover`: a busy
-  seat clears when what holds its lock exits.
+- **What a run left behind:** the receipt's `custody.survivors` lists, by
+  pid, start and `command` (its executable), every process still carrying
+  the run's `FERRY_ID` after the stop, however it left the session; or
+  `"unknown"` when some process could not be read (often on macOS, which
+  hides its own binaries' environment). Stop them by exact pid, never by
+  pattern. `ferry status --on <machine>` lists leftovers of every ended run.
+  There is no `ferry seat recover`: a busy seat clears when what holds its
+  lock exits.
 - **Stale seats:** `ferry seats prune` retires your seats whose workspace is
   gone; it skips busy ones and only names seats you recorded. "kept …
   unknown" means it could not prove the workspace gone (a denied lookup, a
@@ -137,7 +145,7 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 `ferry: waiting for lock …: another run holds it` means another run holds
 the host lease. That is normal while another agent's exclusive
 measurement runs. Wait (at most `--wait-seconds`), or Ctrl-C (the run is then
-`stopped` 130, and nothing is left behind).
+`stopped` 130; nothing ran yet).
 
 ## Rules
 
@@ -146,11 +154,14 @@ measurement runs. Wait (at most `--wait-seconds`), or Ctrl-C (the run is then
   machines are shared.
 - **Services belong to the operator.** A service your recipe needs to outlive
   it (a shared database) must be an operator service, not started by the
-  recipe: Ferry stops whatever a run leaves behind.
+  recipe. Keep everything a recipe starts inside the run (no `nohup`,
+  `setsid` or `-d`), or stop it in the project's collect hook: Ferry stops
+  the run's session and lists what escaped, but it does not hunt escapees.
 - **Ferry owns its own files** (`~/.local/state/ferry`, `.ferry/` in the
   repository). Do not edit or delete them by hand; use the commands above.
 - **Remote evidence is not landing authority.** A green remote run does not
   certify a repository's own local gate (for example `just land`).
 - **Report Ferry problems** with the receipt id and the exit code, to whoever
-  maintains Ferry. A final `lost` 255 that repeats is a Ferry or transport
-  problem, not your code.
+  maintains your Ferry install, or at
+  https://github.com/flowerornament/ferry/issues. A final `lost` 255 that
+  repeats is a Ferry or transport problem, not your code.

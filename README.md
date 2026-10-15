@@ -3,29 +3,60 @@
 Run this repository's recipe at this exact commit, on a machine that can run
 it, and record exactly what happened.
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Ferry is for agents and people who share build hosts. You declare recipes in
 the repository and machines once. Ferry gives each run:
 
 - **The exact commit you named.** No drifting remote checkout: Ferry pushes
-  that object and resets a private checkout to it.
+  that object, even an unpushed one, and resets a private checkout to it.
 - **No collisions.** Each workspace gets its own warm checkout (a *seat*), and
   a host lease keeps timing runs alone on the machine.
-- **Nothing left behind.** Processes a run started are stopped when it ends.
-  A seat that cannot be proven clean refuses the next run and says why.
+- **Nothing left running unseen.** A run's session is stopped when it ends.
+  Its record lists, by pid, any process that escaped, or says `unknown` when
+  it cannot tell (common on macOS).
 - **An honest outcome.** A receipt and an exit code tell a recipe failure
   from a refusal (nothing ran) from a lost run (the infrastructure failed).
+- **Runs outlive the connection.** A dropped SSH connection never ends a run;
+  re-attach with `ferry follow <id>`.
 
 Ferry is deliberately small. It is not a scheduler, a CI system, a service
-manager, a sandbox, a lock service or a deployment tool. `PRINCIPLES.md` says
-what it is and is not, and why.
+manager, a sandbox, a lock service or a deployment tool.
+[`PRINCIPLES.md`](PRINCIPLES.md) says what it is and is not, and why.
+
+**Status:** early and moving fast. It runs every day on Linux and macOS
+build hosts shared by several coding agents. The command line and the
+receipt format are versioned (`protocol`, `version`), but expect changes
+before 1.0. Tested on Linux x86_64 and macOS aarch64; the flake also builds
+for aarch64-linux.
+
+## Install
+
+Ferry is one binary, `ferry`, needed on every machine that calls or runs a
+recipe: Linux or macOS, with `git`, and `ssh` on the caller. A caller and its
+places should run the same version: a caller refuses a place that lacks a
+capability it needs, naming the place's revision. On each remote host, put
+`ferry` where `machines.toml` says (`binary`, below).
+
+```sh
+# With Nix (the supported route; runs the full test suite while building)
+nix profile install github:flowerornament/ferry
+# or, pinned in a flake: inputs.ferry.url = "github:flowerornament/ferry?rev=<commit>";
+
+# With Cargo (needs Rust 1.99 or newer)
+cargo install --locked --git https://github.com/flowerornament/ferry
+```
+
+The flake also provides a Home Manager module (`programs.ferry`) that
+installs the package and links the agent skill (`skills/ferry`) where coding
+agents look for it. [`RELEASE.md`](RELEASE.md) covers installing on shared
+hosts, upgrades and rollback.
 
 ## Quick start
 
 ```sh
-# 1. Install (Nix; see RELEASE.md for hosts and rollback)
-nix build git+file:///path/to/ferry          # or pin it in your Nix configuration
-
-# 2. Declare recipes in the repository (commit this file)
+# 1. Declare recipes in the repository, and commit them: Ferry reads them
+#    from the commit it runs, never from the working tree
 cat > ferry.toml <<'EOF'
 version = 1
 [recipe.test]
@@ -33,25 +64,29 @@ command = ["cargo", "test", "--locked"]
 requires = ["linux"]
 routable = true
 EOF
+git add ferry.toml && git commit -m "Add ferry.toml"
 
-# 3. Declare machines once (~/.config/ferry/machines.toml)
+# 2. Declare machines once, on the caller
+mkdir -p ~/.config/ferry
 cat > ~/.config/ferry/machines.toml <<'EOF'
 [host.bench]
-ssh = "bench"
+ssh = "bench"                       # an alias from your SSH configuration
+triple = "x86_64-unknown-linux-gnu"
 features = ["linux", "x86_64"]
 EOF
 
-# 4. Run
+# 3. Run
 ferry recipes                    # what this commit allows
 ferry machines                   # what you configured
-ferry run test --on bench        # remote, at HEAD's commit
+ferry run test --on bench        # remote, at your current commit (git HEAD, or jj @-)
 ferry run test --local           # this machine, in a clean checkout of the commit
 ferry run test --on bench -- --nocapture       # arguments after --
 ferry receipt <id>               # what happened
 ```
 
 With no machines configured, runs are local. A machine that lacks a required
-feature refuses rather than running.
+feature refuses rather than running. `--local` runs on this machine without
+checking `requires`.
 
 ## Concepts
 
@@ -59,6 +94,7 @@ feature refuses rather than running.
 |---|---|
 | **Recipe** | A named command (argv) the repository allows to run, with required features. Read from the commit being run. |
 | **Machine** | Where work runs: `local`, or an SSH destination with declared features. |
+| **Place** | A machine's Ferry state root, where runs execute: `~/.local/state/ferry/v1` on a host, or the repository's `.ferry/local/v1` for local runs. |
 | **Seat** | A private, warm checkout for one workspace (`--seat`, default `default`). One run at a time per seat: a run that finds its seat's lock held is refused at once (125), naming the run that holds it, its age and the next step. |
 | **Host lease** | Shared by every run on a machine; held alone by an exclusive run. |
 | **Run** | One attempt. It ends with exactly one receipt and one exit code. |
@@ -162,7 +198,8 @@ collect = "scripts/ferry-collect"
   the commit being run, never the working tree.
 - **Explicit argv.** Ferry never infers a tool from a recipe's name.
 - **Only `routable = true` recipes go remote.** Publishing and certifying
-  recipes stay unroutable; for example, Herald's `just land` stays local.
+  recipes stay unroutable; for example, a repository's `just land` stays
+  local.
 - **`exclusive`.** `requires = ["exclusive"]` (or `--exclusive`) holds the host
   lease alone. It is an execution lock, not a machine feature: routing ignores
   it.
@@ -197,7 +234,7 @@ If recipes already have a catalog, point to it:
 ```toml
 version = 1
 [catalog]
-path = ".config/murail-gates.toml"
+path = ".config/gates.toml"
 table = "recipe"
 ```
 
@@ -302,6 +339,9 @@ cores = 16
 features = ["linux", "x86_64", "quiet"]
 ```
 
+- **`binary`** (default `.local/bin/ferry`, relative to the host's home) is
+  the path to `ferry` on the host. After `nix profile install`, set
+  `binary = ".nix-profile/bin/ferry"`.
 - **Routing:** Ferry chooses the first machine whose features contain every
   requirement. `--on` names a machine; it does not bypass requirements.
 - **SSH:** aliases come from your SSH configuration. Ferry copies no
@@ -388,13 +428,12 @@ or prepares its seat) runs none of them, collect included: nothing ran.
   `FERRY_EXIT_CODE`. Every hook and the recipe see the run's own `FERRY_ID`
   (SPEC §10) and request file, collect included.
 - **Identity:** the checkout path's basename is not an identity (every
-  seat's is `checkout`). A stable per-seat identity is `FERRY_SEAT`, the
-  same value the pre-M1 slot directory was named after; `FERRY_ID` is per
-  run.
+  seat's is `checkout`). A stable per-seat identity is `FERRY_SEAT`;
+  `FERRY_ID` is per run.
 - **Sockets:** keep Unix sockets out of the checkout. A remote seat's path
-  (`~/.local/state/ferry/v1/seats/<key>/checkout`) is about 82 bytes on
-  bench, and a socket path is limited to 107: put sockets under `/tmp` or
-  a short `$XDG_RUNTIME_DIR` path instead.
+  (`~/.local/state/ferry/v1/seats/<key>/checkout`) is about 82 bytes on a
+  typical Linux host, and a socket path is limited to 107: put sockets
+  under `/tmp` or a short `$XDG_RUNTIME_DIR` path instead.
 - **Reserved:** `FERRY_*` and `GIT_CONFIG_GLOBAL`. A hook cannot replace the
   run's identity or the seat-local git configuration that serves shipped
   URLs.
@@ -585,8 +624,9 @@ supervisor's pid), then `receipt`.
 ## Limits
 
 - **Not a sandbox.** Runs execute as you, with your permissions.
-- **Outside custody:** processes a run did not start, other users, other
-  hosts, and descendants that leave the run's session.
+- **Outside custody:** processes a run did not start, other users and other
+  hosts. Descendants that leave the run's session are listed, not stopped;
+  one that clears its environment is not listed.
 - **A supervisor killed outright** stops nothing. Its run is reconciled to
   `lost`/255 by its caller or the next run on the seat.
   - The inherited seat lock keeps other runs off its seat while its work
@@ -605,22 +645,22 @@ just land            # gate exactly the described change, then move main (one la
 
 - **Real execution required.** Transport changes need controls with real
   execution, not only unit tests: exact commits, refusal versus recipe exit,
-  seat isolation, and session cleanup on client loss.
+  seat isolation, the session stop at the run's end or deadline, and the run
+  surviving client loss.
 - **Fault injection.** Debug builds read `FERRY_FAIL_AT=<point>[,…]` to
   inject failures at fallible points; release builds never read it.
-- **Process conventions.** `AGENTS.md` describes them: one jj workspace per
-  agent, the design gate, and stopping processes only by exact pid.
-- **Private forge.** The source is in a private GitHub repository, and
-  `just land` is the only way `main` reaches it. There is no published
-  package.
+- **Process conventions.** [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+  [`AGENTS.md`](AGENTS.md) describe them: the checks, the design gate, how
+  changes land, and stopping processes only by exact pid.
 
 ## Design and direction
 
-- `PRINCIPLES.md`: what Ferry is and is not, and how design questions are
-  decided.
-- `design/`: dated design documents, with their reviews and evidence.
-- **Target:** `SPEC.md` (normative end state, terse). **Rationale:**
-  `design/2026-10-09-ferry-minimal.md`: Ferry does one
+- [`PRINCIPLES.md`](PRINCIPLES.md): what Ferry is and is not, and how
+  design questions are decided.
+- [`design/`](design/README.md): dated design documents, with their reviews
+  and evidence.
+- **Target:** [`SPEC.md`](SPEC.md) (normative, terse). **Rationale:**
+  [`design/2026-10-09-ferry-minimal.md`](design/2026-10-09-ferry-minimal.md): Ferry does one
   thing (an exact commit's recipe on your machine, warm, alone if asked, with
   an honest record) and pushes containment strength to the OS and scheduling
   to repositories and CI. A run becomes a bounded, detached job:
@@ -630,5 +670,21 @@ just land            # gate exactly the described change, then move main (one la
   - leases are held by the kernel;
   - there is one authoritative record per run.
 
-  This README describes Ferry as built today; it will change as v3 lands.
-- `RELEASE.md`: install, upgrade and rollback.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): where SPEC's model lives in the code.
+- [`RELEASE.md`](RELEASE.md): install, upgrade and rollback.
+
+## Contributing
+
+Issues and pull requests are welcome. Read
+[`CONTRIBUTING.md`](CONTRIBUTING.md) first: Ferry is small on purpose, and
+a change that adds a mechanism is weighed against
+[`PRINCIPLES.md`](PRINCIPLES.md). Report security problems privately, as
+[`SECURITY.md`](SECURITY.md) describes.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in Ferry
+by you, as defined in the Apache-2.0 license, shall be dual licensed as
+above, without any additional terms or conditions.

@@ -3,6 +3,12 @@ name = "ferry"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
+description = "Run a repository's recipe at an exact commit, locally or on a machine over SSH, and record exactly what happened"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/flowerornament/ferry"
+readme = "README.md"
+keywords = ["build", "ssh", "remote-execution", "agents", "reproducibility"]
+categories = ["command-line-utilities", "development-tools"]
 publish = false
 
 [lints.rust]

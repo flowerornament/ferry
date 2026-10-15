@@ -30,7 +30,7 @@
         inherit self;
         src = ./.;
       };
-      # Source tree path for skill syncing (nix-config agent-sync.nix).
+      # Source tree path, for tools that sync agent skills.
       skillsDir = "${self}/skills";
       # Everything `just check` and the contract tests need, on any machine
       # with Nix: the recipes run in it, so no host needs these installed.

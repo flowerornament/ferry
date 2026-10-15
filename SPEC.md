@@ -1,7 +1,7 @@
 # Ferry specification
 
-**Normative end state.** The M1 slices converge the code onto this document;
-`README.md` describes the behaviour shipped today. The rationale and its
+**Normative end state.** The code converges onto this document slice by
+slice; `README.md` describes the behaviour shipped today. The rationale and its
 evidence are in `design/2026-10-09-ferry-minimal.md`, `PRINCIPLES.md` and the
 earlier design documents. "Why" lines give the reason in one sentence.
 
@@ -52,6 +52,10 @@ ferry check  [--on <place>]
 ferry seats prune [--on <place>]        retire this caller's seats whose workspace is gone
 ferry recipes · ferry places
 ```
+
+Not shipped yet: `--timeout <dur>` and `--wait <dur>` (today
+`--timeout-seconds` and `--wait-seconds`), `--detach`, `ferry check`,
+`ferry places` and `record last`. `README.md` lists the commands as built.
 
 **`run` behaviour:**
 
@@ -169,12 +173,13 @@ leaves none, and the reason says so).
 
 - **Capabilities:** a new caller uses this protocol only if the place
   advertises `detach`. Otherwise it refuses with 125, naming the place's
-  `source_rev` and the next step (install the M1 build on that place).
+  `source_rev` and the next step (install the caller's build on that place).
   There is no legacy `host-run` shim: a caller is never installed before
   its places, and both move in one announced window (decided 2026-10-10
   on ferry-ljc.3; it supersedes the shim in ferry-minimal §7).
-- **Version skew:** old and new binaries never share a state root: the M1
-  root is a new path (`…/ferry/v1`) that pre-M1 binaries never read. A new
+- **Version skew:** old and new binaries never share a state root: the
+  current root is a new path (`…/ferry/v1`) that earlier binaries never
+  read. A new
   caller refuses a place without `detach`/`ship` (125, naming its revision)
   before pushing anything; an old caller meets a place that still answers
   its host-info and is refused at parse (125, naming the place's revision).
@@ -257,7 +262,8 @@ different on each OS and needs host setup. A marker pass works the same on
 macOS and Linux, catches the escapes seen so far, and only reports. On
 2026-10-13 a stopped run's detached devenv Postgres held its seat and the
 shared host lease for 16 hours while its record said `survivors: []`; an
-exclusive request then queued behind it closed bench to every seat. A
+exclusive request then queued behind it closed the shared build host to
+every seat. A
 stronger OS tier stays possible (PRINCIPLES 6) and is not planned.
 
 ## 8. Records and receipts
@@ -350,7 +356,7 @@ working tree.
 - **`seats.jsonl`** (caller state, `~/.local/state/ferry/`): one line per seat
   this caller used: `{key, place, repo_path, seat, last_used_ms}`.
 - **Hook environment:** `FERRY_ID FERRY_SEAT FERRY_COMMIT FERRY_WORKDIR
-  FERRY_CACHE_DIR FERRY_TMP`, plus `FERRY_EXIT_CODE` for collect. Every hook
+  FERRY_CACHE_DIR FERRY_REQUEST_FILE`, plus `FERRY_EXIT_CODE` for collect. Every hook
   and the recipe see the same `FERRY_ID`, the run's own, collect included
   (it is the §7 marker).
 
@@ -361,7 +367,7 @@ working tree.
 | exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (listed as a survivor when it carries the marker); a commit ever shipped on the place is fetchable by hash through a served `[[ship]]` URL even if this run did not declare it (refs are isolated, objects are not) |
 | one run per seat | inherited seat flock | work that unlocks its own descriptor |
 | exclusive host (among Ferry runs; not a quiet host) | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record); a killed supervisor: its session runs on without `host` until the recipe exits (nothing enforces the deadline without the supervisor), and the record reconciles to `lost` |
-| every run ends | an absolute deadline | a killed supervisor: the record is reconciled as `lost`, and its recipe runs until it exits (ferry-8d6) |
+| every run ends | an absolute deadline | a killed supervisor: the record is reconciled as `lost`, and its recipe runs until it exits |
 | run sessions stopped; marked survivors reported | session stop; the marker pass | a marked survivor is reported and left running (the project's or operator's to stop); a leaver that dropped the marker is not listed; an incomplete pass is `"unknown"` |
 | complete output | one capped writer to a file | beyond the cap: `capped` |
 | one honest record | reserve, final once, reconcile | — |
@@ -389,7 +395,8 @@ working tree.
     refusal (125, naming the old `source_rev`), never a mixed state root.
 12. **Fault injection** (`FERRY_FAIL_AT`, debug builds) at every fallible
     point keeps 1–3.
-13. **The cells:** Darwin and Linux Nix checks, bench, a Mac place.
+13. **The cells:** Darwin and Linux Nix checks, a Linux build host, a Mac
+    place.
 14. **Seat count:** `ferry seats prune` retires a seat only when its
     workspace is provably gone (`NotFound`, a listable parent on the
     recorded device). An unreadable or unmounted workspace is kept and
@@ -416,6 +423,6 @@ working tree.
     leftover on the place, it names each: the one holding the gate as its
     holder, the other as a requester. With `host.gate` naming a run whose
     supervisor is gone, the holder is `unknown`. It takes no lock: a run
-    submitted during `status` is never refused busy because of it. The Mac
-    place and bench give the same schema and meaning (`--json`), not the
-    same values.
+    submitted during `status` is never refused busy because of it. A Mac
+    place and a Linux place give the same schema and meaning (`--json`),
+    not the same values.

@@ -32,6 +32,8 @@ in rustPlatform.buildRustPackage {
   '';
   meta = {
     description = "Run committed repository recipes locally or over SSH with durable receipts";
+    homepage = "https://github.com/flowerornament/ferry";
+    license = with lib.licenses; [ mit asl20 ];
     mainProgram = "ferry";
     platforms = lib.platforms.unix;
   };

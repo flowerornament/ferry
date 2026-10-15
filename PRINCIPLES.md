@@ -12,9 +12,9 @@ file.
 1. **Ownership follows lifetime, for processes and files.** A run owns only
    what should end with it. Every file Ferry creates has one declared
    lifetime and lives under Ferry's roots:
-   - **run** (scratch `FERRY_TMP`, request files): removed at release, so
-     nothing is left behind;
-   - **cache** (seat checkouts, `caches/<seat>/`): regenerable. Ferry
+   - **run** (the run's directory: its request, output and result files):
+     kept with its record, never reused by another run;
+   - **cache** (seat checkouts, `seats/<seat>/cache`): regenerable. Ferry
      bounds what it created: a seat is retired when its caller's workspace
      is gone, and a seat's caches are wiped at the start of a run, under its
      lock, when they exceed the place's cap. Anything beyond that is host
@@ -74,15 +74,15 @@ Requests in this list go to the layer that owns them, not into Ferry:
 - **a cache manager:** Ferry bounds only its own state (seats retired with
   their caller's workspace; a per-seat cap enforced under the seat lock). It
   never shares, ranks or evicts caches across seats; anything cleverer is
-  the operator's. Why: M1 is done only when no Ferry state is left to clean
-  by hand, and only Ferry holds the seat lock and only the caller knows
-  whether its workspace still exists;
+  the operator's. Why: no Ferry state may be left to clean by hand, and only
+  Ferry holds the seat lock and only the caller knows whether its workspace
+  still exists;
 - **a quiet-host certifier:** exclusive means "no other Ferry run here", plus
   named observations.
 
 ## Worked example
 
-Herald's shared development Postgres outlived the run that started it, and
+A project's shared development Postgres outlived the run that started it, and
 end-of-run survivor stopping would have stopped it.
 - **1, 2:** no run owns it, and Ferry cannot keep it alive.
 - **3, 4:** it belongs to the host's service manager, set up by the operator.

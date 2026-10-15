@@ -36,14 +36,14 @@
 # follows it is reported lost ("host binary changed during run"), never
 # mis-attributed. Activating on a shared host still needs an announced window.
 #
-# verify-caller only reads: the caller pin lives in ~/.nix-config and
-# changes through the normal Nix configuration workflow.
+# verify-caller only reads: the caller pin lives in the caller's Nix
+# configuration and changes through its normal workflow.
 set -euo pipefail
 
 # Git runs only in the colocated checkout: a jj workspace has no .git, and git
 # there would walk up and silently answer about another repository (~/.git).
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-[ -d "$repo_root/.git" ] || { echo "$(basename "$0"): run this from the colocated checkout (~/code/ferry), not a jj workspace" >&2; exit 1; }
+[ -d "$repo_root/.git" ] || { echo "$(basename "$0"): run this from the colocated checkout (the one with .git), not a jj workspace" >&2; exit 1; }
 unset GIT_DIR GIT_WORK_TREE
 cd "$repo_root"
 root="${FERRY_INSTALL_ROOT:-.local/state/ferry}"

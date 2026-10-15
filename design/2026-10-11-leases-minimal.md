@@ -124,7 +124,7 @@ the behaviour commit apart.
    `--seat`, or follow or stop the named run), and SPEC citations.
 3. **Controls:** tests for §12.7 and §12.8, and the changed tests (§6).
 
-## 5. Contract changes (consumer GO: murail-4a, herald-1b; murail-2a if Morgan says so)
+## 5. Contract changes (consumer GO: murail-4a, herald-1b; murail-2a if @flowerornament says so)
 
 1. A busy seat is refused at once, 125, naming the run, its age and the next
    step. Today it waits up to `--wait-seconds`. A consumer that relied on
