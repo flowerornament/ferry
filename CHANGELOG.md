@@ -4,6 +4,17 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **A stalled SSH connection no longer holds the caller.** Every SSH
+  connection the caller makes has a connect timeout and keepalives, and the
+  replies it needs before submitting a run (`host-info`, file reads) have a
+  60 s bound; past it the run is refused (125). Seen as callers waiting
+  minutes on a stalled jump host.
+- **A failure before submit is a refusal, not a lost run.** Nothing has run
+  until the place is asked to, so such a run now ends `refused` (125)
+  instead of `lost` (255). The `submitted` receipt is written just before the
+  request is sent, so a caller killed earlier leaves no receipt claiming a
+  run.
+
 ## v0.1.0 - 2026-10-15
 
 The first public release. Ferry runs a repository's recipe at an exact

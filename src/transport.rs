@@ -15,7 +15,7 @@ use std::{
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -53,14 +53,12 @@ fn ssh_options(destination: &str) -> Result<Vec<String>> {
     let Some(socket) = control_socket(destination)? else {
         // Multiplexing only saves handshakes: without a usable socket path
         // (a long HOME), every command opens its own connection.
-        return Ok(vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ControlMaster=no".into(),
-            "-o".into(),
-            "ControlPath=none".into(),
-        ]);
+        let mut options: Vec<String> = ["BatchMode=yes", "ControlMaster=no", "ControlPath=none"]
+            .iter()
+            .flat_map(|o| ["-o".into(), (*o).to_owned()])
+            .collect();
+        options.extend(bounded());
+        return Ok(options);
     };
     let directory = control_directory()?;
     let parent = directory.parent().ok_or("invalid SSH control directory")?;
@@ -73,7 +71,7 @@ fn ssh_options(destination: &str) -> Result<Vec<String>> {
     });
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    Ok(vec![
+    let mut options = vec![
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
@@ -83,7 +81,66 @@ fn ssh_options(destination: &str) -> Result<Vec<String>> {
         "ControlPersist=10".into(),
         "-o".into(),
         format!("ControlPath={socket}"),
-    ])
+    ];
+    options.extend(bounded());
+    Ok(options)
+}
+
+/// Every SSH connection the caller makes is bounded: its connect and banner
+/// wait, and a dead link once it is up (three missed 5 s keepalives).
+fn bounded() -> Vec<String> {
+    [
+        "ConnectTimeout=10",
+        "ServerAliveInterval=5",
+        "ServerAliveCountMax=3",
+    ]
+    .iter()
+    .flat_map(|o| ["-o".into(), (*o).to_owned()])
+    .collect()
+}
+
+/// A short reply from a place before submit, within `SSH_REPLY` wall-clock
+/// time (debug builds read `FERRY_SSH_REPLY_MS`): `ConnectTimeout` and
+/// keepalives do not reach a jump host's own connection or a stalled key
+/// exchange, so the caller stops its own ssh at the bound and refuses.
+fn replied(command: &mut Command) -> Result<Vec<u8>> {
+    let bound = execution::debug_bound("FERRY_SSH_REPLY_MS")
+        .map_or(crate::limits::SSH_REPLY, Duration::from_millis);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().ok_or("no stdout")?));
+    let err = drain(Box::new(child.stderr.take().ok_or("no stderr")?));
+    let until = Instant::now() + bound;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= until {
+            // Our own child, by its handle: never a pattern.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("the place did not reply within {bound:?}").into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let (out, err) = (
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    );
+    if !status.success() {
+        return Err(format!("command failed: {}", String::from_utf8_lossy(&err).trim()).into());
+    }
+    Ok(out)
 }
 
 /// Removes the empty control directories of callers that are gone (a killed
@@ -235,7 +292,6 @@ impl Place<'_> {
                 let mut command = Command::new("ssh");
                 command
                     .args(ssh_options(&machine.ssh)?)
-                    .args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
                     .arg(&machine.ssh)
                     .arg(format!(
                         "{} place {}",
@@ -254,7 +310,7 @@ impl Place<'_> {
     fn info(&self) -> Result<HostInfo> {
         match self {
             Place::Local(_) => host_info(),
-            Place::Remote(machine) => Ok(serde_json::from_slice(&repository::output(
+            Place::Remote(machine) => Ok(serde_json::from_slice(&replied(
                 ssh(&machine.ssh)?.arg(format!("{} host-info", machine.binary)),
             )?)?),
         }
@@ -265,7 +321,7 @@ impl Place<'_> {
         config::identifier(id)?;
         match self {
             Place::Local(state) => Ok(fs::read(crate::record::run_dir(state, id).join(name))?),
-            Place::Remote(machine) => repository::output(ssh(&machine.ssh)?.arg(format!(
+            Place::Remote(machine) => replied(ssh(&machine.ssh)?.arg(format!(
                 "cat {}/runs/{id}/{name}",
                 crate::place::REMOTE_ROOT
             ))),
@@ -457,6 +513,9 @@ pub fn run_on(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
+    // From here the place may start the run: a failure is lost, not refused.
+    record.outcome = Outcome::Lost;
+    record.exit_code = 255;
     submit
         .stdin
         .take()

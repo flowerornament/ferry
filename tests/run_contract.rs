@@ -729,7 +729,7 @@ fn internal_push_skips_hooks_and_remote_execution_receives_declared_environment(
     fs::create_dir_all(host.join(".local/bin")).unwrap();
     fs::create_dir_all(&tools).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_ferry"), host.join(".local/bin/ferry")).unwrap();
-    fs::write(tools.join("ssh"), "#!/bin/sh\ncase \"$*\" in *BatchMode=yes*ControlMaster=auto*ControlPersist=10*ControlPath=*/.cache/ferry/ssh/*|*BatchMode=yes*ControlMaster=no*ControlPath=none*) ;; *) exit 125;; esac\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nunset APP_ALLOWED\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\ncase \"$*\" in *BatchMode=yes*ControlMaster=auto*ControlPersist=10*ControlPath=*/.cache/ferry/ssh/*ConnectTimeout=10*ServerAliveInterval=5*ServerAliveCountMax=3*|*BatchMode=yes*ControlMaster=no*ControlPath=none*ConnectTimeout=10*ServerAliveInterval=5*ServerAliveCountMax=3*) ;; *) exit 125;; esac\nfor last do :; done\ncd \"$FERRY_TEST_HOST\" || exit 125\nunset APP_ALLOWED\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let hook_marker = dir.path().join("pre-push-ran");
     let hook = dir.path().join(".git/hooks/pre-push");
@@ -1208,8 +1208,10 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     fs::rename(&staged, host.join(".local/bin/ferry")).unwrap();
     // FERRY_TEST_SLOW_PUSH names a marker: a git push touches it, then stalls.
     // A file `unreachable` on the host fails every follow, as a dead link;
-    // a file `fail-record-once` fails the next `place record`, once.
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    // a file `fail-record-once` fails the next `place record`, once;
+    // FERRY_TEST_HANG_INFO names a file: host-info writes its pid there and
+    // hangs, as a stalled SSH connect or jump host.
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
@@ -1240,6 +1242,89 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
         .env("FERRY_TEST_HOST", &host)
         .args(args);
     command
+}
+
+/// Every wait is bounded (PRINCIPLES 5, ferry-c72): a place whose SSH
+/// stalls before submit (here host-info never answers) is refused within
+/// the reply bound, final 125 with nothing run, and no receipt claims a run.
+#[test]
+fn a_stalled_place_before_submit_is_refused_within_its_bound() {
+    use std::time::{Duration, Instant};
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let pidfile = dir.path().join("hung-ssh.pid");
+    let started = Instant::now();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_HANG_INFO", &pidfile)
+    .env("FERRY_SSH_REPLY_MS", "2000")
+    .output()
+    .unwrap();
+    let took = started.elapsed();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert_eq!(record["state"], "final", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not reply within"),
+        "{record}"
+    );
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    // The caller stopped its own ssh at the bound.
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        kill(Pid::from_raw(pid), None).is_err(),
+        "the stalled ssh outlived the caller"
+    );
+}
+
+/// A caller killed while the place has not been asked to run anything
+/// leaves no receipt saying `submitted`: nothing ran, so `ferry record`
+/// has nothing to wait for.
+#[test]
+fn a_caller_killed_before_submit_leaves_no_submitted_receipt() {
+    use std::{thread, time::Duration};
+    let dir = fixture();
+    let pidfile = dir.path().join("hung-ssh.pid");
+    let mut caller = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_HANG_INFO", &pidfile)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+    let deadline = common::startup_deadline();
+    while !pidfile.exists() {
+        assert!(std::time::Instant::now() < deadline, "host-info never ran");
+        thread::sleep(Duration::from_millis(20));
+    }
+    caller.kill().unwrap();
+    caller.wait().unwrap();
+    // The hung ssh is ours: stop it by its exact pid.
+    if let Ok(pid) = fs::read_to_string(&pidfile).unwrap().trim().parse::<i32>() {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let receipts = dir.path().join(".ferry/receipts");
+    for entry in fs::read_dir(&receipts).into_iter().flatten().flatten() {
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap();
+        assert_ne!(record["state"], "submitted", "{record}");
+    }
 }
 
 #[test]

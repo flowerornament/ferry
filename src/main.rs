@@ -231,19 +231,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         waits_end_ms: None,
     };
     record.token = Some(request.token.clone());
-    if matches!(route, config::Route::Remote(_)) {
-        record.outcome = receipt::Outcome::Lost;
-        record.exit_code = 255;
-    }
     execution::interrupted()?;
-    // Every caller fact, stored before the host is asked to run anything:
-    // lost until the final receipt replaces it.
-    let mut submitted = record.clone();
-    submitted.state = Some("submitted".into());
-    submitted.outcome = receipt::Outcome::Lost;
-    submitted.exit_code = 255;
-    submitted.reason = Some("submitted; no verdict yet".into());
-    receipt::submit(root, &submitted)?;
     let place = match route {
         config::Route::Local => transport::Place::Local(root.join(".ferry/local/v1")),
         config::Route::Remote(name) => transport::Place::Remote(&hosts.host[name]),
@@ -252,7 +240,18 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         .into_iter()
         .map(|(object, repo, _)| (repo, object.commit))
         .collect();
+    // Until the place is asked to run it, nothing ran: any failure here is
+    // a refusal (125), and a killed caller leaves no receipt claiming a run.
     transport::ship(root, &place, &request, &objects, record)?;
+    execution::interrupted()?;
+    // Every caller fact, stored just before the place is asked to run the
+    // request: lost until the final receipt replaces it.
+    let mut submitted = record.clone();
+    submitted.state = Some("submitted".into());
+    submitted.outcome = receipt::Outcome::Lost;
+    submitted.exit_code = 255;
+    submitted.reason = Some("submitted; no verdict yet".into());
+    receipt::submit(root, &submitted)?;
     transport::run_on(root, &place, &request, record, options.json)
 }
 

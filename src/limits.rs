@@ -41,5 +41,10 @@ pub const TEARDOWN: Duration = Duration::from_secs(
         + 10,
 );
 
+/// How long a caller waits for a short reply from a place before it submits
+/// (`host-info`, a file read): a stalled SSH connect or jump host is refused
+/// instead of holding the caller (PRINCIPLES 5).
+pub const SSH_REPLY: Duration = Duration::from_secs(60);
+
 /// How long a caller keeps trying a place that does not answer.
 pub const UNREACHABLE: Duration = Duration::from_mins(5);
