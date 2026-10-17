@@ -4,6 +4,13 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **Fewer `unknown` survivors on busy Linux hosts.** The marker pass reads a
+  process it could not read again every 100 ms for up to 1 s, instead of
+  once: a large build process still tearing down its memory as it exits no
+  longer makes the run's survivors `unknown`. One still unreadable after the
+  second counts, as before (3.4% of runs on one shared host read `unknown`
+  before this change).
+
 - **A stalled SSH connection no longer holds the caller.** Every SSH
   connection the caller makes has a connect timeout and keepalives, and the
   replies it needs before submitting a run (`host-info`, file reads) have a

@@ -215,20 +215,50 @@ pub fn census(all: bool) -> Result<Census, String> {
             Seen::Unreadable(_) => again.push(pid),
         }
     }
-    // A child forked by a non-dumpable process (a login's sshd-session) is
-    // unreadable until it execs or exits: read the unreadable ones once
-    // more, after one short pause for the whole pass.
-    if !again.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    for pid in again {
-        match seen(pid, uid, since) {
-            Seen::Other => {}
-            Seen::Marked(ids, survivor) => census.marked.push((ids, survivor)),
-            Seen::Unreadable(why) => census.unreadable.entry(why).or_default().push(pid),
-        }
-    }
+    reread(
+        again,
+        &mut census,
+        |pid| seen(pid, uid, since),
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        },
+    );
     Ok(census)
+}
+
+/// How often, and how many times, an unreadable process is read again.
+const REREADS: usize = 10;
+
+/// Reads the unreadable `pids` again, every `pause` (100 ms) for up to
+/// `REREADS` rounds (1 s, inside `MARKER_BOUND`). A process mid-exit (a big
+/// build process unmapping its memory) or a child forked by a non-dumpable
+/// one (a login's sshd-session) is unreadable for a moment; it is skipped
+/// only once a read sees it gone, a zombie or readable. One still
+/// unreadable after the last round counts, so the pass is unknown.
+fn reread(
+    mut pids: Vec<i32>,
+    census: &mut Census,
+    mut look: impl FnMut(i32) -> Seen,
+    mut pause: impl FnMut(),
+) {
+    for round in 1..=REREADS {
+        if pids.is_empty() {
+            return;
+        }
+        pause();
+        let mut still = vec![];
+        for pid in pids {
+            match look(pid) {
+                Seen::Other => {}
+                Seen::Marked(ids, survivor) => census.marked.push((ids, survivor)),
+                Seen::Unreadable(why) if round == REREADS => {
+                    census.unreadable.entry(why).or_default().push(pid);
+                }
+                Seen::Unreadable(_) => still.push(pid),
+            }
+        }
+        pids = still;
+    }
 }
 
 enum Seen {
@@ -516,6 +546,48 @@ mod tests {
             !foreign(9, 7, 501, |_| Ok(40), child),
             "the process itself reused"
         );
+    }
+
+    /// A process unreadable for a moment (mid-exit) is skipped once it is
+    /// seen gone; one unreadable through every round still counts.
+    #[test]
+    fn the_unreadable_are_reread_until_gone_or_the_last_round() {
+        use super::{Census, REREADS, Seen, reread};
+        let fresh = || Census {
+            marked: vec![],
+            unreadable: std::collections::BTreeMap::new(),
+        };
+        let mut census = fresh();
+        let mut looks = 0;
+        let mut pauses = 0;
+        reread(
+            vec![7],
+            &mut census,
+            |_| {
+                looks += 1;
+                if looks < 4 {
+                    Seen::Unreadable("environ: Permission denied".into())
+                } else {
+                    Seen::Other
+                }
+            },
+            || pauses += 1,
+        );
+        assert!(census.unreadable.is_empty(), "skipped once gone");
+        assert_eq!(pauses, 4, "stops polling once nothing is pending");
+        let mut census = fresh();
+        let mut pauses = 0;
+        reread(
+            vec![8],
+            &mut census,
+            |_| Seen::Unreadable("environ: Permission denied".into()),
+            || pauses += 1,
+        );
+        assert_eq!(census.unreadable.values().flatten().count(), 1);
+        assert_eq!(pauses, REREADS, "a second in all, not more");
+        let mut census = fresh();
+        reread(vec![], &mut census, |_| unreachable!(), || unreachable!());
+        assert!(census.unreadable.is_empty());
     }
 
     #[test]
