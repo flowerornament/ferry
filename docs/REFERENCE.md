@@ -299,12 +299,15 @@ or prepares its seat) runs none of them, collect included: nothing ran.
   one run never rides on a connection another run's caller owns.
   - If that path would be too long for a Unix socket (a very long HOME), each
     SSH command opens its own connection instead.
-- **Every SSH wait is bounded.** Each connection gets `ConnectTimeout=10`,
-  `ServerAliveInterval=5` and `ServerAliveCountMax=3`. Those do not reach a
-  jump host's own connection, so the short replies a caller needs before it
-  submits (`host-info`, a file read) also have a 60 s wall-clock bound: past
-  it the caller stops its own `ssh` and the run is refused (125), with
-  nothing run.
+- **SSH waits.** Each connection gets `ConnectTimeout=10`,
+  `ServerAliveInterval=5` and `ServerAliveCountMax=3`, which end a connect
+  that never completes and a link that dies. They do not reach a jump host's
+  own connection, so the short replies a caller needs before it submits
+  (`host-info`, a file read) also have a 60 s wall-clock bound, covering the
+  reply's end too: past it the caller stops its own `ssh` and the run is
+  refused (125), with nothing run. The object push and the store setup have
+  no wall-clock bound yet (a large push can legitimately take long): a push
+  that stalls on a live link waits.
 - **Submitted means asked.** The receipt is first written, as `submitted`,
   just before the place is asked to run the request. Anything that fails
   before that is a refusal (125), and a caller killed before it leaves no

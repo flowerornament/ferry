@@ -1210,8 +1210,10 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     // A file `unreachable` on the host fails every follow, as a dead link;
     // a file `fail-record-once` fails the next `place record`, once;
     // FERRY_TEST_HANG_INFO names a file: host-info writes its pid there and
-    // hangs, as a stalled SSH connect or jump host.
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    // hangs, as a stalled SSH connect or jump host; FERRY_TEST_HOLD_PIPE
+    // names a file: host-info leaves a descendant holding its pipes (its
+    // pid written there) and exits at once.
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi; if [ -n \"$FERRY_TEST_HOLD_PIPE\" ]; then sleep 600 & echo $! > \"$FERRY_TEST_HOLD_PIPE\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
@@ -1288,6 +1290,48 @@ fn a_stalled_place_before_submit_is_refused_within_its_bound() {
         kill(Pid::from_raw(pid), None).is_err(),
         "the stalled ssh outlived the caller"
     );
+}
+
+/// The reply bound covers the pipes too: an ssh that exits while a
+/// descendant still holds its stdout and stderr (a `ProxyCommand`, a helper)
+/// is refused within the bound, never waited on to the descendant's end.
+#[test]
+fn an_ssh_whose_pipes_outlive_it_is_refused_within_its_bound() {
+    use std::time::{Duration, Instant};
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let pidfile = dir.path().join("pipe-holder.pid");
+    let started = Instant::now();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_HOLD_PIPE", &pidfile)
+    .env("FERRY_SSH_REPLY_MS", "2000")
+    .output();
+    let took = started.elapsed();
+    // The descendant is this test's own: stop it by its exact pid.
+    if let Some(pid) = fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+    {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    let out = out.unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert_eq!(record["state"], "final", "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not reply within"),
+        "{record}"
+    );
+    assert!(took < Duration::from_secs(30), "{took:?}");
 }
 
 /// A caller killed while the place has not been asked to run anything

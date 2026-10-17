@@ -111,16 +111,22 @@ fn replied(command: &mut Command) -> Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // The bound covers the child's exit and both pipes' end of file: a
+    // descendant of ssh (a ProxyCommand, a helper it spawned) can hold a pipe
+    // open after ssh itself has exited.
     let drain = |mut pipe: Box<dyn Read + Send>| {
+        let (sent, received) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let mut bytes = Vec::new();
             let _ = pipe.read_to_end(&mut bytes);
-            bytes
-        })
+            let _ = sent.send(bytes);
+        });
+        received
     };
     let out = drain(Box::new(child.stdout.take().ok_or("no stdout")?));
     let err = drain(Box::new(child.stderr.take().ok_or("no stderr")?));
     let until = Instant::now() + bound;
+    let late = || format!("the place did not reply within {bound:?}");
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -129,14 +135,16 @@ fn replied(command: &mut Command) -> Result<Vec<u8>> {
             // Our own child, by its handle: never a pattern.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("the place did not reply within {bound:?}").into());
+            return Err(late().into());
         }
         thread::sleep(Duration::from_millis(50));
     };
-    let (out, err) = (
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
-    );
+    let collect = |pipe: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        pipe.recv_timeout(until.saturating_duration_since(Instant::now()))
+    };
+    let (Ok(out), Ok(err)) = (collect(&out), collect(&err)) else {
+        return Err(late().into());
+    };
     if !status.success() {
         return Err(format!("command failed: {}", String::from_utf8_lossy(&err).trim()).into());
     }
