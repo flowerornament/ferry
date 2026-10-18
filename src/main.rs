@@ -87,6 +87,9 @@ enum Action {
     ExecuteSession {
         spec: PathBuf,
         result: PathBuf,
+        /// When the session must have ended (unix ms), whatever happens to
+        /// its supervisor.
+        deadline_ms: u128,
     },
 }
 #[derive(Subcommand)]
@@ -466,8 +469,12 @@ fn execute(cli: Cli) -> Result<i32> {
             println!("{}", serde_json::to_string(&transport::host_info()?)?);
             Ok(0)
         }
-        Action::ExecuteSession { spec, result } => {
-            let owned = crate::run::execute_session(&spec, &result);
+        Action::ExecuteSession {
+            spec,
+            result,
+            deadline_ms,
+        } => {
+            let owned = crate::run::execute_session(&spec, &result, deadline_ms);
             if let Err(error) = &owned {
                 crate::run::left_error(&result, error.as_ref());
             }

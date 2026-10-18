@@ -12,6 +12,11 @@ pub const STOP_GRACE: Duration = Duration::from_secs(10);
 /// left are recorded as survivors.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// How long after a run's timeout or deadline its session owner stops the
+/// session itself (ferry-8d6): late enough that a live supervisor's stop
+/// comes first, so each member gets one TERM.
+pub const OWNER_LAG: Duration = Duration::from_secs(1);
+
 /// How long a session's output writer gets after the session stop.
 pub const DRAIN: Duration = Duration::from_secs(2);
 

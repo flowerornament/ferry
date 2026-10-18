@@ -25,6 +25,7 @@ transport::run_on ── submit{request} ──────────►  plac
   │                                                    reset checkout, present [[ship]]   ── seats/<key>/checkout
   │                                                  run::run_released (deadline absolute, §5)
   │                                                    session owner: prepare → env → recipe → (result.json | result.error)
+  │                                                      own watch: stops its session at timeout/deadline (no result)
   │                                                    copy output ── runs/<id>/output.log (capped)
   │                                                    end/timeout/stop → custody: stop session (§7)
   │                                                    collect hook, own session, stopped ── runs/<id>/collect.*

@@ -418,6 +418,14 @@ with the supervisor: an exclusive run whose supervisor is killed no longer
 keeps other seats out (SPEC §11). Release closes descriptors, never
 `LOCK_UN`.
 
+**A killed supervisor's run still ends on time.** The session owner keeps
+its own watch: 1 s after the run's timeout or deadline, whichever is first,
+it stops its session as the supervisor would (TERM, 10 s, KILL), sparing
+only itself, and writes no result. With a live supervisor, the
+supervisor's stop comes first. The record reconciles to `lost`. No marker
+pass runs without the supervisor, so `ferry status` lists what the stop
+leaves.
+
 ### Detached runs, output and the verdict
 
 A run belongs to its place, not to the connection that asked for it:

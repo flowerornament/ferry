@@ -522,6 +522,7 @@ fn spawn_session(
     result_path: &Path,
     lock: &fs::File,
     output: std::io::PipeWriter,
+    deadline_ms: u128,
 ) -> Result<(std::io::Result<std::process::Child>, Result<()>)> {
     crate::lock::close_on_exec(lock, false)?;
     // One pipe for both streams keeps the order they were written in.
@@ -529,6 +530,7 @@ fn spawn_session(
         .arg("execute-session")
         .arg(spec)
         .arg(result_path)
+        .arg(deadline_ms.to_string())
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
@@ -584,7 +586,8 @@ fn run_session(
         spec.with_extension("result.json")
     };
     let (reader, writer) = std::io::pipe()?;
-    let (spawned, restored) = spawn_session(workdir, spec, &result_path, lock, writer)?;
+    let (spawned, restored) =
+        spawn_session(workdir, spec, &result_path, lock, writer, deadline_ms)?;
     let child = spawned?;
     let mut owner = SessionOwner {
         child,
@@ -717,11 +720,132 @@ fn owner_error(result: &Path) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
+/// The session owner (SPEC §5): runs the hooks and the recipe in a session
+/// of its own, writes the recipe's result, and stays until its supervisor
+/// is gone. Its own watch stops the session at `deadline_ms` or the
+/// timeout, so a killed supervisor leaves no recipe unbounded.
+pub fn execute_session(spec: &Path, result: &Path, deadline_ms: u128) -> Result<()> {
     let supervisor = nix::unistd::getppid();
     setsid()?;
     let request: Request = serde_json::from_slice(&fs::read(spec)?)?;
     validate(&request)?;
+    let timeout = request
+        .timeout_seconds
+        .map(|t| Instant::now() + Duration::from_secs(t));
+    let watching = thread::spawn(move || watch(deadline_ms, timeout));
+    let ran = dispatch(spec, result, &request);
+    // The first of the two wins: the recipe's end or the watch's.
+    let expired = WATCH
+        .compare_exchange(RUNNING, DISPATCHED, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err();
+    DONE.store(true, Ordering::SeqCst);
+    // Whatever ended the recipe after the end, the end came first: the
+    // supervisor records the timeout, or the run reconciles to lost. A
+    // result here would turn the stop's signal into the recipe's exit. The
+    // stop is seen through, while this leader still pins the session id.
+    if expired {
+        let _ = watching.join();
+    } else {
+        let code = ran?;
+        let tmp = result.with_extension("tmp");
+        fs::write(&tmp, serde_json::to_vec(&code)?)?;
+        fs::rename(tmp, result)?;
+    }
+    // Retain the leader for supervised cleanup, but not forever after supervisor death.
+    // Direct parent identity cannot recycle without the kernel reparenting this process.
+    while nix::unistd::getppid() == supervisor {
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// The owner's two ends, decided once: the hooks and recipe returned
+/// (`DISPATCHED`) or the watch fired (`EXPIRED`), whichever came first.
+static WATCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(RUNNING);
+const RUNNING: u8 = 0;
+const DISPATCHED: u8 = 1;
+const EXPIRED: u8 = 2;
+/// Set once the hooks and recipe returned, whoever won.
+static DONE: AtomicBool = AtomicBool::new(false);
+
+/// The owner's own bound (PRINCIPLES 2, SPEC §11): `OWNER_LAG` after the
+/// run's deadline (unix ms) or its timeout (from the owner's start,
+/// monotonic), it stops its session as the supervisor would, TERM, up to
+/// `STOP_GRACE`, then KILL, sparing only itself, which pins the session id.
+/// The lag leaves a live supervisor's own stop first, which also ends this
+/// owner; without a supervisor the watch is the run's only bound. It goes
+/// on killing whatever is spawned until the hooks and recipe return, then
+/// up to `KILL_GRACE` more, so no stage starts unbounded after it; a failed
+/// listing is retried, never read as an empty session. What it leaves has
+/// no record to go to: `ferry status` lists survivors.
+fn watch(deadline_ms: u128, timeout: Option<Instant>) {
+    let lag = crate::limits::OWNER_LAG;
+    let deadline = deadline_ms.saturating_add(lag.as_millis());
+    let timeout = timeout.map(|t| t + lag);
+    while receipt::now_ms() < deadline && timeout.is_none_or(|t| Instant::now() < t) {
+        if DONE.load(Ordering::SeqCst) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if WATCH
+        .compare_exchange(RUNNING, EXPIRED, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let me = std::process::id();
+    let others = || {
+        session_list(me).map(|members| {
+            members
+                .into_iter()
+                .filter(|pid| u32::try_from(*pid).ok() != Some(me))
+                .collect::<Vec<_>>()
+        })
+    };
+    let send = |signal, members: &[i32]| {
+        for pid in members {
+            let _ = kill(Pid::from_raw(*pid), signal);
+        }
+    };
+    if let Ok(members) = others() {
+        send(Signal::SIGTERM, &members);
+    }
+    // A listing that fails cannot confirm the others left: the grace runs.
+    let until = Instant::now() + STOP_GRACE;
+    while Instant::now() < until && others().is_ok_and(|left| !left.is_empty()) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut returned: Option<Instant> = None;
+    loop {
+        let left = others();
+        if let Ok(members) = &left {
+            send(Signal::SIGKILL, members);
+        }
+        let empty = left.is_ok_and(|left| left.is_empty());
+        if DONE.load(Ordering::SeqCst) {
+            let since = *returned.get_or_insert_with(Instant::now);
+            if empty || since.elapsed() >= KILL_GRACE {
+                return;
+            }
+        }
+        // A stage that never returns (a pipe held from outside the
+        // session) is polled slowly once its session is empty.
+        thread::sleep(Duration::from_millis(if empty { 1000 } else { 20 }));
+    }
+}
+
+/// No stage starts once the watch has fired; one that starts just before
+/// is killed by the watch, which runs until the stages return.
+fn unexpired() -> Result<()> {
+    if WATCH.load(Ordering::SeqCst) == EXPIRED {
+        return Err("the session's end passed".into());
+    }
+    Ok(())
+}
+
+/// The hooks, then the recipe: its exit code.
+fn dispatch(spec: &Path, result: &Path, request: &Request) -> Result<i32> {
     let root = spec
         .parent()
         .and_then(Path::parent)
@@ -752,12 +876,14 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         );
     }
     if let Some(prepare) = &request.hooks.prepare {
+        unexpired()?;
         let status = Command::new(workdir.join(prepare)).envs(&env).status()?;
         if !status.success() {
             return Err(format!("prepare hook failed: {status}").into());
         }
     }
     if let Some(hook) = &request.hooks.env {
+        unexpired()?;
         let bytes = repository::output(Command::new(workdir.join(hook)).envs(&env))?;
         let additions: BTreeMap<String, String> = serde_json::from_slice(&bytes)?;
         if additions
@@ -772,23 +898,15 @@ pub fn execute_session(spec: &Path, result: &Path) -> Result<()> {
         result.with_extension("attempted"),
         b"recipe dispatch begins",
     )?;
+    unexpired()?;
     let status = Command::new(&request.recipe.command[0])
         .args(&request.recipe.command[1..])
         .args(&request.args)
         .envs(&env)
         .status()?;
-    let code = status
+    Ok(status
         .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
-    let tmp = result.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec(&code)?)?;
-    fs::rename(tmp, result)?;
-    // Retain the leader for supervised cleanup, but not forever after supervisor death.
-    // Direct parent identity cannot recycle without the kernel reparenting this process.
-    while nix::unistd::getppid() == supervisor {
-        thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
 }
 
 #[cfg(test)]

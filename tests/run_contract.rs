@@ -587,6 +587,88 @@ fn caller_environment_is_declared_forwarded_and_recorded() {
     );
 }
 
+/// ferry-8d6 (PRINCIPLES 2): with its supervisor killed (`SIGKILL`), the session
+/// owner itself stops the session at the run's end: the recipe and the
+/// process it started are gone soon after the timeout, not when they exit.
+#[test]
+fn a_killed_supervisor_s_session_is_stopped_at_its_timeout() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture();
+    let marker = dir.path().join("recipe-started");
+    let member = dir.path().join("member");
+    fs::write(
+        dir.path().join("ferry.toml"),
+        format!(
+            "version=1\n[recipe.pass]\ncommand=['sh','-c','sleep 600 & echo $! > {}; echo $$ > {}.tmp; mv {}.tmp {}; wait']\n",
+            member.display(), marker.display(), marker.display(), marker.display()
+        ),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "unbounded recipe"]);
+    let caller_output = dir.path().join("caller-stdout");
+    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .args(["run", "pass", "--local", "--json", "--timeout-seconds", "4"])
+        .stdout(fs::File::create(&caller_output).unwrap())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut caller = OwnedCaller {
+        child: Some(child),
+        member: marker.clone(),
+    };
+    let deadline = common::startup_deadline();
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "recipe did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let started = Instant::now();
+    let recipe: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    let sleeper: i32 = fs::read_to_string(&member).unwrap().trim().parse().unwrap();
+    let group = OwnedGroup(getsid(Some(Pid::from_raw(recipe))).unwrap().as_raw());
+    let submitted = fs::read_to_string(&caller_output)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["event"] == "submitted")
+        .expect("the caller prints its submitted event");
+    let supervisor = submitted["pid"].as_i64().unwrap();
+    let id = submitted["id"].as_str().unwrap().to_owned();
+    // The session's id is its owner's pid.
+    let owner = group.0;
+    kill(
+        Pid::from_raw(i32::try_from(supervisor).unwrap()),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    caller.child.as_mut().unwrap().wait().unwrap();
+    // Each is reaped at once: `sh` by the owner, `sleep` once orphaned.
+    let alive = |pid: i32| kill(Pid::from_raw(pid), None).is_ok();
+    assert!(
+        alive(recipe) && alive(sleeper),
+        "the session ended before its timeout"
+    );
+    // The timeout and the owner's lag, then TERM: `sh` and `sleep` leave
+    // at once, and the owner, its supervisor gone, after them.
+    while alive(recipe) || alive(sleeper) || alive(owner) {
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "the session outlived its timeout without its supervisor"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let out = run(dir.path(), &["record", &id]);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["outcome"], "lost", "{record}");
+    drop(group);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
