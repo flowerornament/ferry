@@ -366,8 +366,8 @@ working tree.
 |---|---|---|
 | exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (listed as a survivor when it carries the marker); a commit ever shipped on the place is fetchable by hash through a served `[[ship]]` URL even if this run did not declare it (refs are isolated, objects are not) |
 | one run per seat | inherited seat flock | work that unlocks its own descriptor |
-| exclusive host (among Ferry runs; not a quiet host) | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record); a killed supervisor: its session runs on without `host` until the recipe exits (nothing enforces the deadline without the supervisor), and the record reconciles to `lost` |
-| every run ends | an absolute deadline | a killed supervisor: the record is reconciled as `lost`, and its recipe runs until it exits |
+| exclusive host (among Ferry runs; not a quiet host) | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record); a killed supervisor: its session runs on without `host` until its session owner stops it at the run's timeout or deadline, and the record reconciles to `lost` |
+| every run ends | an absolute deadline | a killed supervisor: the record is reconciled as `lost`; the session owner stops its session at the timeout or deadline (TERM, grace, KILL), sparing only itself; what that stop leaves is listed by `ferry status` (no marker pass runs without the supervisor) |
 | run sessions stopped; marked survivors reported | session stop; the marker pass | a marked survivor is reported and left running (the project's or operator's to stop); a leaver that dropped the marker is not listed; an incomplete pass is `"unknown"` |
 | complete output | one capped writer to a file | beyond the cap: `capped` |
 | one honest record | reserve, final once, reconcile | — |
