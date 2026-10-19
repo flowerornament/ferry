@@ -425,27 +425,28 @@ Nothing else is written; Ferry writes nowhere outside these.
 
 - A run's history is its run folder (`runs/<id>/`) and its record
   (`records/<id>.json`), with any reservation (`records/<id>.reserved.json`)
-  a crashed finalize left beside that final record: it is not live, and
-  left alone it would be reconciled into a second, `lost` record once the
-  final one is gone. With `delete_run_history_after_days = <n>` in
-  `host.toml` (a whole number of days, at least 1; anything else refuses
-  the run as a bad `host.toml`), each run, after its record is final and
-  its own locks are released (in teardown, after a `--once` retire),
-  deletes the history of final runs submitted more than `<n>` days ago (by
-  the host record's own `submitted_ms`, on the host's clock). It lists
-  names only and works oldest first by the time a name carries (a run id
-  starts with its submit time, an account with its `ms`); it reads no run
-  or account whose name is less than `<n> - 1` days old, and names that
-  carry no time (retirement records, temporary files) come after the
-  rest. The name only orders and bounds the work; whether an entry is old
-  is decided by what it records. So entries kept for being young are
-  never read, and the work a pass repeats is what it must keep although
-  its name is old: live leftovers, live reservations, and runs from a
-  caller whose clock ran more than a day behind the host's. Those, and
-  listing the names, can still spend a pass's budget: that is a bound on
-  each pass, not a promise that every pass deletes something. It never
-  delays its own recipe or its caller, and never counts against a run's
-  timeout.
+  a crashed finalize left beside that final record: it is not live, and left
+  alone it would be reconciled into a second, `lost` record once the final
+  one is gone. With `delete_run_history_after_days = <n>` in `host.toml` (a
+  whole number of days, at least 1; anything else refuses the run as a bad
+  `host.toml`), each run, after its record is final and its own locks are
+  released (in teardown, after a `--once` retire), deletes the history of
+  final runs submitted more than `<n>` days ago (by the host record's own
+  `submitted_ms`, on the host's clock). It lists names only and works oldest
+  first by the time a name carries (a run id starts with its submit time, on
+  the caller's clock, and an account with its `ms`); it reads no run or
+  account whose name is less than `<n>` days less one hour old. Names that
+  carry no time come after the rest: temporary files first (judged by their
+  modification time, never read), then retirement records. The name only
+  orders and bounds the work; whether an entry is old is decided by what it
+  records. The hour allows for the caller's clock: a pass rereads the runs
+  named within that hour of the cutoff, and what it must keep although its
+  name is old (live leftovers, live reservations, runs from a caller whose
+  clock ran more than an hour behind the host's). Those, and listing the
+  names, can still spend a pass's budget: that is a bound on each pass, not
+  a promise that every pass deletes something. A run from a caller whose
+  clock ran ahead of the host's is deleted that much later. It never delays
+  its own recipe or its caller, and never counts against a run's timeout.
 - **Never under a timing run:** the pass first passes the host's gate and
   takes a fresh shared `host` lease the way a shared run does, by try,
   never waiting at either, held by the supervisor alone. If an exclusive
@@ -472,14 +473,15 @@ Nothing else is written; Ferry writes nowhere outside these.
   It never touches a live reservation, a seat, `store/`, or a caller's
   receipts and fetched artifacts.
 - **Budget:** the pass lists, reads and deletes entry by entry and checks
-  one second between entries, then releases its lease. That bounds how
-  much work it starts, not the filesystem: one listing or unlink in
-  progress may take longer. What is
-  left waits for the next run. A run's folder is deleted before its
-  record, so a run deleted only in part keeps its record and stays
-  eligible next time. A reader that already has a file open (a `follow`
-  in progress) finishes reading it; a new reader of a deleted run gets
-  not-found.
+  one second between entries, then releases its lease. That bounds how much
+  work it starts, not the filesystem: one listing or unlink in progress may
+  take longer. What is left waits for the next run. A run's folder is
+  deleted first, then a reservation left beside its record, then its record,
+  each only after the one before it succeeded: a run deleted only in part
+  keeps its record and stays eligible next time, and no reservation outlives
+  its final record to be reconciled as `lost`. A reader that already has a
+  file open (a `follow` in progress) finishes reading it; a new reader of a
+  deleted run gets not-found.
 - **The account:** the run's record is already final, so a pass that
   deleted anything creates `records/history-<ms>-<run>.json` (`{ms, run,
   deleted, older_than_days}`), never replacing one; it ages by its `ms`
@@ -733,11 +735,14 @@ receipt is seeing this rule, not a bug.
     deleted and a newer one is kept. With the deletion injected to fail
     after the folder, the run's record is unchanged, the record that
     failed stays, the count leaves that run out, and the next pass deletes
-    it. Progress: with a one-pass budget too small to read them all, a
-    host holding more young runs and young or timeless retirement records
-    than one pass can read, plus a crashed write's temporary file, still
-    has its two-day-old final run deleted by the first pass; the temporary
-    file is deleted by its age and never read as a record.
+    it. Progress: a host holding more runs named under 23 hours old and
+    more retirement records (young, or without `retired_ms`) than one pass
+    can read, plus a crashed write's temporary file, still has its
+    two-day-old final run deleted by the first pass; the temporary file is
+    deleted by its age and never read as a record. A final record with a
+    stale reservation beside it, deleted with the injection failing
+    between the reservation and the record, keeps its final record and is
+    never reconciled as `lost`.
 23. **Prune without remembering:** with
     `delete_unused_checkouts_after_days = 1` on the caller, a run on a
     place holding this caller's seat unused for two days and one used an
