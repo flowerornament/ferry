@@ -186,19 +186,23 @@ leaves none, and the reason says so).
   caller refuses a place without `detach`/`ship` (125, naming its revision)
   before pushing anything; an old caller meets a place that still answers
   its host-info and is refused at parse (125, naming the place's revision).
-- **Every caller wait before submit is bounded**, so a stalled link ends
-  in a refusal (125, nothing run, no record) rather than a hung caller:
+- **Every wait on the place before submit is bounded**, so a stalled link
+  ends in a refusal (125, nothing run, no host record; the caller's receipt
+  says refused) rather than a hung caller. Local commands on the caller
+  (the repository, the catalog adapter) are not covered by this rule:
   - every ssh carries a connect timeout and keepalives;
   - short replies (`host-info`, file reads, the store setup and the
     `ls-remote` check after a failed push) have the reply bound, 60 s;
-  - the object push has no wall-clock bound, so a large push that keeps
-    moving is never cut. It is bounded by progress: the caller runs
-    `git push --progress` in a process group of its own, and 60 s without
-    a new byte of progress output (git's or the place's `remote:` lines)
-    ends it. The caller stops that group, which it recorded, and refuses
-    with "the push made no progress for 60 s". Residue: a place whose git
-    works silently for longer (a hook or a config that hides progress,
-    never Ferry's own bare store) is refused.
+  - the object push has no wall-clock bound, so a push that keeps
+    printing progress is never cut. It is bounded by its progress output:
+    the caller runs `git push --progress` in a process group of its own,
+    and 60 s without a new byte on its stderr (git's lines or the place's
+    `remote:` lines) ends it. The caller stops that group, which it
+    recorded, and refuses with "the push made no progress for 60 s".
+    Output is a proxy for progress, not proof of it. Residue, either way:
+    a push stuck while something keeps printing (a remote hook's periodic
+    text) is not cut, since before submit no run deadline exists yet; real
+    work that stays silent for 60 s (on either side) is refused.
 
 **Why:** short idempotent calls survive dropped connections; long-lived
 streams do not.
@@ -778,7 +782,7 @@ receipt is seeing this rule, not a bug.
     not refuse.
 25. **Bounded push:** through a fake ssh, a push that stops making
     progress on a live link is refused (125) within the progress bound
-    plus slack, with no submit and no record, and its ssh is gone; a push
-    that keeps printing progress for longer than the bound is not cut and
+    plus slack, with no submit and no host record, and its ssh is gone; a
+    push that keeps printing progress for longer than the bound is not cut and
     its run passes; a store setup that never answers is refused within
     the reply bound.
