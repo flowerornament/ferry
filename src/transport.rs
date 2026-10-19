@@ -345,18 +345,21 @@ fn progressing(command: &mut Command) -> Result<Pushed> {
     let exited = || crate::record::exited(group.as_raw());
     let status = loop {
         // Whatever git left in its group (a pipe-holder, a ProxyCommand) is
-        // ours, and goes before git is reaped. A state that cannot be read
-        // proves nothing: this tick reaps only, as before, never kills.
+        // ours: when git is seen to have exited, the group goes before git
+        // is reaped. A state that cannot be read proves nothing, so
+        // unreadability alone never kills a live push (see below).
         match exited() {
             Some(true) => {
                 stop();
                 break child.wait()?;
             }
             Some(false) => {}
-            // Unknown: reap only if it has exited, never kill a live push.
-            // The group goes after the reap all the same: a process group's
-            // id is never reused while it has members, and an empty group
-            // only answers ESRCH.
+            // Unknown: nothing is signalled while git may be alive. Once a
+            // reap shows it exited, its recorded group is signalled after the
+            // reap: while a leftover lives, a group's id is never reused, so
+            // it is ours. Residue: if the group has just emptied, its id may
+            // be reused by a new group in the instant before the signal (a
+            // pid wraparound in that instant).
             None => {
                 if let Some(status) = child.try_wait()? {
                     stop();
