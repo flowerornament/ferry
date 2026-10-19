@@ -335,12 +335,19 @@ Nothing else is written; Ferry writes nowhere outside these.
   - **workspace gone:** `ferry seats prune` retires each seat whose
     `repo_path` no longer exists;
   - **idle:** `ferry seats prune --idle <dur>` also retires each seat whose
-    newest `last_used_ms` is older than `<dur>`. Ferry never runs it by
-    itself; when to run it is the caller's or the operator's;
+    newest `last_used_ms` (over its lines with the same `place` and `key`)
+    is older than `<dur>`. `last_used_ms` is when this caller last used
+    the seat, not a claim that no one else has; the try-lock is the guard
+    against live use. A line without `last_used_ms` has an unknown age: the
+    seat is kept and reported, never treated as idle. Ferry never runs
+    prune by itself; when to run it is the caller's or the operator's;
   - **one run:** `ferry run --once` declares the seat lives for that run
-    only. After the final record, the supervisor, still holding the seat
-    lock, retires the seat. The record is final first, so it says `once`,
-    never that the delete happened; a delete that fails leaves the seat
+    only. After the final record, the supervisor releases its seat lock
+    and then retires the seat like any other: through the same try-lock.
+    A survivor that inherited the seat's fd still holds the lock (§7), so
+    the seat stays, busy, until that process exits and a later prune
+    retires it. The record is final first, so it says `once`, never that
+    the delete happened; a retire that fails or is skipped leaves the seat
     for `status` to show and a later prune to retire.
 
   Retiring deletes `seats/<key>/` and writes `records/retired-<key>.json`.
@@ -448,8 +455,13 @@ working tree.
     (with `once: true`), `records/retired-<key>.json`, and no
     `seats/<key>/`. With the retire injected to fail, the record is the
     same and final, the seat stays, `status` lists it, and a later
-    `prune --idle 0s` retires it.
+    `prune --idle 0s` retires it. With an escaped child that inherited the
+    seat's fd (the item 9 fixture), the record is final and unchanged, the
+    seat stays and is busy, prune skips it while the child lives, and
+    retires it once the child has exited.
 20. **Idle seat:** `ferry seats prune --idle <dur>` retires this caller's
     seat last used before `<dur>`, keeps one used since, skips a busy one
-    and reports it, and never touches another caller's seat or any record,
-    receipt or `runs/<id>/`.
+    and reports it, keeps and reports a seat whose lines have no
+    `last_used_ms`, and never touches another caller's seat or any record,
+    receipt or `runs/<id>/` (records, output and fetched artifacts stay
+    readable after retirement).
