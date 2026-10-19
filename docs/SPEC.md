@@ -589,15 +589,18 @@ receipt is seeing this rule, not a bug.
   reserved_for = ["quiet"]       # chosen without --on only for recipes that need one of these
   ```
 
-  A run without `--on` goes to the first machine, by name, that has what
-  its recipe needs. A machine with `reserved_for` is skipped in that
-  choice unless the recipe needs one of the listed features, so a timing
+  A recipe with `may_run_elsewhere = true`, run without `--on` or
+  `--local` while machines are configured, goes to the first machine, by
+  name, that has what it needs; any other recipe stays local, as before.
+  A machine with `reserved_for` is skipped in that automatic choice
+  unless the recipe needs one of the listed features, so a timing
   host is not taken by runs that merely forgot `--on`. One listed feature
   among the recipe's needs is enough. When no other machine can run it,
   such a run is refused, naming the reserved machine and its `--on` (for
   example "bench is reserved_for quiet; use --on bench"); it never falls
   back to the reserved machine. `--on <machine>`
-  still chooses it explicitly; every name in `reserved_for` must also be
+  still chooses it explicitly: it bypasses the reservation only, never
+  `may_run_elsewhere` or the recipe's needs. Every name in `reserved_for` must also be
   in its `has`, or `machines.toml` is refused.
 - **`host.toml`** (each place, its operator, `~/.config/ferry/`): the
   machine's own rules.
@@ -802,7 +805,10 @@ receipt is seeing this rule, not a bug.
 26. **Reserved machine:** with `bench` (`reserved_for = ["quiet"]`) and
     `gates` both able to run a recipe, a run without `--on` of a recipe
     that does not need `quiet` goes to `gates`, one that needs `quiet`
-    goes to `bench`, and `--on bench` runs either there. Without `gates`,
+    goes to `bench`, and `--on bench` runs either there, while `--on
+    bench` of a recipe without `may_run_elsewhere` or needing what bench
+    lacks is still refused, and such a recipe without `--on` still runs
+    locally. Without `gates`,
     the first is refused, never sent to `bench`. A `reserved_for`
     name missing from that machine's `has` refuses the run as a bad
     `machines.toml`.
