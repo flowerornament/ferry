@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.2 - 2026-10-19
+
 - **Run history no longer grows forever.** With
   `delete_run_history_after_days = <n>` in a place's `host.toml`, each run,
   after its record is final, deletes the folders and records of runs

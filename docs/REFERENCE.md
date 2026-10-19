@@ -320,7 +320,9 @@ ago (the record's `submitted_ms`, on the place's clock), oldest first:
   supervisor is gone is reconciled to `lost` first, then ages); a run whose
   recorded survivor is still alive; seats, `store/`, and the caller's
   receipts and fetched artifacts. Survivors listed as `unknown` keep
-  nothing.
+  nothing. A run folder with neither a record nor a reservation (left by
+  hand or by a crash before submit) is never reached, since the pass walks
+  `records/`; remove it by hand.
 - **Also aged.** `records/retired-<key>.json` by its `retired_ms` (without
   one it stays), the pass accounts by their `ms`, and a crashed write's
   temporary file (`records/.<name>.<pid>.<n>.tmp`) by its modification
