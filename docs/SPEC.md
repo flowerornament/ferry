@@ -594,8 +594,9 @@ receipt is seeing this rule, not a bug.
   choice unless the recipe needs one of the listed features, so a timing
   host is not taken by runs that merely forgot `--on`. One listed feature
   among the recipe's needs is enough. When no other machine can run it,
-  such a run is refused ("no configured machine meets requirements"); it
-  never falls back to the reserved machine. `--on <machine>`
+  such a run is refused, naming the reserved machine and its `--on` (for
+  example "bench is reserved_for quiet; use --on bench"); it never falls
+  back to the reserved machine. `--on <machine>`
   still chooses it explicitly; every name in `reserved_for` must also be
   in its `has`, or `machines.toml` is refused.
 - **`host.toml`** (each place, its operator, `~/.config/ferry/`): the
