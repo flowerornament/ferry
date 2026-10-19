@@ -147,9 +147,11 @@ pub fn admit(root: &Path, admission: &mut Admission, timeout: Option<u64>) -> Re
         Some((Err(error), path)) if error.kind() != std::io::ErrorKind::NotFound => {
             return Err(format!("host policy {}: {error}", path.display()).into());
         }
-        // No policy file: not configured, and the run proceeds.
+        // No policy file: not configured, and the run proceeds within the
+        // default limit.
         _ => {
             admission.policy = Some("not-configured".into());
+            within(timeout, None)?;
             admission.result = "admitted".into();
             return Ok(());
         }
@@ -167,16 +169,7 @@ pub fn admit(root: &Path, admission: &mut Admission, timeout: Option<u64>) -> Re
     admission.floor_bytes = Some(policy.min_free_bytes);
     admission.seat_cap_bytes = policy.seat_cap_bytes;
     admission.history_days = policy.delete_run_history_after_days;
-    let limit = policy
-        .max_run_time
-        .unwrap_or(crate::limits::MAX_TIMEOUT.as_secs());
-    if timeout.is_some_and(|timeout| timeout > limit) {
-        return Err(format!(
-            "timeout above this place's max_run_time ({limit} s), as its host.toml says now; \
-             next: ask for at most {limit} s with --timeout-seconds"
-        )
-        .into());
-    }
+    within(timeout, policy.max_run_time)?;
     admission.filesystem = Some(Filesystem {
         path: root.display().to_string(),
         device: fs::metadata(root)?.dev(),
@@ -193,6 +186,21 @@ pub fn admit(root: &Path, admission: &mut Admission, timeout: Option<u64>) -> Re
         .into());
     }
     admission.result = "admitted".into();
+    Ok(())
+}
+
+/// Whether a run's `timeout` is within the limit the policy just read gives
+/// (`max_run_time`, else `limits::MAX_TIMEOUT`, policy or none): the one
+/// limit check at admission.
+fn within(timeout: Option<u64>, max_run_time: Option<u64>) -> Result<()> {
+    let limit = max_run_time.unwrap_or(crate::limits::MAX_TIMEOUT.as_secs());
+    if timeout.is_some_and(|timeout| timeout > limit) {
+        return Err(format!(
+            "timeout above this place's max_run_time ({limit} s), as its host.toml says now; \
+             next: ask for at most {limit} s with --timeout-seconds"
+        )
+        .into());
+    }
     Ok(())
 }
 

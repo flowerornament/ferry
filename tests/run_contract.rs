@@ -6291,4 +6291,44 @@ fn a_policy_lowered_while_a_run_waits_refuses_it_at_admission() {
         "{record}"
     );
     assert_eq!(record["admission"]["result"], "refused", "{record}");
+
+    // herald-1b's case: allowed under 7d at submit, the policy removed while
+    // it waits. The default limit (6h) applies at admission all the same.
+    policy("7d");
+    let held = fs::File::open(root.join("locks/host")).unwrap();
+    fs2::FileExt::try_lock_exclusive(&held).unwrap();
+    let reserved = fs::read_dir(root.join("records")).unwrap().count();
+    let waiting = command(dir.path())
+        .args([
+            "run",
+            "pass",
+            "--local",
+            "--json",
+            "--timeout-seconds",
+            "172800",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let guard = OwnedPid(i32::try_from(waiting.id()).unwrap());
+    let until = Instant::now() + common::slack();
+    while fs::read_dir(root.join("records")).unwrap().count() == reserved {
+        assert!(Instant::now() < until, "the run was never submitted");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    fs::remove_file(dir.path().join("config/ferry/host.toml")).unwrap();
+    drop(held);
+    let out = waiting.wait_with_output().unwrap();
+    drop(guard);
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_run_time (21600 s)"),
+        "{record}"
+    );
+    assert_eq!(record["admission"]["policy"], "not-configured", "{record}");
 }
