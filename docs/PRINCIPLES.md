@@ -16,8 +16,10 @@ file.
      kept with its record, never reused by another run;
    - **cache** (seat checkouts, `seats/<seat>/cache`): regenerable. Ferry
      bounds what it created: a seat is retired when its caller's workspace
-     is gone, and a seat's caches are wiped at the start of a run, under its
-     lock, when they exceed the place's cap. Anything beyond that is host
+     is gone, when its caller declares it idle past an age it names, or
+     after the one run its caller declared it for, and a seat's caches are
+     wiped at the start of a run, under its lock, when they exceed the
+     place's cap. Anything beyond that is host
      policy;
    - **record** (receipts, host records, run output): kept until the
      operator's retention says otherwise.
@@ -72,11 +74,12 @@ Requests in this list go to the layer that owns them, not into Ferry:
 - **a sandbox or security boundary:** runs execute as the user;
 - **a deployment or publication tool:** it never pushes to forges;
 - **a cache manager:** Ferry bounds only its own state (seats retired with
-  their caller's workspace; a per-seat cap enforced under the seat lock). It
+  their caller's workspace, past the caller's idle age or after a one-run
+  seat's run; a per-seat cap enforced under the seat lock). It
   never shares, ranks or evicts caches across seats; anything cleverer is
   the operator's. Why: no Ferry state may be left to clean by hand, and only
   Ferry holds the seat lock and only the caller knows whether its workspace
-  still exists;
+  still exists or it still wants the seat;
 - **a quiet-host certifier:** exclusive means "no other Ferry run here", plus
   named observations.
 

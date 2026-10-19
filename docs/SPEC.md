@@ -26,7 +26,8 @@ below (OS/operator)  flock · sessions · systemd scope (opt.) · services · di
 Ferry never schedules, queues, retries, supervises services, sandboxes,
 publishes, reclaims disk beyond its own bounds, or proves that nothing
 survived (PRINCIPLES). Its own bounds: a seat is retired when its caller's
-workspace is gone, and a seat's caches are capped (§9).
+workspace is gone, when the caller declares it idle, or after a `--once`
+run, and a seat's caches are capped (§9).
 
 ## 3. Concepts
 
@@ -42,19 +43,22 @@ workspace is gone, and a seat's caches are capped (§9).
 ## 4. Interface
 
 ```
-ferry run <recipe> [--on <place>] [--exclusive] [--seat <name>] [--commit <rev>]
+ferry run <recipe> [--on <place>] [--exclusive] [--seat <name>] [--once] [--commit <rev>]
           [--timeout <dur>] [--wait <dur>] [--detach] [--json] [-- <args>…]
 ferry follow <run>                      re-attach: tail the output until the record is final
 ferry stop <run> [--other --reason <why>]
 ferry record [<run> | last] [--json]
 ferry status [--on <place>] [--json]   what the place sees now (read-only)
 ferry check  [--on <place>]
-ferry seats prune [--on <place>]        retire this caller's seats whose workspace is gone
+ferry seats prune [--on <place>] [--idle <dur>]
+                                        retire this caller's seats whose workspace is gone
+                                        (and, with --idle, those unused for <dur>)
 ferry recipes · ferry places
 ```
 
 Not shipped yet: `--timeout <dur>` and `--wait <dur>` (today
-`--timeout-seconds` and `--wait-seconds`), `--detach`, `ferry check`,
+`--timeout-seconds` and `--wait-seconds`), `--detach`, `--once`,
+`seats prune --idle`, `ferry check`,
 `ferry places` and `record last`. `README.md` lists the commands as built.
 
 **`run` behaviour:**
@@ -324,18 +328,32 @@ Nothing else is written; Ferry writes nowhere outside these.
 
 **Bounds on seats (Ferry's own state):**
 
-- **Count:** a seat lives while its caller's workspace does. Each run
-  appends `{key, place, repo_path, seat}` to the caller's `seats.jsonl`.
-  `ferry seats prune` retires, through the place's `retire` verb, each seat
-  whose `repo_path` no longer exists. `retire` only tries the seat lock: a
-  busy seat is skipped and reported. It deletes `seats/<key>/` and
-  writes `records/retired-<key>.json`. A caller retires only seats it
-  recorded, never another caller's.
+- **Count:** a seat lives as long as its caller says it does. Each run
+  appends `{key, place, repo_path, seat, last_used_ms}` to the caller's
+  `seats.jsonl`. A seat ends in one of three ways, all declared by the
+  caller:
+  - **workspace gone:** `ferry seats prune` retires each seat whose
+    `repo_path` no longer exists;
+  - **idle:** `ferry seats prune --idle <dur>` also retires each seat whose
+    newest `last_used_ms` is older than `<dur>`. Ferry never runs it by
+    itself; when to run it is the caller's or the operator's;
+  - **one run:** `ferry run --once` declares the seat lives for that run
+    only. After the final record, the supervisor, still holding the seat
+    lock, retires the seat. The record is final first, so it says `once`,
+    never that the delete happened; a delete that fails leaves the seat
+    for `status` to show and a later prune to retire.
+
+  Retiring deletes `seats/<key>/` and writes `records/retired-<key>.json`.
+  The `retire` verb only tries the seat lock: a busy seat is skipped and
+  reported. Records, receipts and `runs/<id>/` are never touched. A caller
+  retires only seats it recorded, never another caller's.
 - **Size:** at the start of a run, while the run holds the seat lock, if the
   seat's preserve paths plus its cache exceed `seat_cap_bytes`, they are
   wiped and the run starts cold. The record says so (`pruned: {bytes, cap}`).
   Source, logs, receipts and records are never touched.
-- **Floor:** below `min_free_bytes` a run refuses with 125, as before.
+- **Floor:** below `min_free_bytes` a run refuses with 125, as before. Its
+  `next` names `ferry status --on <place>` (seat sizes and last runs) and
+  `ferry seats prune --on <place> --idle <dur>`.
   Anything cleverer (shared caches, cross-seat eviction) is the operator's.
 
 **Why:** only the caller knows whether a workspace still exists, and only a
@@ -397,8 +415,8 @@ working tree.
     point keeps 1–3.
 13. **The cells:** Darwin and Linux Nix checks, a Linux build host, a Mac
     place.
-14. **Seat count:** `ferry seats prune` retires a seat only when its
-    workspace is provably gone (`NotFound`, a listable parent on the
+14. **Seat count:** without `--idle`, `ferry seats prune` retires a seat
+    only when its workspace is provably gone (`NotFound`, a listable parent on the
     recorded device). An unreadable or unmounted workspace is kept and
     reported. It never touches another caller's seat, and skips a busy one.
 15. **Seat size:** over `seat_cap_bytes`, a run starts cold with `pruned`
@@ -426,3 +444,12 @@ working tree.
     submitted during `status` is never refused busy because of it. A Mac
     place and a Linux place give the same schema and meaning (`--json`),
     not the same values.
+19. **One-run seat:** `ferry run --once` ends with exactly one final record
+    (with `once: true`), `records/retired-<key>.json`, and no
+    `seats/<key>/`. With the retire injected to fail, the record is the
+    same and final, the seat stays, `status` lists it, and a later
+    `prune --idle 0s` retires it.
+20. **Idle seat:** `ferry seats prune --idle <dur>` retires this caller's
+    seat last used before `<dur>`, keeps one used since, skips a busy one
+    and reports it, and never touches another caller's seat or any record,
+    receipt or `runs/<id>/`.
