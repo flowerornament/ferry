@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.3 - 2026-10-19
+
 - **A stalled push no longer holds the caller.** The caller's object push
   now has an output watchdog: 60 s without new progress output (git's own,
   or the place's `remote:` lines) stops the push and refuses the run (125),
