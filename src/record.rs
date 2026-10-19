@@ -77,10 +77,6 @@ pub fn boot_id() -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-/// Writes `bytes` to `path` complete, or not at all, and never over an
-/// existing file: a synced temporary file is linked into place (link(2)
-/// fails if the name exists), then the directory is synced. `point` names
-/// the link step for fault injection, and enables the `fsync` point too.
 /// Writes `path` whole, replacing what is there: through a temporary file of
 /// its own (a unique name, created exclusively, so never one a link already
 /// holds), renamed over `path`, which replaces a link and never follows it.
@@ -110,6 +106,10 @@ pub fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
     written
 }
 
+/// Writes `bytes` to `path` complete, or not at all, and never over an
+/// existing file: a synced temporary file is linked into place (link(2)
+/// fails if the name exists), then the directory is synced. `point` names
+/// the link step for fault injection, and enables the `fsync` point too.
 pub fn write_new(path: &Path, bytes: &[u8], point: Option<&str>) -> Result<()> {
     static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let injected = |at: &str| point.is_some() && crate::execution::fail_at(at);
