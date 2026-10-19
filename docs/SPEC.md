@@ -34,7 +34,7 @@ run, and a seat's caches are capped (§9).
 | Concept | State | Rule | Why |
 |---|---|---|---|
 | **Recipe** | `name → {argv, needs, exclusive, timeout, wait, artifacts, keep_between_runs}` read from the commit | runs only where `needs ⊆ has`, on every route | the repository decides what may run |
-| **Place** | `local` or an ssh destination; `provides` = declared ∪ detected ∪ binary capabilities; `host.toml` | describes itself through the binary that will run the work | the facts come from the doer |
+| **Place** | `local` or an ssh destination; `has` = declared (`machines.toml`) ∪ detected ∪ the binary's capabilities; `host.toml` | describes itself through the binary that will run the work | the facts come from the doer |
 | **Seat** | `(caller, repo path, name) → checkout + cache` | reset to the commit each run; `keep_between_runs` dirs kept | warm and exact, never shared |
 | **Lock** | flock: `seat.<key>`, `host`, `host.gate` | held means busy; the work inherits the seat's fd only, the supervisor alone holds `host` and `host.gate`; release by `close()` | the kernel is the only judge, and a leftover can hold no more than its own seat |
 | **Run** | `id → phase, deadline` | detached from the client; ends by its deadline or `stop` | its lifetime is not the connection's |
@@ -504,25 +504,38 @@ working tree.
 Three files, each in a different place and owned by a different person.
 Every key reads as a plain statement of what it does, so a new user can
 read a file without Ferry's vocabulary. Sizes are strings with a unit
-(`"40 GiB"`, `"512 MiB"`, `"40 GB"`), durations a number and unit
-(`"6h"`). A file declares `version = 2`.
+(`"40 GiB"`, `"512 MiB"` binary; `"40 GB"` decimal; units are
+case-sensitive), durations a number and unit (`"6h"`, `"30m"`). A file
+declares `version = 2`. A recipe's `needs` names what the place `has`
+(§3): its declared labels, what is detected, and the binary's
+capabilities, as `requires` does today; `[provider] needs` names only
+the binary's capabilities.
+
+Only the three files' keys are renamed. Records, receipts, the request
+and the protocol keep their field names (`requires`, `routable`,
+`preserve`, `forwarded_env`, `provides`, …), because every consumer's
+receipt parser reads them; they move only with a protocol bump of their
+own. A reader who sees `needs` in `ferry.toml` and `requires` in a
+receipt is seeing this rule, not a bug.
 
 - **`ferry.toml`** (the project, committed; or the JSON emitted by
   `[catalog] adapter`): what can be run.
 
   ```toml
   version = 2
+  keep_between_runs = ["_build"] # ignored build dirs kept warm, for every recipe
   [recipe.check]
   command = ["just", "check"]
-  needs = ["linux"]              # what the machine must have
+  needs = ["linux-x86_64"]       # what the machine must have (labels unchanged)
   may_run_elsewhere = true       # may run on another machine
-  keep_between_runs = ["_build"] # ignored build dirs kept warm
   [[also_send]]                  # extra refs or dependencies sent with the commit
   ref = "refs/remotes/origin/main"
   from = "main@origin"
   [environment]
   send = ["MY_FLAG"]             # your variables passed to the recipe
-  refuse_if_set = ["MY_"]        # other set variables with these prefixes refuse the run
+  refuse_other_vars_starting_with = ["MY_"]
+                                 # a set, nonempty MY_* variable refuses the run,
+                                 # unless it is listed in send or keep_local
   keep_local = ["MY_SECRET"]     # deliberately kept on the caller
   [hooks]                        # prepare, env, collect
   [provider]
@@ -549,9 +562,26 @@ read a file without Ferry's vocabulary. Sizes are strings with a unit
   max_run_time = "6h"
   delete_run_history_after_days = 30
   ```
-- **From version 1:** for one release Ferry reads both versions. A
-  version 2 file that holds a version 1 key, or a version 1 file after
-  that release, is refused, and the refusal names the new key.
+- **The catalog adapter's JSON** carries its own `version`, checked on its
+  own: during the compatibility release a version 2 `ferry.toml` may name
+  an adapter that still prints version 1, and the reverse. Each is read by
+  its own version's keys, and the two are merged as today (`ship` /
+  `also_send` entries combined, a duplicate refusing; `preserve` /
+  `keep_between_runs` the project's one list, from either).
+- **From version 1:** for one release Ferry reads both versions, of each
+  file and of adapter JSON. A version 2 file or JSON that holds a version
+  1 key is refused, and the refusal names the new key. Version 1 is
+  removed only after Herald and Murail have each moved and given GO by
+  execution, not merely at the next version number.
+- **Order:** a file another tool also reads moves only after that tool
+  reads version 2 (Murail's `remote-hosts.py` reads `machines.toml`
+  itself), so a shared file never flips under a reader Ferry does not
+  control.
+- **Old commits:** once version 1 is removed, an exact commit whose
+  `ferry.toml` or adapter is still version 1 no longer runs on the
+  current Ferry: it is refused, naming the version. That is the
+  compatibility limit; such a commit runs on a Ferry from before the
+  removal (an install keeps its previous build). No shim is kept.
 
   | version 1 | version 2 |
   |---|---|
@@ -559,7 +589,7 @@ read a file without Ferry's vocabulary. Sizes are strings with a unit
   | `routable` | `may_run_elsewhere` |
   | `preserve` | `keep_between_runs` |
   | `[[ship]]` | `[[also_send]]` |
-  | `[environment] forwards / watches / local` | `send / refuse_if_set / keep_local` |
+  | `[environment] forwards / watches / local` | `send / refuse_other_vars_starting_with / keep_local` |
   | `[host.<name>]` | `[machine.<name>]` |
   | `triple` | `platform` |
   | `features` | `has` |
@@ -704,4 +734,8 @@ read a file without Ferry's vocabulary. Sizes are strings with a unit
     with the §10 keys, sizes and durations. A version 1 file is read the
     same for one release; a version 2 file holding a version 1 key is
     refused naming the new key (`min_free_bytes` → "use
-    `refuse_runs_below_free_disk`"), and so is a size without a unit.
+    `refuse_runs_below_free_disk`"), and so is a size without a unit. A
+    version 2 `ferry.toml` with a version 1 adapter, and the reverse, run
+    with the same merged contract as both at version 1. A variable under
+    a `refuse_other_vars_starting_with` prefix that is listed in `send` or `keep_local` does
+    not refuse.
