@@ -873,11 +873,17 @@ fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
         .flatten()
         .any(|p| p["pid"] == split && p["run"] == id.as_str());
     // SPEC §11: listed when its marker can be read; otherwise reported as
-    // unreadable or an error, never silently absent.
-    assert!(
-        listed || left["unreadable"].as_u64() > Some(0) || left["error"].is_string(),
-        "status does not report the split member: {left}"
-    );
+    // unreadable or an error, never silently absent. On Linux every marker
+    // can be read (§7), so only this pid under this run's id will do: an
+    // unrelated unreadable process on a shared host must not pass for it.
+    if cfg!(target_os = "linux") {
+        assert!(listed, "status does not list the split member: {left}");
+    } else {
+        assert!(
+            listed || left["unreadable"].as_u64() > Some(0) || left["error"].is_string(),
+            "status does not report the split member: {left}"
+        );
+    }
     drop(guard);
 }
 
