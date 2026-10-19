@@ -5180,9 +5180,12 @@ fn a_run_whose_record_failed_to_delete_is_deleted_by_the_next_pass() {
 }
 
 /// SPEC §12 item 22, progress: a pass never reads a run named under 23
-/// hours old (at one day), so many young runs and many young or timeless
-/// retirement records never keep the first pass from a two-day-old run or
-/// from a crashed write's temporary file, deleted by its age unread.
+/// hours old (at one day), and names without a time come last, temporary
+/// files first. So with more young runs and young or timeless retirement
+/// records than one pass can read, the FIRST pass still deletes the
+/// two-day-old run and, by its age and unread, a crashed write's temporary
+/// file. Debug builds make the pass's work two entries (exactly those two);
+/// a release build checks that no pass reads a young run.
 #[test]
 fn a_history_pass_reads_no_young_run_and_reaches_the_old_ones() {
     let dir = fixture();
@@ -5201,16 +5204,18 @@ fn a_history_pass_reads_no_young_run_and_reaches_the_old_ones() {
         false,
         &none,
     );
-    for n in 0..30 {
-        let young = 22 * 3_600_000;
-        plant(
-            &root,
-            &format!("{}-young{n}", now_ms() - young),
-            young,
-            false,
-            &none,
-        );
-    }
+    let young = 22 * 3_600_000;
+    let young_runs: Vec<_> = (0..30)
+        .map(|n| {
+            plant(
+                &root,
+                &format!("{}-young{n}", now_ms() - young),
+                young,
+                false,
+                &none,
+            )
+        })
+        .collect();
     let records = root.join("records");
     for n in 0..30 {
         fs::write(
@@ -5226,21 +5231,36 @@ fn a_history_pass_reads_no_young_run_and_reaches_the_old_ones() {
     fs::write(&crashed, "not json").unwrap();
     age_file(&crashed, 2 * DAY_MS);
     with_host_policy(dir.path(), HISTORY_DAY);
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let mut first = command(dir.path());
+    first.args(["run", "pass", "--local", "--json"]);
+    if cfg!(debug_assertions) {
+        first.env("FERRY_HISTORY_MAX_ENTRIES", "2");
+    }
+    let out = first.output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
     let id = receipt(&out)["id"].as_str().unwrap().to_owned();
-    let (passes, deleted) = settled(dir.path(), &root, &id);
-    // At most the old run and the forty retirement records; no young run,
-    // whichever pass, so a pass's budget goes to the old ones.
-    assert!(
-        passes.iter().all(|(_, line)| read_of(line) <= 41),
-        "{passes:?}"
-    );
-    if passes.len() == 1 {
-        assert_eq!(read_of(&passes[0].1), 41, "{passes:?}");
+    let line = history_logged(&root, &id);
+    if cfg!(debug_assertions) {
+        // Two entries: the old run (read) and the temporary file (a stat);
+        // then the pass stops, every retirement record unread.
+        assert!(line.contains("deleted 1 runs and 1 other"), "{line}");
+        assert!(
+            line.contains("read 1,") && line.contains("stopped at its"),
+            "{line}"
+        );
+        assert!(!old.exists() && !crashed.exists(), "{line}");
+        assert!(records.join("retired-ageless0.json").exists(), "{line}");
+    } else {
+        // At most the old run and the forty retirement records.
+        let (passes, deleted) = settled(dir.path(), &root, &id);
+        assert!(
+            passes.iter().all(|(_, line)| read_of(line) <= 41),
+            "{passes:?}"
+        );
+        assert_eq!(deleted, 1, "{passes:?}");
+        assert!(!old.exists() && !crashed.exists(), "{passes:?}");
     }
-    assert_eq!(deleted, 1, "{passes:?}");
-    assert!(!old.exists() && !crashed.exists(), "{passes:?}");
+    assert!(young_runs.iter().all(|folder| folder.exists()), "{line}");
 }
 
 /// SPEC §12 item 22: `ferry record` and `ferry follow` on a run whose

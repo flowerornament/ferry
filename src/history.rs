@@ -13,7 +13,7 @@
 //! - `retired-<key>.json` ages by its `retired_ms`, `history-<ms>-<run>.json`
 //!   by its `ms`, and a temporary file a crashed write left by its mtime.
 //! - It lists names only, oldest first by the time a name carries (names
-//!   with none last), never reads a name younger than the cutoff plus a day,
+//!   with none last), never reads a name younger than the cutoff plus an hour,
 //!   then reads and deletes entry by entry, checking [`HISTORY_BUDGET`]
 //!   between entries; then it stops starting work, and the next run goes on.
 //!
@@ -73,14 +73,18 @@ pub fn delete_old(root: &Path, own: &str, days: u64) -> String {
     // A name younger than this is never read: its entry is younger than
     // the cutoff, allowing an hour for a caller's clock behind the host's.
     let young = cutoff + SKEW_MS;
+    // Debug builds: a budget in entries, so a control can make one pass's
+    // work smaller than what is there without depending on time.
+    let mut entries = execution::debug_bound::<u64>("FERRY_HISTORY_MAX_ENTRIES");
     for (made, name) in names {
-        if Instant::now() >= until {
+        if Instant::now() >= until || entries == Some(0) {
             pass.spent = true;
             break;
         }
         if made.is_some_and(|ms| ms >= young) {
             continue;
         }
+        entries = entries.map(|left| left - 1);
         let aged = Aged {
             root,
             own,
@@ -132,8 +136,9 @@ pub fn delete_old(root: &Path, own: &str, days: u64) -> String {
 
 /// The names in `records/`, each with the time it carries (a run id starts
 /// with its submit time in ms, an account with its own), oldest first, so a
-/// large `records/` is worked from its old end and each run makes progress
-/// within its budget. Names that carry no time come after the rest:
+/// large `records/` is worked from its old end. A pass's budget can still be
+/// spent on what it must keep (SPEC §9): a bound per pass, not a promise
+/// that each deletes something. Names that carry no time come after the rest:
 /// temporary files (judged by a stat, never read), then the others
 /// (retirement records), so kept entries never hold up an old run. Only
 /// names are listed here.
