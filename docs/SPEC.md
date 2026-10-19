@@ -429,9 +429,13 @@ Nothing else is written; Ferry writes nowhere outside these.
   the run as a bad `host.toml`), each run, after its record is final and
   its own locks are released (in teardown, after a `--once` retire),
   deletes the history of final runs submitted more than `<n>` days ago (by
-  the host record's own `submitted_ms`, on the host's clock), oldest
-  first. It never delays its own recipe or its caller, and never counts
-  against a run's timeout.
+  the host record's own `submitted_ms`, on the host's clock). It lists
+  names only, then works oldest first by the time a name carries (a run id
+  starts with its submit time, an account with its `ms`; names that carry
+  none come first), so a large `records/` cannot spend the budget on reads
+  before anything is deleted. The name orders the work; whether an entry
+  is old is still decided by what it records. It never delays its own
+  recipe or its caller, and never counts against a run's timeout.
 - **Never under a timing run:** the pass first passes the host's gate and
   takes a fresh shared `host` lease the way a shared run does, by try,
   never waiting at either, held by the supervisor alone. If an exclusive
@@ -452,9 +456,11 @@ Nothing else is written; Ferry writes nowhere outside these.
   everything.
 - **Retirement records** (`records/retired-<key>.json`) are not a run's:
   each ages by its own `retired_ms` on the same rule, and one without
-  `retired_ms` is kept. Without the key, history is kept forever. It never
-  touches a live reservation, a seat, `store/`, or a caller's receipts and
-  fetched artifacts.
+  `retired_ms` is kept. A temporary file a crashed write left in
+  `records/` (`.<name>.<pid>.<n>.tmp`) ages by its modification time and
+  is never read as a record. Without the key, history is kept forever.
+  It never touches a live reservation, a seat, `store/`, or a caller's
+  receipts and fetched artifacts.
 - **Budget:** the pass lists, reads and deletes entry by entry and checks
   one second between entries, then releases its lease. That bounds how
   much work it starts, not the filesystem: one listing or unlink in
