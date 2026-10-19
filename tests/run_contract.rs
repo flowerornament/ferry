@@ -1,5 +1,9 @@
 //! Real CLI contracts exercise committed bytes and durable refusal receipts.
 mod common;
+#[path = "../src/limits.rs"]
+#[allow(dead_code)]
+mod limits;
+
 use common::{git, receipt};
 use nix::{
     sys::signal::{Signal, kill, killpg},
@@ -650,7 +654,14 @@ fn unsupervised(
     };
     let deadline = common::startup_deadline();
     while !marker.exists() {
-        assert!(Instant::now() < deadline, "recipe did not start");
+        // A caller that ended (a refusal) or a startup past the bound: say
+        // what the caller printed.
+        let ended = caller.child.as_mut().unwrap().try_wait().unwrap().is_some();
+        assert!(
+            Instant::now() < deadline && !ended,
+            "recipe did not start (caller ended: {ended}): {}",
+            fs::read_to_string(&caller_output).unwrap_or_default()
+        );
         thread::sleep(Duration::from_millis(10));
     }
     let recipe: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
@@ -691,13 +702,13 @@ fn gone_within(pids: &[i32], since: std::time::Instant, bound: std::time::Durati
 #[test]
 fn a_killed_supervisor_s_session_is_stopped_at_its_timeout() {
     let dir = fixture();
-    let started = std::time::Instant::now();
     let (id, owner, recipe, guard, _caller) = unsupervised(
         dir.path(),
         "sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; wait",
         "",
-        "4",
+        "8",
     );
+    let started = std::time::Instant::now();
     let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
         .unwrap()
         .trim()
@@ -711,11 +722,11 @@ fn a_killed_supervisor_s_session_is_stopped_at_its_timeout() {
         alive(recipe) && alive(sleeper),
         "the session ended before its timeout"
     );
-    // The timeout and the owner's lag, then TERM.
+    // The timeout and the owner's lag, then TERM, which both obey.
     gone_within(
         &[recipe, sleeper, owner],
         started,
-        std::time::Duration::from_secs(14),
+        std::time::Duration::from_secs(8) + limits::OWNER_LAG + common::slack(),
         "the session outlived its timeout without its supervisor",
     );
     let out = run(dir.path(), &["record", &id]);
@@ -747,10 +758,11 @@ fn an_unsupervised_recipes_leftover_is_stopped_at_its_end() {
         session: owner,
     };
     fs::write(&release, "end").unwrap();
+    // The owner polls its parent every 100 ms, then TERM, which both obey.
     gone_within(
         &[recipe, sleeper, owner],
         std::time::Instant::now(),
-        std::time::Duration::from_secs(8),
+        common::slack(),
         "the recipe's leftover outlived its end without a supervisor",
     );
     let out = run(dir.path(), &["record", &id]);
@@ -767,13 +779,13 @@ fn an_unsupervised_recipes_leftover_is_stopped_at_its_end() {
 #[test]
 fn an_unlistable_session_still_ends_at_its_timeout() {
     let dir = fixture();
-    let started = std::time::Instant::now();
     let (_id, owner, recipe, guard, _caller) = unsupervised(
         dir.path(),
         "trap \"\" TERM; sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
         "session-list",
-        "3",
+        "6",
     );
+    let started = std::time::Instant::now();
     let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
         .unwrap()
         .trim()
@@ -788,7 +800,11 @@ fn an_unlistable_session_still_ends_at_its_timeout() {
     gone_within(
         &[recipe, sleeper, owner],
         started,
-        std::time::Duration::from_secs(25),
+        std::time::Duration::from_secs(6)
+            + limits::OWNER_LAG
+            + limits::STOP_GRACE
+            + limits::KILL_GRACE
+            + common::slack(),
         "an unlistable session outlived its bound",
     );
     drop(guard);
@@ -806,12 +822,13 @@ fn a_failed_listing_does_not_cut_the_owners_term_grace() {
         dir.path(),
         "trap \"touch $DIR/termed\" TERM; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
         "owner-list",
-        "2",
+        "5",
     );
     let started = std::time::Instant::now();
     while !termed.exists() {
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed()
+                < std::time::Duration::from_secs(5) + limits::OWNER_LAG + common::slack(),
             "the owner never sent TERM"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -820,19 +837,19 @@ fn a_failed_listing_does_not_cut_the_owners_term_grace() {
     gone_within(
         &[recipe],
         term,
-        std::time::Duration::from_secs(20),
+        limits::STOP_GRACE + limits::KILL_GRACE + common::slack(),
         "the recipe outlived the owner's KILL",
     );
-    // STOP_GRACE is 10 s; polling slack only shortens what is seen.
+    // Polling only shortens the grace that is seen, by at most a poll.
     assert!(
-        term.elapsed() >= std::time::Duration::from_secs(9),
+        term.elapsed() >= limits::STOP_GRACE.saturating_sub(std::time::Duration::from_secs(1)),
         "KILL came {:?} after TERM, before the grace",
         term.elapsed()
     );
     gone_within(
         &[owner],
         term,
-        std::time::Duration::from_secs(25),
+        limits::STOP_GRACE + limits::KILL_GRACE + common::slack(),
         "the owner stayed",
     );
     drop(guard);
