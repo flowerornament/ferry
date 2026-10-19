@@ -391,20 +391,32 @@ Nothing else is written; Ferry writes nowhere outside these.
 
 **Bound on run history (the host's records):**
 
-- A run's history is its run folder (`runs/<id>/`) and its records
-  (`records/<id>.json`, and `records/retired-<key>.json` for a retired
-  seat). With `delete_run_history_after_days = <n>` in `host.toml`, each
-  run, at its start and before its recipe starts, deletes the history of
-  final runs that started more than `<n>` days ago (by the record's
-  `started_ms`, on the host's clock), oldest first, for at most one second;
-  what is left waits for the next run. Without the key, history is kept
-  forever. It never touches a reserved record or its run folder, a seat,
-  `store/`, or a caller's receipts and fetched artifacts.
-- The run that deleted says so in its own record: `history_deleted: <count>`.
-  Two runs starting together may race on the same files; a file already
-  gone counts for neither and is not an error. Afterwards `ferry record
-  <id>` and `ferry follow <id>` answer "not found: this host deletes run
-  history after `<n>` days" instead of a bare not-found.
+- A run's history is its run folder (`runs/<id>/`) and its record
+  (`records/<id>.json`). With `delete_run_history_after_days = <n>` in
+  `host.toml`, each run, at its start and before its recipe starts, deletes
+  the history of final runs that started more than `<n>` days ago (by the
+  record's `started_ms`, on the host's clock), oldest first. A seat's
+  retirement record (`records/retired-<key>.json`) has its own age, its
+  `retired_ms`, and is deleted on the same rule; one without `retired_ms`
+  is kept. Without the key, history is kept forever. It never touches a
+  reserved record or its run folder, a seat, `store/`, or a caller's
+  receipts and fetched artifacts.
+- **Budget:** after one second the run starts no new deletion; one already
+  under way may overrun it. What is left waits for the next run. A run's
+  folder is deleted before its record, so a run deleted only in part keeps
+  its record and stays eligible next time.
+- The run that deleted says so in its own record: `history_deleted:
+  <count>`, counting whole runs only (folder and record both gone), never
+  a run deleted in part. Two runs starting together may race on the same
+  files; a file already gone is not an error, and a run counts for the one
+  that removed its record. Afterwards `ferry record <id>` and
+  `ferry follow <id>` answer "not found (this host keeps run history for
+  `<n>` days)": context, not proof, since the id may never have existed.
+- **What is lost with it:** a run's history is the only thing that names
+  it on the host. After it is deleted, a marked process that outlived the
+  run shows in `status` as `record: none` instead of a leftover of that
+  run, and a seat's last run is no longer named. The receipt the caller
+  kept still says what happened.
 
 **Why:** history only grows when runs happen, so runs can bound it: no
 daemon, no timer, nothing left on the host between runs (PRINCIPLES 2).
@@ -533,6 +545,7 @@ working tree.
     only the first run's folder and records, and says
     `history_deleted: 1`. Without the key nothing is deleted. A seat,
     `store/` and the caller's receipts are untouched. `ferry record` on the
-    deleted run names the setting. With the deletion injected to fail, the
-    run still runs, its count leaves out what failed, and the next run
-    deletes it.
+    deleted run names the setting as context. A retirement record older
+    than a day is deleted and a newer one is kept. With the deletion
+    injected to fail after the folder, the run still runs, the record
+    stays, the count leaves that run out, and the next run deletes it.
