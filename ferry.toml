@@ -5,8 +5,10 @@ command = ["sh", "-c", "echo ferry-smoke-ok"]
 requires = []
 routable = true
 
+# Arguments after `--` reach cargo test as literal argv, for a focused
+# control: `ferry run test --on <host> --commit <rev> -- --test run_contract <filter>`.
 [recipe.test]
-command = ["sh", "-c", "command -v nix >/dev/null || . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; exec nix develop -c cargo test --locked --no-fail-fast"]
+command = ["sh", "-c", "command -v nix >/dev/null || . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; exec nix develop -c cargo test --locked --no-fail-fast \"$@\"", "ferry-test"]
 requires = []
 routable = true
 
