@@ -186,10 +186,11 @@ leaves none, and the reason says so).
   caller refuses a place without `detach`/`ship` (125, naming its revision)
   before pushing anything; an old caller meets a place that still answers
   its host-info and is refused at parse (125, naming the place's revision).
-- **Every wait on the place before submit is bounded**, so a stalled link
-  ends in a refusal (125, nothing run, no host record; the caller's receipt
+- **Caller limits before submit:** short replies from the place are
+  bounded and the push has an output watchdog, so a stalled link ends
+  in a refusal (125, nothing run, no host record; the caller's receipt
   says refused) rather than a hung caller. Local commands on the caller
-  (the repository, the catalog adapter) are not covered by this rule:
+  (the repository, the catalog adapter) are not covered:
   - every ssh carries a connect timeout and keepalives;
   - short replies (`host-info`, file reads, the store setup and the
     `ls-remote` check after a failed push) have the reply bound, 60 s;
@@ -198,7 +199,7 @@ leaves none, and the reason says so).
     the caller runs `git push --progress` in a process group of its own,
     and 60 s without a new byte on its stderr (git's lines or the place's
     `remote:` lines) ends it. The caller stops that group, which it
-    recorded, and refuses with "the push made no progress for 60 s".
+    recorded, and refuses with "the push printed no progress for 60 s".
     Output is a proxy for progress, not proof of it. Residue, either way:
     a push stuck while something keeps printing (a remote hook's periodic
     text) is not cut, since before submit no run deadline exists yet; real
@@ -780,8 +781,8 @@ receipt is seeing this rule, not a bug.
     with the same merged contract as both at version 1. A variable under
     a `refuse_other_vars_starting_with` prefix that is listed in `send` or `keep_local` does
     not refuse.
-25. **Bounded push:** through a fake ssh, a push that stops making
-    progress on a live link is refused (125) within the progress bound
+25. **Push watchdog:** through a fake ssh, a push that stops producing
+    progress output on a live link is refused (125) within the progress bound
     plus slack, with no submit and no host record, and its ssh is gone; a
     push that keeps printing progress for longer than the bound is not cut and
     its run passes; a store setup that never answers is refused within
