@@ -171,7 +171,7 @@ leaves none, and the reason says so).
 | `describe` | — | `{protocol, source_rev, exe, capabilities, boot_id, os, arch}` |
 | `submit` | request JSON (`id`, `token`, `commit`, `seat`, `recipe`, `args`, `env`, `hooks`, `deadline`) | `{id}` or `{refused, why, next}` |
 | `follow` | `id`, `offset` | output bytes from that offset; ends when the record is final |
-| `retire` | seat `key`; optionally `idle_ms` or `once_id` (neither for a workspace-gone prune: no `used` check) | per seat: `{retired, bytes}` (under the seat lock, try only), `{refused: busy}`, `{refused: used}` (used since), `{unknown, why}` or `{failed, why}` |
+| `retire` | seat `key`; optionally `idle_ms` or `once_id` (neither for a workspace-gone prune: no `used` check) | per seat: `{retired, bytes}` (under a shared host lease and the seat lock, try only), `{refused: exclusive}`, `{refused: busy}`, `{refused: used}` (used since), `{unknown, why}` or `{failed, why}` |
 | `stop` | `id`, `who`, `why` | `{accepted}` or `{refused}` |
 | `record` | `id` | the final or reserved record |
 
@@ -341,13 +341,37 @@ Nothing else is written; Ferry writes nowhere outside these.
     is older than `<dur>`. `last_used_ms` is when this caller last used
     the seat, not a claim that no one else has; the try-lock is the guard
     against live use. A line without `last_used_ms` has an unknown age: the
-    seat is kept and reported, never treated as idle. Ferry never runs
-    prune by itself; when to run it is the caller's or the operator's;
+    seat is kept and reported, never treated as idle;
+  - **idle, without remembering:** with `delete_unused_checkouts_after_days
+    = <n>` at the top level of the caller's `machines.toml` (a whole number
+    of days, at least 1; anything else is a bad `machines.toml`), each
+    `ferry run`, once its run is final (or submitted, with `--detach`),
+    also runs `prune --idle <n>d` against that run's place, at most once an
+    hour per place. The hour is claimed before pruning, under an flock on
+    the caller's `pruned.json` (`{<place>: ms}`): a run reads it, and only
+    if the place's time is over an hour old writes now and prunes; a run
+    that finds the lock held or the time recent skips silently. The lock
+    is a sibling `pruned.lock`, so `pruned.json` can be replaced atomically
+    under it. After ten seconds it starts no new retire. One already in
+    flight is waited for: over ssh up to the ssh reply bound (60 s), on the
+    local route until that seat's delete ends. Stopping the wait never
+    stops the retire, which the place completes or leaves as a tombstone
+    (below). So the caller's exit, after its receipt and `--json` output
+    are complete, is delayed by at most ten seconds plus one retire, at
+    most once an hour per place. It prints one line on stderr
+    naming the place, what it retired and how long it took; it never
+    changes the run's exit code (a failing recipe's included) or its
+    `--json` output, and a failure is only that line. It is the same
+    prune, through the same `retire`, so a busy or recently used seat is
+    kept. Without the key nothing prunes by itself;
   - **one run:** `ferry run --once` declares the seat lives for that run
     only. After the final record, the supervisor closes its seat fd (never
     `LOCK_UN`: the lock belongs to the open file description it shares
     with everything that inherited it) and then retires the seat like any
-    other, through a fresh try-lock with `once_id` set to its run.
+    other, through a fresh try-lock with `once_id` set to its run, after
+    its own host lease is released (so an exclusive `--once` run never
+    refuses its own retire). An exclusive run waiting at the gate then
+    makes it `exclusive`, and the seat waits for a later prune.
     A survivor that inherited the seat's fd still holds the lock (§7), so
     the seat stays, busy, until that process exits and a later prune
     retires it. The record is final first, so it says `once`, never that
@@ -365,8 +389,17 @@ Nothing else is written; Ferry writes nowhere outside these.
   half a seat. That run re-creates the seat, and its
   `seats.jsonl` line makes it live again.
 
-  The `retire` verb only tries the seat lock: a busy seat is skipped and
-  reported. Under the lock it checks the seat is still the one the caller
+  The `retire` verb only tries its locks and never waits. It first passes
+  the host's gate and takes a shared `host` lease the way a shared run
+  does, by try: if an exclusive run holds the gate or `host`, it is
+  refused `exclusive` and nothing is deleted, so no retire, by hand or by
+  itself, ever deletes during an exclusive run or jumps ahead of one
+  waiting. It then tries the seat lock: a busy seat is skipped and
+  reported. This is the opposite of a run's order (seat, then host),
+  which is safe only because retire never waits on either: both are
+  tries, with no retry that holds `host` while it waits on a seat. Retire
+  holds the shared lease through the rename and the tombstone's delete,
+  so an exclusive run that arrives meanwhile may wait one seat's delete. Under the lock it checks the seat is still the one the caller
   meant: each run writes `seats/<key>/used` (`{ms, id}`) when it takes the
   seat lock. With `idle_ms`, a seat whose `used.ms` is newer than the
   place's clock minus `idle_ms` is refused `used`. With `once_id`, a seat
@@ -471,7 +504,11 @@ working tree.
 - **`ferry.toml`** (or the JSON emitted by `[catalog] adapter`): `[recipe.*]`,
   `[hooks]`, `[environment] forwards/watches/local`, `[ship]` extra refs
   (companion refs and mirrors), `[provider] requires`.
-- **`machines.toml`** (caller): `[host.<name>] ssh, features`.
+- **`machines.toml`** (caller): `[host.<name>] ssh, features`;
+  `delete_unused_checkouts_after_days` (§9): a checkout here is a seat, the
+  copy of the repository a place keeps for it, with its build cache.
+- **`pruned.json`** (caller state, `~/.local/state/ferry/`): `{<place>: ms}`,
+  when this caller's runs last pruned that place by themselves.
 - **`host.toml`** (place, operator): `min_free_bytes`, `max_timeout`,
   `seat_cap_bytes`, `delete_run_history_after_days`. A new key's name reads
   as a plain sentence about what the host does, so the file explains
@@ -593,3 +630,14 @@ working tree.
     after the folder, the run's record is unchanged, the record that
     failed stays, the count leaves that run out, and the next pass deletes
     it.
+23. **Prune without remembering:** with
+    `delete_unused_checkouts_after_days = 1` on the caller, a run on a
+    place holding this caller's seat unused for two days and one used an
+    hour ago retires the first, keeps the second, prints one summary line
+    on stderr, and exits with its own code and unchanged `--json`. A
+    second run within the hour does not prune, and two runs ending
+    together prune once. With the place unreachable or slow, the run's
+    exit code and `--json` are its own and no new retire starts after ten
+    seconds. With an exclusive run holding the place's gate or `host`,
+    retire, by hand or by itself, is refused `exclusive` and deletes
+    nothing. Without the key, nothing is retired.
