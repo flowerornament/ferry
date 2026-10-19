@@ -57,8 +57,7 @@ ferry recipes · ferry places
 ```
 
 Not shipped yet: `--timeout <dur>` and `--wait <dur>` (today
-`--timeout-seconds` and `--wait-seconds`), `--detach`, `--once`,
-`seats prune --idle`, `ferry check`,
+`--timeout-seconds` and `--wait-seconds`), `--detach`, `ferry check`,
 `ferry places` and `record last`. `README.md` lists the commands as built.
 
 **`run` behaviour:**
