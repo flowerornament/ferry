@@ -151,6 +151,7 @@ requires = ["admission"]
 | `detach` | detached runs (`ferry place` submit, follow, stop, record); a caller refuses a place without it (125, naming the place's `source_rev`) |
 | `retire` | the place's `retire` verb for `ferry seats prune`; prune refuses a place without it (125, naming its `source_rev`) |
 | `seat-lifetime` | `run --once`, `seats prune --idle`, and a `retire` that checks the seat's latest use, never deletes during an exclusive run, and renames to a tombstone first; a `--once` run or an idle retire refuses a place without it |
+| `run-history` | `delete_run_history_after_days` in `host.toml`, and a not-found answer that names it |
 | `ship` | `[[ship]]` requests and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
 | `status` | the place's `status` verb; `ferry status` refuses a place without it (125, naming its `source_rev`) |
 
@@ -196,6 +197,8 @@ version = 1
 min_free_bytes = 42949672960
 # Optional: a seat whose preserve paths and cache exceed this starts cold.
 seat_cap_bytes = 21474836480
+# Optional: each run deletes the history of runs submitted over 7 days ago.
+delete_run_history_after_days = 7
 ```
 
 - **No file:** the run proceeds, and the receipt records `not-configured`.
@@ -287,6 +290,49 @@ receipts or records.
   An operator who moves it to another disk through a symbolic link makes
   every cap and retire on that place refuse: safe, but they never act. Move
   the whole state root instead.
+
+### Run history (SPEC §9)
+
+Without `delete_run_history_after_days`, a place keeps every run's folder
+(`runs/<id>/`: output, artifacts) and record (`records/<id>.json`) forever.
+With it (a whole number of days, at least 1; anything else refuses the run
+as a bad `host.toml`), each run, once its record is final and its locks are
+closed, deletes the history of final runs submitted more than that many days
+ago (the record's `submitted_ms`, on the place's clock), oldest first:
+
+- **Never beside an exclusive run.** It takes a shared host lease by try,
+  as a shared run does. If an exclusive run holds or waits for the place,
+  the pass is skipped; an exclusive run that arrives during it waits for
+  it (at most 1 s plus one file).
+- **One second.** It lists `records/` by name, oldest first by the time a
+  name carries (a run id starts with its submit time on the caller's
+  clock), and never reads a run named less than `n` days less one hour ago;
+  names without a time come last, temporary files before retirement
+  records. It reads and deletes entry by entry and stops starting work after
+  1 s; the rest waits for the next run. A run's folder goes first, then a
+  reservation a crashed finalize left beside its record, then the record,
+  each only after the one before succeeded, so a run deleted in part is
+  found again and never comes back as `lost`. A run from a caller whose
+  clock runs ahead of the place's is deleted that much later. Keep `runs/` a real
+  directory on the state root's disk: one behind a symbolic link or on
+  another device is never deleted (each pass logs the failure).
+- **What stays.** A live supervisor's reservation (an old one whose
+  supervisor is gone is reconciled to `lost` first, then ages); a run whose
+  recorded survivor is still alive; seats, `store/`, and the caller's
+  receipts and fetched artifacts. Survivors listed as `unknown` keep
+  nothing.
+- **Also aged.** `records/retired-<key>.json` by its `retired_ms` (without
+  one it stays), the pass accounts by their `ms`, and a crashed write's
+  temporary file (`records/.<name>.<pid>.<n>.tmp`) by its modification
+  time, never read as a record.
+- **Accounted.** A pass that deleted anything writes
+  `records/history-<ms>-<run>.json` (`{ms, run, deleted, older_than_days}`,
+  `deleted` counting whole runs) and a line in its run's `supervisor.log`.
+- **After.** `ferry record <id>` and `ferry follow <id>` on a deleted run say
+  `not found (this host keeps run history for <n> days)`, as context: the
+  id may never have existed. Your receipt keeps the outcome, exit code and
+  digests, and fetched artifacts stay in `<repo>/.ferry/runs/<id>/`; save
+  any output you need for longer before then.
 
 ## Hooks and environment
 

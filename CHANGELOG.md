@@ -4,6 +4,15 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **Run history no longer grows forever.** With
+  `delete_run_history_after_days = <n>` in a place's `host.toml`, each run,
+  after its record is final, deletes the folders and records of runs
+  submitted more than `n` days ago, for at most 1 s and never beside an
+  exclusive run. A run whose leftover process is still alive is kept, and
+  `ferry record` on a deleted run names the setting. Without the key nothing
+  changes. Seen as 2,740 run folders (5.7 GB) on one shared host after a
+  week.
+
 ## v0.1.1 - 2026-10-19
 
 - **Seats no longer pile up.** `ferry seats prune --idle <dur>` also

@@ -6,7 +6,9 @@
 //! - absent: not configured; the run proceeds and the receipt says so;
 //! - `version = 1`, `min_free_bytes`: below the floor, refuse; optional
 //!   `seat_cap_bytes`: a seat whose preserve paths and cache exceed it is
-//!   wiped at run start and runs cold (SPEC §9).
+//!   wiped at run start and runs cold (SPEC §9); optional
+//!   `delete_run_history_after_days`: each run then deletes the history of
+//!   runs submitted more than that many days ago (SPEC §9, `history`).
 //!
 //! Anything else (malformed TOML, another version, an unknown key) refuses.
 //! Seats are bounded by `ferry seats prune` and `seat_cap_bytes` (SPEC §9),
@@ -25,6 +27,14 @@ struct Policy {
     version: u32,
     min_free_bytes: u64,
     seat_cap_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "history_days")]
+    delete_run_history_after_days: Option<u64>,
+}
+
+fn history_days<'de, D: serde::Deserializer<'de>>(
+    to: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    crate::config::whole_days(to, "delete_run_history_after_days")
 }
 
 /// The admission evidence a session leaves in its host result and receipt.
@@ -41,6 +51,10 @@ pub struct Admission {
     /// What the cap wiped, carried to the record's top-level `pruned`.
     #[serde(skip)]
     pub pruned: Option<Pruned>,
+    /// How many days of run history the policy keeps, for the pass this
+    /// run makes once its record is final (SPEC §9).
+    #[serde(skip)]
+    pub history_days: Option<u64>,
     /// `admitted` or `refused`.
     pub result: String,
 }
@@ -56,6 +70,14 @@ fn policy_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .map(|base| base.join("ferry/host.toml"))
+}
+
+/// How many days of run history this host keeps, as its policy file says,
+/// for a not-found answer's context; `None` when unset or unreadable.
+pub fn history_kept_days() -> Option<u64> {
+    let text = fs::read_to_string(policy_path()?).ok()?;
+    let policy: Policy = toml::from_str(&text).ok()?;
+    policy.delete_run_history_after_days
 }
 
 // statvfs field widths differ between platforms (u32 or u64), so the
@@ -115,6 +137,7 @@ pub fn admit(root: &Path, admission: &mut Admission) -> Result<()> {
     }
     admission.floor_bytes = Some(policy.min_free_bytes);
     admission.seat_cap_bytes = policy.seat_cap_bytes;
+    admission.history_days = policy.delete_run_history_after_days;
     admission.filesystem = Some(Filesystem {
         path: root.display().to_string(),
         device: fs::metadata(root)?.dev(),

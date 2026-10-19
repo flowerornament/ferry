@@ -231,16 +231,24 @@ pub struct Machines {
     /// Each run prunes its place's seats this caller has not used for this
     /// many whole days, at least 1 (SPEC §9); absent, nothing prunes by
     /// itself.
-    #[serde(default, deserialize_with = "whole_days")]
+    #[serde(default, deserialize_with = "unused_days")]
     pub delete_unused_checkouts_after_days: Option<u64>,
 }
 
-fn whole_days<'de, D: serde::Deserializer<'de>>(to: D) -> Result<Option<u64>, D::Error> {
+fn unused_days<'de, D: serde::Deserializer<'de>>(to: D) -> Result<Option<u64>, D::Error> {
+    whole_days(to, "delete_unused_checkouts_after_days")
+}
+
+/// A count of whole days, from 1 to 36500 (a century), for the key `name`.
+pub(crate) fn whole_days<'de, D: serde::Deserializer<'de>>(
+    to: D,
+    name: &str,
+) -> Result<Option<u64>, D::Error> {
     let days = <Option<u64> as Deserialize>::deserialize(to)?;
     if days.is_some_and(|days| !(1..=36_500).contains(&days)) {
-        return Err(serde::de::Error::custom(
-            "delete_unused_checkouts_after_days: a whole number of days, from 1 to 36500",
-        ));
+        return Err(serde::de::Error::custom(format!(
+            "{name}: a whole number of days, from 1 to 36500"
+        )));
     }
     Ok(days)
 }

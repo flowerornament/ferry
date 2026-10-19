@@ -33,6 +33,7 @@ transport::run_on ── submit{request} ──────────►  plac
   │                                                    artifacts (§8)  ── runs/<id>/artifacts.tar
   │                                                  run::verdict: first terminal fact (§5)
   │                                                  record::finalize (once)   ── records/<id>.json
+  │                                                  close locks; --once retire; history::delete_old (§9, shared host try)
 transport::follow ◄── output.log by offset ──────  place::follow
 transport::complete ◄── final record ───────────  place::print_record
   │   artifacts::fetch, verify per file
@@ -59,6 +60,7 @@ final record, and `ferry record <id>` completes the receipt later.
 | `record` | Reserve, finalize once, reconcile a lost supervisor; busy-holder naming. | §8 |
 | `receipt` | The caller's receipt, digests, run ids, capabilities. | §8 |
 | `admission` | Host policy: disk floor, per-seat cap, and every delete in a seat (contained, same device). | §9 |
+| `history` | The host's run history bound: after a run's record is final, delete the runs, retirement records and accounts older than `delete_run_history_after_days`. | §9 |
 | `seats` | The caller's seat book, `ferry seats prune [--idle]`, and the hourly prune a run makes by itself. | §9 |
 | `status` | `ferry status`: one read-only view of a place (disk, live runs, the gate, seats, leftovers). | §4 |
 | `artifacts` | Collect and hash at the place; fetch and verify at the caller. | §8 |

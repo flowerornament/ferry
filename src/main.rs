@@ -4,6 +4,7 @@ mod artifacts;
 mod config;
 mod custody;
 mod execution;
+mod history;
 mod limits;
 mod lock;
 mod place;

@@ -32,6 +32,10 @@ pub const AUTO_PRUNE_EVERY: Duration = Duration::from_hours(1);
 /// After this, a prune a run makes by itself starts no new retire.
 pub const AUTO_PRUNE_BUDGET: Duration = Duration::from_secs(10);
 
+/// After this, a run's history pass (SPEC §9) starts no new listing, read
+/// or delete: what is left waits for the next run.
+pub const HISTORY_BUDGET: Duration = Duration::from_secs(1);
+
 /// The most a run's output log holds; later output is read and dropped.
 pub const OUTPUT_CAP: u64 = 1 << 30;
 

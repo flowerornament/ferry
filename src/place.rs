@@ -352,6 +352,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
         }),
     )
     .unwrap_or_else(|_| Err("supervisor panicked".into()));
+    let history_days = admission.as_ref().and_then(|a| a.history_days);
     record_admission(&mut result, admission);
     uncollected(&mut result, &request);
     // One verdict, from the first terminal fact (SPEC §5). A stop's signal is
@@ -390,9 +391,7 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             // Closed, never unlocked: a survivor that inherited the seat's
             // descriptor keeps it held, so the retire below finds it busy.
             drop(held);
-            if request.once {
-                retire_once(root, &request);
-            }
+            after_final(root, &request, history_days);
             Ok(result.exit_code)
         }
         Err(error) => {
@@ -401,6 +400,19 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             // `held` closes with the process; reconcile then proves it lost.
             std::process::exit(255)
         }
+    }
+}
+
+/// What a run does once its record is final and its locks are closed, so
+/// it never delays the recipe or the caller, who has the final record
+/// already (SPEC §9): a `--once` run retires its seat, then a host that
+/// bounds its run history deletes what is older.
+fn after_final(root: &Path, request: &Request, history_days: Option<u64>) {
+    if request.once {
+        retire_once(root, request);
+    }
+    if let Some(days) = history_days {
+        execution::warn(&crate::history::delete_old(root, &request.id, days));
     }
 }
 
@@ -493,7 +505,7 @@ fn collect_artifacts(root: &Path, seat: &Path, request: &Request, result: &mut H
 pub fn follow(root: &Path, id: &str, offset: u64) -> Result<i32> {
     let reserved = record::reserved_path(root, id);
     if !reserved.exists() && record::reconcile(root, id)?.is_none() {
-        return Ok(4);
+        return Ok(not_found());
     }
     let path = record::run_dir(root, id).join("output.log");
     let mut sent = offset;
@@ -924,6 +936,18 @@ pub fn print_record(root: &Path, id: &str) -> Result<i32> {
             execution::emit(&bytes);
             Ok(3)
         }
-        Err(_) => Ok(4),
+        Err(_) => Ok(not_found()),
     }
+}
+
+/// Says a run is not found here (exit 4), naming how long this host keeps
+/// run history: context, not proof, since the id may never have existed.
+fn not_found() -> i32 {
+    match crate::admission::history_kept_days() {
+        Some(days) => execution::warn(&format!(
+            "not found (this host keeps run history for {days} days)"
+        )),
+        None => execution::warn("not found"),
+    }
+    4
 }

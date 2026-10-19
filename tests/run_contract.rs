@@ -4504,3 +4504,789 @@ fn an_unparsable_request_is_refused_naming_the_places_revision() {
     assert!(reply.contains("this place runs "), "{reply}");
     assert!(!dir.path().join("records").exists());
 }
+
+/// ferry-8wq: the local place's state root.
+fn local_root(dir: &Path) -> std::path::PathBuf {
+    dir.join(".ferry/local/v1")
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
+const HISTORY_DAY: &str = "version = 1\nmin_free_bytes = 1\ndelete_run_history_after_days = 1\n";
+
+/// Plants run `id`'s history on the place at `root`, submitted `ago` ms
+/// before now: its folder (a log and a nested file) and its record, final
+/// or (`reserved`) a reservation, with `extra` fields over the defaults.
+/// Returns the folder.
+fn plant(
+    root: &Path,
+    id: &str,
+    ago: u128,
+    reserved: bool,
+    extra: &serde_json::Value,
+) -> std::path::PathBuf {
+    let folder = root.join("runs").join(id);
+    fs::create_dir_all(folder.join("artifacts/deep")).unwrap();
+    fs::write(folder.join("output.log"), "old output\n").unwrap();
+    fs::write(folder.join("artifacts/deep/file"), "old artifact\n").unwrap();
+    let mut record = serde_json::json!({
+        "state": if reserved { "reserved" } else { "final" },
+        "id": id,
+        "token": "t",
+        "commit": "0000000000000000000000000000000000000000",
+        "seat": "planted",
+        "binary_sha256": "b",
+        "supervisor": {"pid": 1, "start": null},
+        "boot_id": null,
+        "submitted_ms": now_ms() - ago,
+    });
+    if !reserved {
+        record["outcome"] = "ran-pass".into();
+        record["exit_code"] = 0.into();
+    }
+    for (key, value) in extra.as_object().unwrap() {
+        record[key] = value.clone();
+    }
+    let name = if reserved {
+        format!("{id}.reserved.json")
+    } else {
+        format!("{id}.json")
+    };
+    fs::create_dir_all(root.join("records")).unwrap();
+    fs::write(root.join("records").join(name), record.to_string()).unwrap();
+    folder
+}
+
+/// Sets `path`'s modification time to `ago` ms before now.
+fn age_file(path: &Path, ago: u128) {
+    let seconds = (now_ms() - ago) / 1000;
+    let set = Command::new("python3")
+        .args([
+            "-c",
+            "import os,sys; t=int(sys.argv[2]); os.utime(sys.argv[1], (t, t))",
+            path.to_str().unwrap(),
+            &seconds.to_string(),
+        ])
+        .status()
+        .unwrap();
+    assert!(set.success());
+}
+
+/// Waits for run `id`'s history pass to be logged by its supervisor, and
+/// returns that line.
+fn history_logged(root: &Path, id: &str) -> String {
+    let log = root.join("runs").join(id).join("supervisor.log");
+    let until = common::startup_deadline();
+    loop {
+        if let Some(line) = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .find(|line| line.starts_with("ferry: run history:"))
+        {
+            return line.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the history pass never ran"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Waits until run `id`'s supervisor has exited, so whatever it would do
+/// after its record is done.
+fn supervisor_exited(root: &Path, id: &str) {
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(format!("records/{id}.json"))).unwrap())
+            .unwrap();
+    let pid = i32::try_from(record["supervisor"]["pid"].as_u64().unwrap()).unwrap();
+    let until = common::startup_deadline();
+    while alive(pid) {
+        assert!(std::time::Instant::now() < until, "the supervisor stayed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The account run `id`'s history pass wrote, if it wrote one.
+fn history_account(root: &Path, id: &str) -> Option<serde_json::Value> {
+    let suffix = format!("-{id}.json");
+    fs::read_dir(root.join("records"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("history-") && name.ends_with(&suffix))
+        .map(|name| {
+            serde_json::from_slice(&fs::read(root.join("records").join(name)).unwrap()).unwrap()
+        })
+}
+
+/// The history passes from run `id`'s on: while the last one stopped at
+/// its budget (a loaded host), the next run's pass goes on, as SPEC §9
+/// promises. Each pass's run and line, and the runs their accounts deleted
+/// in all.
+fn settled(dir: &Path, root: &Path, id: &str) -> (Vec<(String, String)>, u64) {
+    let mut passes = vec![(id.to_owned(), history_logged(root, id))];
+    while passes.last().unwrap().1.contains("stopped at its") {
+        assert!(passes.len() < 20, "{passes:?}");
+        let out = run(dir, &["run", "pass", "--local", "--json"]);
+        let next = receipt(&out)["id"].as_str().unwrap().to_owned();
+        let line = history_logged(root, &next);
+        passes.push((next, line));
+    }
+    let deleted = passes
+        .iter()
+        .filter_map(|(id, _)| history_account(root, id))
+        .map(|account| account["deleted"].as_u64().unwrap())
+        .sum();
+    (passes, deleted)
+}
+
+/// How many entries a pass's line says it read.
+fn read_of(line: &str) -> u64 {
+    let (_, after) = line.split_once("read ").unwrap();
+    after.split(',').next().unwrap().parse().unwrap()
+}
+
+/// A pid that was a process of this test and is gone.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// SPEC §12 item 22: with `delete_run_history_after_days = 1`, a run deletes,
+/// after its record is final, the history of a final run from two days ago
+/// and of a two-day-old reservation whose supervisor is gone (reconciled
+/// first), and keeps an hour-old run and a live supervisor's reservation.
+/// Its recipe starts with nothing deleted. Retirement records, an earlier
+/// pass's account and a crashed write's temporary file age on the same
+/// rule; seats, `store/` and the caller's receipts stay.
+#[test]
+fn run_history_older_than_its_days_is_deleted_after_the_record_is_final() {
+    let dir = fixture();
+    let root = local_root(dir.path());
+    let first = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(first.status.code(), Some(0), "{}", receipt(&first));
+    let first_id = receipt(&first)["id"].as_str().unwrap().to_owned();
+    let none = serde_json::json!({});
+    let old = plant(&root, "old-final", 2 * DAY_MS, false, &none);
+    let recent = plant(&root, "recent-final", 3_600_000, false, &none);
+    let live = plant(
+        &root,
+        "old-live",
+        2 * DAY_MS,
+        true,
+        &serde_json::json!({"supervisor": {"pid": std::process::id(), "start": null}}),
+    );
+    let lost = plant(
+        &root,
+        "old-lost",
+        2 * DAY_MS,
+        true,
+        &serde_json::json!({
+            "supervisor": {"pid": dead_pid(), "start": 1},
+            "boot_id": "another-boot",
+        }),
+    );
+    // A crashed finalize: final record and reservation both; deleting the
+    // run deletes both, so no reconcile brings it back as lost.
+    let both = plant(&root, "old-both", 2 * DAY_MS, false, &none);
+    let final_record = root.join("records/old-both.json");
+    let reserved_copy = root.join("records/old-both.reserved.json");
+    fs::copy(&final_record, &reserved_copy).unwrap();
+    let records = root.join("records");
+    let then = plant_other_records(&records);
+    // The recipe proves nothing was deleted before it started.
+    fs::write(
+        dir.path().join("ferry.toml"),
+        format!(
+            "version=1\n[recipe.check]\ncommand=['sh','-c','test -e {}']\nroutable=true\n",
+            old.join("output.log").display()
+        ),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "a recipe that sees the old run"],
+    );
+    with_host_policy(dir.path(), HISTORY_DAY);
+    let out = run(dir.path(), &["run", "check", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let (passes, deleted) = settled(dir.path(), &root, &id);
+    let logged = format!("{passes:?}");
+    assert_eq!(deleted, 3, "{logged}");
+    for gone in [&old, &lost, &both] {
+        assert!(!gone.exists(), "{logged}: {}", gone.display());
+    }
+    for name in [
+        "old-final.json",
+        "old-lost.json",
+        "old-lost.reserved.json",
+        "old-both.json",
+        "old-both.reserved.json",
+        "retired-oldkey.json",
+        ".old-final.json.1.0.tmp",
+        &format!("history-{then}-earlier.json"),
+    ] {
+        assert!(!records.join(name).exists(), "{logged}: {name}");
+    }
+    for kept in [&recent, &live] {
+        assert!(
+            kept.join("output.log").exists(),
+            "{logged}: {}",
+            kept.display()
+        );
+    }
+    for name in [
+        "recent-final.json",
+        "old-live.reserved.json",
+        "retired-newkey.json",
+        "retired-ageless.json",
+        ".recent-final.json.1.0.tmp",
+    ] {
+        assert!(records.join(name).exists(), "{logged}: {name}");
+    }
+    let (by, account) = passes
+        .iter()
+        .find_map(|(id, _)| Some((id, history_account(&root, id)?)))
+        .expect("no account");
+    assert_eq!(account["older_than_days"], 1, "{account}");
+    assert_eq!(account["run"], by.as_str(), "{account}");
+    assert_eq!(host_record_at(&root, &id)["state"], "final");
+    assert!(fs::read_dir(root.join("seats")).unwrap().next().is_some());
+    assert!(root.join("store").exists());
+    assert!(
+        dir.path()
+            .join(format!(".ferry/receipts/{first_id}.json"))
+            .exists()
+    );
+    assert_eq!(host_record_at(&root, &first_id)["state"], "final");
+}
+
+/// Plants the records of `records/` that are not a run's, for item 22: a
+/// two-day-old and a fresh retirement record, one without `retired_ms`, a
+/// two-day-old pass's account, and a two-day-old and a fresh temporary file
+/// of a crashed write. Returns the old ones' time.
+fn plant_other_records(records: &Path) -> u128 {
+    let then = now_ms() - 2 * DAY_MS;
+    fs::write(
+        records.join("retired-oldkey.json"),
+        serde_json::json!({"key": "oldkey", "retired_ms": then}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        records.join("retired-newkey.json"),
+        serde_json::json!({"key": "newkey", "retired_ms": now_ms()}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        records.join("retired-ageless.json"),
+        serde_json::json!({"key": "ageless"}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        records.join(format!("history-{then}-earlier.json")),
+        serde_json::json!({"ms": then, "run": "earlier", "deleted": 1, "older_than_days": 1})
+            .to_string(),
+    )
+    .unwrap();
+    let crashed = records.join(".old-final.json.1.0.tmp");
+    fs::write(&crashed, "half a record").unwrap();
+    age_file(&crashed, 2 * DAY_MS);
+    let fresh_tmp = records.join(".recent-final.json.1.0.tmp");
+    fs::write(&fresh_tmp, "half a record").unwrap();
+    then
+}
+
+fn host_record_at(root: &Path, id: &str) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(root.join(format!("records/{id}.json"))).unwrap()).unwrap()
+}
+
+/// SPEC §12 item 22: without the key nothing is deleted; `0` or `1.5`
+/// refuses the run as a bad `host.toml`, naming the key.
+#[test]
+fn delete_run_history_after_days_is_whole_days_from_one_and_absent_keeps_all() {
+    for (days, refused) in [(None, false), (Some("0"), true), (Some("1.5"), true)] {
+        let dir = fixture();
+        let root = local_root(dir.path());
+        assert_eq!(
+            run(dir.path(), &["run", "pass", "--local", "--json"])
+                .status
+                .code(),
+            Some(0)
+        );
+        let old = plant(
+            &root,
+            "old-final",
+            2 * DAY_MS,
+            false,
+            &serde_json::json!({}),
+        );
+        let mut policy = "version = 1\nmin_free_bytes = 1\n".to_owned();
+        if let Some(days) = days {
+            writeln!(policy, "delete_run_history_after_days = {days}").unwrap();
+        }
+        with_host_policy(dir.path(), &policy);
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        let record = receipt(&out);
+        if refused {
+            assert_eq!(out.status.code(), Some(125), "{days:?}: {record}");
+            assert!(
+                record["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("delete_run_history_after_days"),
+                "{days:?}: {record}"
+            );
+        } else {
+            assert_eq!(out.status.code(), Some(0), "{record}");
+        }
+        supervisor_exited(&root, record["id"].as_str().unwrap());
+        assert!(old.join("output.log").exists(), "{days:?}");
+        assert!(root.join("records/old-final.json").exists(), "{days:?}");
+    }
+}
+
+/// This process's start time as the place records it on Linux (clock ticks
+/// since boot); `None` elsewhere.
+fn own_start() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// SPEC §12 item 22: an old final run whose recorded survivor is still
+/// alive is kept, with or without a recorded start (the start only where
+/// the test can read it: Linux); one whose pid lives with another start,
+/// whose survivor is gone, or whose survivors are `unknown` is deleted.
+#[test]
+fn an_old_run_with_a_live_survivor_is_kept() {
+    let dir = fixture();
+    let root = local_root(dir.path());
+    assert_eq!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let me = std::process::id();
+    let survivors = |list: serde_json::Value| serde_json::json!({"custody": {"survivors": list}});
+    let mut kept = vec![plant(
+        &root,
+        "live-no-start",
+        2 * DAY_MS,
+        false,
+        &survivors(serde_json::json!([{"pid": me}])),
+    )];
+    if let Some(start) = own_start() {
+        kept.push(plant(
+            &root,
+            "live-start",
+            2 * DAY_MS,
+            false,
+            &survivors(serde_json::json!([{"pid": me, "start": start}])),
+        ));
+    }
+    let deleted = [
+        plant(
+            &root,
+            "pid-reused",
+            2 * DAY_MS,
+            false,
+            &survivors(serde_json::json!([{"pid": me, "start": 1}])),
+        ),
+        plant(
+            &root,
+            "survivor-gone",
+            2 * DAY_MS,
+            false,
+            &survivors(serde_json::json!([{"pid": dead_pid(), "start": null}])),
+        ),
+        plant(
+            &root,
+            "survivors-unknown",
+            2 * DAY_MS,
+            false,
+            &survivors(serde_json::json!("unknown")),
+        ),
+    ];
+    with_host_policy(dir.path(), HISTORY_DAY);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let (passes, count) = settled(dir.path(), &root, &id);
+    let line = &passes.last().unwrap().1;
+    assert!(
+        line.contains(&format!("kept {} with a live survivor", kept.len())),
+        "{passes:?}"
+    );
+    for folder in &kept {
+        assert!(folder.exists(), "{line}: {}", folder.display());
+    }
+    for folder in &deleted {
+        assert!(!folder.exists(), "{line}: {}", folder.display());
+    }
+    assert_eq!(count, 3, "{passes:?}");
+}
+
+/// SPEC §12 item 22: the pass holds a shared host lease: held mid-delete, an
+/// exclusive run submitted then does not start its recipe until the pass
+/// has released it; with an exclusive run holding `host`, the pass is
+/// skipped and deletes nothing.
+#[test]
+fn the_history_pass_never_runs_beside_an_exclusive_run() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let root = local_root(dir.path());
+    let marked = dir.path().join("marked");
+    fs::write(
+        dir.path().join("ferry.toml"),
+        format!(
+            "version=1\n[recipe.pass]\ncommand=['sh','-c','echo committed']\nroutable=true\n[recipe.mark]\ncommand=['sh','-c','touch {}']\nroutable=true\n",
+            marked.display()
+        ),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "a recipe that marks its start"],
+    );
+    assert_eq!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .code(),
+        Some(0)
+    );
+    // Name order is the reverse of age order (as listed on APFS), so only
+    // the pass's own order deletes the older first.
+    let first = plant(&root, "900-old", 3 * DAY_MS, false, &serde_json::json!({}));
+    let second = plant(&root, "1000-old", 2 * DAY_MS, false, &serde_json::json!({}));
+    with_host_policy(dir.path(), HISTORY_DAY);
+    let out = command(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .env("FERRY_FAIL_AT", "history-pause")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let pause = root.join("runs").join(&id).join("history");
+    let until = common::startup_deadline();
+    while !pause.with_extension("paused").exists() {
+        assert!(std::time::Instant::now() < until, "the pass never paused");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!first.exists() && second.exists(), "oldest first");
+    let exclusive = command(dir.path())
+        .args([
+            "run",
+            "mark",
+            "--local",
+            "--json",
+            "--exclusive",
+            "--seat",
+            "other",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let guard = OwnedPid(i32::try_from(exclusive.id()).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        !marked.exists(),
+        "an exclusive recipe started beside the pass"
+    );
+    fs::write(pause.with_extension("go"), "").unwrap();
+    let ended = exclusive.wait_with_output().unwrap();
+    drop(guard);
+    assert_eq!(ended.status.code(), Some(0), "{}", receipt(&ended));
+    assert!(marked.exists());
+    let line = history_logged(&root, &id);
+    assert!(line.contains("deleted 1 runs"), "{line}");
+
+    // An exclusive run holding `host`, or waiting at the gate: skipped.
+    // (The exclusive run's own pass deleted the second old run.)
+    for lock in ["host", "host.gate"] {
+        let third = plant(
+            &root,
+            "old-three",
+            2 * DAY_MS,
+            false,
+            &serde_json::json!({}),
+        );
+        let out = command(dir.path())
+            .args(["run", "pass", "--local", "--json"])
+            .env("FERRY_FAIL_AT", "history-start")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+        let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+        let start = root.join("runs").join(&id).join("history-start");
+        while !start.with_extension("paused").exists() {
+            assert!(std::time::Instant::now() < until, "the pass never paused");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let held = fs::File::open(root.join("locks").join(lock)).unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        fs::write(start.with_extension("go"), "").unwrap();
+        let line = history_logged(&root, &id);
+        assert!(line.contains("skipped: an exclusive run"), "{lock}: {line}");
+        assert!(third.join("output.log").exists(), "{lock}: {line}");
+        drop(held);
+    }
+}
+
+/// SPEC §9: the pass stops starting work at its budget, and the rest waits
+/// for the next run: with no budget a run deletes nothing and says so; the
+/// next, with its own, deletes every old run.
+#[test]
+fn a_history_pass_past_its_budget_leaves_the_rest_for_the_next_run() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let root = local_root(dir.path());
+    assert_eq!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let old: Vec<_> = (0..20)
+        .map(|n| {
+            plant(
+                &root,
+                &format!("{n}-old"),
+                2 * DAY_MS,
+                false,
+                &serde_json::json!({}),
+            )
+        })
+        .collect();
+    with_host_policy(dir.path(), HISTORY_DAY);
+    let out = command(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .env("FERRY_HISTORY_BUDGET_MS", "0")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let line = history_logged(&root, &id);
+    assert!(
+        line.contains("deleted 0 runs") && line.contains("budget"),
+        "{line}"
+    );
+    // Nothing started past the budget: not even a read.
+    assert!(line.contains("read 0,"), "{line}");
+    assert!(old.iter().all(|folder| folder.exists()), "{line}");
+    assert!(history_account(&root, &id).is_none(), "{line}");
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let (passes, deleted) = settled(dir.path(), &root, &id);
+    assert_eq!(deleted, 20, "{passes:?}");
+    assert!(old.iter().all(|folder| !folder.exists()), "{passes:?}");
+}
+
+/// SPEC §12 item 22: with the deletion injected to fail after a run's
+/// folder, that run's record stays and the count leaves it out (other old
+/// records still go); the run's own record is unchanged, and the next pass
+/// deletes the record and counts the run.
+#[test]
+fn a_run_whose_record_failed_to_delete_is_deleted_by_the_next_pass() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let root = local_root(dir.path());
+    assert_eq!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let old = plant(
+        &root,
+        "old-final",
+        2 * DAY_MS,
+        false,
+        &serde_json::json!({}),
+    );
+    fs::write(
+        root.join("records/retired-oldkey.json"),
+        serde_json::json!({"key": "oldkey", "retired_ms": now_ms() - 2 * DAY_MS}).to_string(),
+    )
+    .unwrap();
+    with_host_policy(dir.path(), HISTORY_DAY);
+    let out = command(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .env("FERRY_FAIL_AT", "history-record")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let own = host_record_at(&root, &id);
+    let line = history_logged(&root, &id);
+    assert!(line.contains("history-record"), "{line}");
+    assert!(!old.exists(), "{line}");
+    assert!(root.join("records/old-final.json").exists(), "{line}");
+    assert!(!root.join("records/retired-oldkey.json").exists(), "{line}");
+    assert_eq!(history_account(&root, &id).unwrap()["deleted"], 0);
+    assert_eq!(host_record_at(&root, &id), own);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let (passes, deleted) = settled(dir.path(), &root, &id);
+    assert!(!root.join("records/old-final.json").exists(), "{passes:?}");
+    assert_eq!(deleted, 1, "{passes:?}");
+
+    // A stale reservation beside the final record, with the injection
+    // between the reservation and the record: the final record stays, as
+    // it was, and nothing reconciles it as lost.
+    plant(&root, "old-both", 2 * DAY_MS, false, &serde_json::json!({}));
+    let final_record = root.join("records/old-both.json");
+    let planted = fs::read(&final_record).unwrap();
+    fs::copy(&final_record, root.join("records/old-both.reserved.json")).unwrap();
+    let out = command(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .env("FERRY_FAIL_AT", "history-final")
+        .output()
+        .unwrap();
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let line = history_logged(&root, &id);
+    assert!(line.contains("history-final"), "{line}");
+    assert!(
+        !root.join("records/old-both.reserved.json").exists(),
+        "{line}"
+    );
+    assert_eq!(fs::read(&final_record).unwrap(), planted, "{line}");
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let (passes, deleted) = settled(dir.path(), &root, &id);
+    assert!(!final_record.exists(), "{passes:?}");
+    assert_eq!(deleted, 1, "{passes:?}");
+}
+
+/// SPEC §12 item 22, progress: a pass never reads a run named under 23
+/// hours old (at one day), so many young runs and many young or timeless
+/// retirement records never keep the first pass from a two-day-old run or
+/// from a crashed write's temporary file, deleted by its age unread.
+#[test]
+fn a_history_pass_reads_no_young_run_and_reaches_the_old_ones() {
+    let dir = fixture();
+    let root = local_root(dir.path());
+    assert_eq!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let none = serde_json::json!({});
+    let old = plant(
+        &root,
+        &format!("{}-old", now_ms() - 2 * DAY_MS),
+        2 * DAY_MS,
+        false,
+        &none,
+    );
+    for n in 0..30 {
+        let young = 22 * 3_600_000;
+        plant(
+            &root,
+            &format!("{}-young{n}", now_ms() - young),
+            young,
+            false,
+            &none,
+        );
+    }
+    let records = root.join("records");
+    for n in 0..30 {
+        fs::write(
+            records.join(format!("retired-young{n}.json")),
+            serde_json::json!({"retired_ms": now_ms()}).to_string(),
+        )
+        .unwrap();
+    }
+    for n in 0..10 {
+        fs::write(records.join(format!("retired-ageless{n}.json")), "{}").unwrap();
+    }
+    let crashed = records.join(".x.json.1.0.tmp");
+    fs::write(&crashed, "not json").unwrap();
+    age_file(&crashed, 2 * DAY_MS);
+    with_host_policy(dir.path(), HISTORY_DAY);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let (passes, deleted) = settled(dir.path(), &root, &id);
+    // At most the old run and the forty retirement records; no young run,
+    // whichever pass, so a pass's budget goes to the old ones.
+    assert!(
+        passes.iter().all(|(_, line)| read_of(line) <= 41),
+        "{passes:?}"
+    );
+    if passes.len() == 1 {
+        assert_eq!(read_of(&passes[0].1), 41, "{passes:?}");
+    }
+    assert_eq!(deleted, 1, "{passes:?}");
+    assert!(!old.exists() && !crashed.exists(), "{passes:?}");
+}
+
+/// SPEC §12 item 22: `ferry record` and `ferry follow` on a run whose
+/// history was deleted name the setting, as context.
+#[test]
+fn a_deleted_runs_record_names_how_long_the_host_keeps_history() {
+    let dir = fixture();
+    let root = local_root(dir.path());
+    with_host_policy(dir.path(), HISTORY_DAY);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let real = receipt(&out)["id"].as_str().unwrap().to_owned();
+    supervisor_exited(&root, &real);
+    // The same run as if submitted two days ago (its id carries its submit
+    // time), by a caller that lost its end: its receipt stays submitted.
+    let then = now_ms() - 2 * DAY_MS;
+    let id = format!("{then}-{}", real.split_once('-').unwrap().1);
+    let mut mine: serde_json::Value = serde_json::from_slice(
+        &fs::read(dir.path().join(format!(".ferry/receipts/{real}.json"))).unwrap(),
+    )
+    .unwrap();
+    mine["id"] = id.as_str().into();
+    mine["state"] = "submitted".into();
+    fs::write(
+        dir.path().join(format!(".ferry/receipts/{id}.json")),
+        mine.to_string(),
+    )
+    .unwrap();
+    let path = root.join(format!("records/{id}.json"));
+    let mut record = host_record_at(&root, &real);
+    record["id"] = id.as_str().into();
+    record["submitted_ms"] = serde_json::json!(then);
+    fs::write(&path, record.to_string()).unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let later = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let (passes, _) = settled(dir.path(), &root, &later);
+    assert!(!path.exists(), "{passes:?}");
+    let said = "not found (this host keeps run history for 1 days)";
+    let out = run(dir.path(), &["record", &id]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(said), "{stderr}");
+    let out = run(dir.path(), &["follow", &id]);
+    let both = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(both.contains(said), "{both}");
+}

@@ -746,7 +746,7 @@ fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Fo
         };
         match status.code() {
             Some(0) => return Ok(Followed::Final),
-            Some(4) => return Err(format!("the place has no run {}", record.id).into()),
+            Some(4) => return Err(no_run(place, &record.id).into()),
             _ => {}
         }
         // Contact is output received, or a follow that stayed connected; a
@@ -760,6 +760,22 @@ fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Fo
         }
         thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// The place has no run `id`, with the context its record verb gives (how
+/// long it keeps run history): a follow's own stderr is not read.
+fn no_run(place: &Place, id: &str) -> String {
+    let said = place
+        .verb(&["record", id])
+        .and_then(|mut verb| answered(&mut verb))
+        .ok()
+        .filter(|(status, _, _)| status.code() == Some(4))
+        .map(|(_, _, err)| String::from_utf8_lossy(&err).trim().to_owned())
+        .filter(|said| !said.is_empty());
+    match said {
+        Some(said) => format!("the place has no run {id}: {said}"),
+        None => format!("the place has no run {id}"),
     }
 }
 
