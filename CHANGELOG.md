@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.1 - 2026-10-19
+
 - **Seats no longer pile up.** `ferry seats prune --idle <dur>` also
   retires this caller's seats unused for that long, and `ferry run --once`
   retires its seat once the run's record is final. With
