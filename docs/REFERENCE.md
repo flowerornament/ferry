@@ -418,11 +418,16 @@ with the supervisor: an exclusive run whose supervisor is killed no longer
 keeps other seats out (SPEC §11). Release closes descriptors, never
 `LOCK_UN`.
 
-**A killed supervisor's run still ends on time.** The session owner keeps
-its own watch: 1 s after the run's timeout or deadline, whichever is first,
-it stops its session as the supervisor would (TERM, 10 s, KILL), sparing
-only itself, and writes no result. With a live supervisor, the
-supervisor's stop comes first. The record reconciles to `lost`. No marker
+**A killed supervisor's run still ends on time.** The session owner bounds
+its session itself. Its watch fires 1 s after the run's timeout or
+deadline, whichever is first; and once its supervisor is gone after the
+recipe has ended, it stops the session then, as the supervisor would have.
+Either way it stops it like the supervisor (TERM, 10 s, KILL), sparing only
+itself, and the watch writes no result. When the session cannot be listed,
+it signals the hook or recipe it is running instead. Its timeout counts
+from its own start, after the locks, so with a live supervisor the
+supervisor's stop normally comes first. An owner that is itself killed
+leaves its session unbounded. The record reconciles to `lost`. No marker
 pass runs without the supervisor, so `ferry status` lists what the stop
 leaves.
 

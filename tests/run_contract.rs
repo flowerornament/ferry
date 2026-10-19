@@ -587,34 +587,59 @@ fn caller_environment_is_declared_forwarded_and_recorded() {
     );
 }
 
-/// ferry-8d6 (PRINCIPLES 2): with its supervisor killed (`SIGKILL`), the session
-/// owner itself stops the session at the run's end: the recipe and the
-/// process it started are gone soon after the timeout, not when they exit.
-#[test]
-fn a_killed_supervisor_s_session_is_stopped_at_its_timeout() {
+/// A member of a session whose owner may be gone, killed when the control
+/// ends while it is still in that session.
+struct OwnedMember {
+    pid: i32,
+    session: i32,
+}
+impl Drop for OwnedMember {
+    fn drop(&mut self) {
+        if getsid(Some(Pid::from_raw(self.pid))).is_ok_and(|sid| sid.as_raw() == self.session) {
+            let _ = kill(Pid::from_raw(self.pid), Signal::SIGKILL);
+        }
+    }
+}
+
+/// An unsupervised session (ferry-8d6): runs `pass` locally with `script`
+/// as its `sh -c` recipe, which must write its pid to `$DIR/recipe`, waits
+/// for that, then SIGKILLs the run's supervisor. Returns the run id, the
+/// owner's pid (the session's id) and the guards on the recipe and caller.
+fn unsupervised(
+    dir: &Path,
+    script: &str,
+    fail_at: &str,
+    timeout: &str,
+) -> (String, i32, i32, OwnedMember, OwnedCaller) {
     use std::{
         thread,
         time::{Duration, Instant},
     };
-    let dir = fixture();
-    let marker = dir.path().join("recipe-started");
-    let member = dir.path().join("member");
+    let marker = dir.join("recipe");
     fs::write(
-        dir.path().join("ferry.toml"),
+        dir.join("ferry.toml"),
         format!(
-            "version=1\n[recipe.pass]\ncommand=['sh','-c','sleep 600 & echo $! > {}; echo $$ > {}.tmp; mv {}.tmp {}; wait']\n",
-            member.display(), marker.display(), marker.display(), marker.display()
+            "version=1\n[recipe.pass]\ncommand=['sh','-c','{}']\n",
+            script.replace("$DIR", &dir.display().to_string())
         ),
     )
     .unwrap();
-    git(dir.path(), &["add", "ferry.toml"]);
-    git(dir.path(), &["commit", "-m", "unbounded recipe"]);
-    let caller_output = dir.path().join("caller-stdout");
+    git(dir, &["add", "ferry.toml"]);
+    git(dir, &["commit", "-m", "unsupervised recipe"]);
+    let caller_output = dir.join("caller-stdout");
     let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env("XDG_STATE_HOME", dir.path().join("state"))
-        .args(["run", "pass", "--local", "--json", "--timeout-seconds", "4"])
+        .current_dir(dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("FERRY_FAIL_AT", fail_at)
+        .args([
+            "run",
+            "pass",
+            "--local",
+            "--json",
+            "--timeout-seconds",
+            timeout,
+        ])
         .stdout(fs::File::create(&caller_output).unwrap())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -628,45 +653,178 @@ fn a_killed_supervisor_s_session_is_stopped_at_its_timeout() {
         assert!(Instant::now() < deadline, "recipe did not start");
         thread::sleep(Duration::from_millis(10));
     }
-    let started = Instant::now();
     let recipe: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
-    let sleeper: i32 = fs::read_to_string(&member).unwrap().trim().parse().unwrap();
-    let group = OwnedGroup(getsid(Some(Pid::from_raw(recipe))).unwrap().as_raw());
+    let owner = getsid(Some(Pid::from_raw(recipe))).unwrap().as_raw();
+    let guard = OwnedMember {
+        pid: recipe,
+        session: owner,
+    };
     let submitted = fs::read_to_string(&caller_output)
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|event| event["event"] == "submitted")
         .expect("the caller prints its submitted event");
-    let supervisor = submitted["pid"].as_i64().unwrap();
-    let id = submitted["id"].as_str().unwrap().to_owned();
-    // The session's id is its owner's pid.
-    let owner = group.0;
-    kill(
-        Pid::from_raw(i32::try_from(supervisor).unwrap()),
-        Signal::SIGKILL,
-    )
-    .unwrap();
+    let supervisor = i32::try_from(submitted["pid"].as_i64().unwrap()).unwrap();
+    kill(Pid::from_raw(supervisor), Signal::SIGKILL).unwrap();
     caller.child.as_mut().unwrap().wait().unwrap();
-    // Each is reaped at once: `sh` by the owner, `sleep` once orphaned.
-    let alive = |pid: i32| kill(Pid::from_raw(pid), None).is_ok();
+    let id = submitted["id"].as_str().unwrap().to_owned();
+    (id, owner, recipe, guard, caller)
+}
+
+fn alive(pid: i32) -> bool {
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+/// Waits for every pid to be gone, within `bound` from `since`.
+fn gone_within(pids: &[i32], since: std::time::Instant, bound: std::time::Duration, what: &str) {
+    while pids.iter().any(|pid| alive(*pid)) {
+        assert!(since.elapsed() < bound, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// ferry-8d6 (PRINCIPLES 2): with its supervisor killed (`SIGKILL`), the
+/// session owner itself stops the session at the run's end: the recipe, the
+/// process it started and the owner are gone soon after the timeout, not
+/// when they exit, and the record reconciles to lost.
+#[test]
+fn a_killed_supervisor_s_session_is_stopped_at_its_timeout() {
+    let dir = fixture();
+    let started = std::time::Instant::now();
+    let (id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; wait",
+        "",
+        "4",
+    );
+    let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _sleeper = OwnedMember {
+        pid: sleeper,
+        session: owner,
+    };
     assert!(
         alive(recipe) && alive(sleeper),
         "the session ended before its timeout"
     );
-    // The timeout and the owner's lag, then TERM: `sh` and `sleep` leave
-    // at once, and the owner, its supervisor gone, after them.
-    while alive(recipe) || alive(sleeper) || alive(owner) {
-        assert!(
-            started.elapsed() < Duration::from_secs(12),
-            "the session outlived its timeout without its supervisor"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    // The timeout and the owner's lag, then TERM.
+    gone_within(
+        &[recipe, sleeper, owner],
+        started,
+        std::time::Duration::from_secs(14),
+        "the session outlived its timeout without its supervisor",
+    );
     let out = run(dir.path(), &["record", &id]);
     let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(record["outcome"], "lost", "{record}");
-    drop(group);
+    drop(guard);
+}
+
+/// ferry-8d6 (murail-4a R1): a recipe that ends with its supervisor already
+/// killed leaves a process it started; the owner stops its session then,
+/// as the supervisor would have, not at the timeout and not never.
+#[test]
+fn an_unsupervised_recipes_leftover_is_stopped_at_its_end() {
+    let dir = fixture();
+    let release = dir.path().join("release");
+    let (id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while test ! -e $DIR/release; do sleep 0.1; done",
+        "",
+        "600",
+    );
+    let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _sleeper = OwnedMember {
+        pid: sleeper,
+        session: owner,
+    };
+    fs::write(&release, "end").unwrap();
+    gone_within(
+        &[recipe, sleeper, owner],
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(8),
+        "the recipe's leftover outlived its end without a supervisor",
+    );
+    let out = run(dir.path(), &["record", &id]);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["outcome"], "lost", "{record}");
+    drop(guard);
+}
+
+/// ferry-8d6 (murail-4a R3): with every session listing failing
+/// (`session-list`), the owner still ends its session's stage: it signals
+/// the running stage itself, so the recipe is gone after the timeout and
+/// the owner exits.
+#[test]
+fn an_unlistable_session_still_ends_at_its_timeout() {
+    let dir = fixture();
+    let started = std::time::Instant::now();
+    let (_id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "trap \"\" TERM; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
+        "session-list",
+        "3",
+    );
+    // TERM is ignored: only the KILL after the grace ends it.
+    gone_within(
+        &[recipe, owner],
+        started,
+        std::time::Duration::from_secs(25),
+        "an unlistable session outlived its bound",
+    );
+    drop(guard);
+}
+
+/// ferry-8d6 (herald-1b): the owner's stop keeps its TERM grace through a
+/// listing that fails (`owner-list`, once): only a session seen empty ends
+/// it early, so a member that ignores TERM is killed only after
+/// `STOP_GRACE`.
+#[test]
+fn a_failed_listing_does_not_cut_the_owners_term_grace() {
+    let dir = fixture();
+    let termed = dir.path().join("termed");
+    let (_id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "trap \"touch $DIR/termed\" TERM; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
+        "owner-list",
+        "2",
+    );
+    let started = std::time::Instant::now();
+    while !termed.exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the owner never sent TERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let term = std::time::Instant::now();
+    gone_within(
+        &[recipe],
+        term,
+        std::time::Duration::from_secs(20),
+        "the recipe outlived the owner's KILL",
+    );
+    // STOP_GRACE is 10 s; polling slack only shortens what is seen.
+    assert!(
+        term.elapsed() >= std::time::Duration::from_secs(9),
+        "KILL came {:?} after TERM, before the grace",
+        term.elapsed()
+    );
+    gone_within(
+        &[owner],
+        term,
+        std::time::Duration::from_secs(25),
+        "the owner stayed",
+    );
+    drop(guard);
 }
 
 #[test]

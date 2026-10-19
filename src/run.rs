@@ -4,7 +4,7 @@
 use crate::{
     execution::{Request, fail_at, pause_at, signal_name, validate},
     limits::{COLLECT_TIMEOUT, KILL_GRACE, STOP_GRACE},
-    receipt, repository,
+    receipt,
 };
 use nix::{
     sys::signal::{Signal, kill},
@@ -187,8 +187,11 @@ fn session_list(sid: u32) -> Result<Vec<i32>> {
     Ok(process_ids()?
         .into_iter()
         .filter(|pid| {
-            getsid(Some(Pid::from_raw(*pid)))
-                .is_ok_and(|session| u32::try_from(session.as_raw()).ok() == Some(sid))
+            // pid 0 is never a member: `getsid(0)` asks about the caller,
+            // and `kill(0)` signals the caller's own group.
+            *pid > 0
+                && getsid(Some(Pid::from_raw(*pid)))
+                    .is_ok_and(|session| u32::try_from(session.as_raw()).ok() == Some(sid))
                 && !zombie(*pid)
         })
         .collect())
@@ -722,8 +725,10 @@ fn owner_error(result: &Path) -> Option<String> {
 
 /// The session owner (SPEC §5): runs the hooks and the recipe in a session
 /// of its own, writes the recipe's result, and stays until its supervisor
-/// is gone. Its own watch stops the session at `deadline_ms` or the
-/// timeout, so a killed supervisor leaves no recipe unbounded.
+/// is gone. It bounds its session itself, so a killed supervisor leaves
+/// nothing unbounded: its watch stops the session at the timeout or
+/// deadline, and an owner whose supervisor is gone once the recipe has
+/// ended stops it then, as the supervisor would have.
 pub fn execute_session(spec: &Path, result: &Path, deadline_ms: u128) -> Result<()> {
     let supervisor = nix::unistd::getppid();
     setsid()?;
@@ -735,9 +740,12 @@ pub fn execute_session(spec: &Path, result: &Path, deadline_ms: u128) -> Result<
     let watching = thread::spawn(move || watch(deadline_ms, timeout));
     let ran = dispatch(spec, result, &request);
     // The first of the two wins: the recipe's end or the watch's.
-    let expired = WATCH
-        .compare_exchange(RUNNING, DISPATCHED, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err();
+    let expired = {
+        let _stage = stage();
+        WATCH
+            .compare_exchange(RUNNING, DISPATCHED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    };
     DONE.store(true, Ordering::SeqCst);
     // Whatever ended the recipe after the end, the end came first: the
     // supervisor records the timeout, or the run reconciles to lost. A
@@ -745,22 +753,38 @@ pub fn execute_session(spec: &Path, result: &Path, deadline_ms: u128) -> Result<
     // stop is seen through, while this leader still pins the session id.
     if expired {
         let _ = watching.join();
-    } else {
-        let code = ran?;
+    } else if let Err(error) = ran.and_then(|code| {
         let tmp = result.with_extension("tmp");
         fs::write(&tmp, serde_json::to_vec(&code)?)?;
-        fs::rename(tmp, result)?;
+        Ok(fs::rename(tmp, result)?)
+    }) {
+        // Its supervisor reads the error once this leader exits, and stops
+        // the session then; without one, the owner stops it first.
+        if nix::unistd::getppid() != supervisor {
+            stop_own_session();
+        }
+        return Err(error);
     }
-    // Retain the leader for supervised cleanup, but not forever after supervisor death.
-    // Direct parent identity cannot recycle without the kernel reparenting this process.
+    stop_unsupervised(supervisor);
+    Ok(())
+}
+
+/// Retains the leader for its supervisor's stop, which ends this process;
+/// once the supervisor is gone without it (its parent changed: a direct
+/// parent's identity cannot recycle without the kernel reparenting this
+/// process), stops the session itself, as the supervisor would have.
+fn stop_unsupervised(supervisor: Pid) {
     while nix::unistd::getppid() == supervisor {
         thread::sleep(Duration::from_millis(100));
     }
-    Ok(())
+    if WATCH.load(Ordering::SeqCst) != EXPIRED {
+        stop_own_session();
+    }
 }
 
 /// The owner's two ends, decided once: the hooks and recipe returned
 /// (`DISPATCHED`) or the watch fired (`EXPIRED`), whichever came first.
+/// Both are decided under the stage lock, so no stage starts after expiry.
 static WATCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(RUNNING);
 const RUNNING: u8 = 0;
 const DISPATCHED: u8 = 1;
@@ -768,16 +792,83 @@ const EXPIRED: u8 = 2;
 /// Set once the hooks and recipe returned, whoever won.
 static DONE: AtomicBool = AtomicBool::new(false);
 
+/// The stage now running (a hook or the recipe), by its unreaped child:
+/// signalled under this lock only, so never by a pid already reaped and
+/// free for reuse.
+static STAGE: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+fn stage() -> std::sync::MutexGuard<'static, Option<std::process::Child>> {
+    STAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs one stage to its end: spawned under the stage lock unless the
+/// watch has fired, then reaped under it. `capture` collects stdout and
+/// stderr (read on threads, so a full pipe never stalls the stage).
+fn run_stage(
+    command: &mut Command,
+    capture: bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    if capture {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+    let (out, err) = {
+        let mut current = stage();
+        if WATCH.load(Ordering::SeqCst) == EXPIRED {
+            return Err("the session's end passed".into());
+        }
+        let mut child = command.spawn()?;
+        let read = |pipe: Option<Box<dyn Read + Send>>| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        };
+        let out = read(
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let err = read(
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        *current = Some(child);
+        (out, err)
+    };
+    let status = loop {
+        {
+            let mut current = stage();
+            if let Some(child) = current.as_mut()
+                && let Some(status) = child.try_wait()?
+            {
+                *current = None;
+                break status;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    Ok((
+        status,
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    ))
+}
+
 /// The owner's own bound (PRINCIPLES 2, SPEC §11): `OWNER_LAG` after the
-/// run's deadline (unix ms) or its timeout (from the owner's start,
-/// monotonic), it stops its session as the supervisor would, TERM, up to
-/// `STOP_GRACE`, then KILL, sparing only itself, which pins the session id.
-/// The lag leaves a live supervisor's own stop first, which also ends this
-/// owner; without a supervisor the watch is the run's only bound. It goes
-/// on killing whatever is spawned until the hooks and recipe return, then
-/// up to `KILL_GRACE` more, so no stage starts unbounded after it; a failed
-/// listing is retried, never read as an empty session. What it leaves has
-/// no record to go to: `ferry status` lists survivors.
+/// run's deadline (unix ms) or its timeout (from the owner's start, after
+/// the locks, monotonic), it stops the session. The lag lets a live
+/// supervisor's own stop, which also ends this owner, normally come first;
+/// if the owner is descheduled past it, the stops overlap and a member may
+/// get a second TERM, but no result is written either way. An owner that is
+/// itself killed leaves its session unbounded: the residue SPEC §11 accepts.
 fn watch(deadline_ms: u128, timeout: Option<Instant>) {
     let lag = crate::limits::OWNER_LAG;
     let deadline = deadline_ms.saturating_add(lag.as_millis());
@@ -788,12 +879,25 @@ fn watch(deadline_ms: u128, timeout: Option<Instant>) {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    if WATCH
-        .compare_exchange(RUNNING, EXPIRED, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
+    let won = {
+        let _stage = stage();
+        WATCH
+            .compare_exchange(RUNNING, EXPIRED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    };
+    if won {
+        stop_own_session();
     }
+}
+
+/// Stops the owner's session as the supervisor would (SPEC §7): TERM, up to
+/// `STOP_GRACE`, then KILL, sparing only the owner, which pins the session
+/// id. Only a listing seen empty ends the grace early. While the session
+/// cannot be listed, the running stage is signalled instead, so every
+/// stage returns; the KILLs go on until the stages have returned, then up
+/// to `KILL_GRACE` more. What it leaves has no record to go to: `ferry
+/// status` lists survivors.
+fn stop_own_session() {
     let me = std::process::id();
     let others = || {
         session_list(me).map(|members| {
@@ -803,25 +907,30 @@ fn watch(deadline_ms: u128, timeout: Option<Instant>) {
                 .collect::<Vec<_>>()
         })
     };
-    let send = |signal, members: &[i32]| {
-        for pid in members {
-            let _ = kill(Pid::from_raw(*pid), signal);
+    let send = |signal, listed: &Result<Vec<i32>>| match listed {
+        Ok(members) => {
+            for pid in members {
+                let _ = kill(Pid::from_raw(*pid), signal);
+            }
+        }
+        Err(_) => {
+            if let Some(child) = stage().as_ref() {
+                let _ = i32::try_from(child.id()).map(|pid| kill(Pid::from_raw(pid), signal));
+            }
         }
     };
-    if let Ok(members) = others() {
-        send(Signal::SIGTERM, &members);
-    }
-    // A listing that fails cannot confirm the others left: the grace runs.
+    send(Signal::SIGTERM, &others());
+    // `owner-list` fails the first listing of the grace, once.
     let until = Instant::now() + STOP_GRACE;
-    while Instant::now() < until && others().is_ok_and(|left| !left.is_empty()) {
+    while Instant::now() < until
+        && (owner_list_fails() || !others().is_ok_and(|left| left.is_empty()))
+    {
         thread::sleep(Duration::from_millis(20));
     }
     let mut returned: Option<Instant> = None;
     loop {
         let left = others();
-        if let Ok(members) = &left {
-            send(Signal::SIGKILL, members);
-        }
+        send(Signal::SIGKILL, &left);
         let empty = left.is_ok_and(|left| left.is_empty());
         if DONE.load(Ordering::SeqCst) {
             let since = *returned.get_or_insert_with(Instant::now);
@@ -835,13 +944,10 @@ fn watch(deadline_ms: u128, timeout: Option<Instant>) {
     }
 }
 
-/// No stage starts once the watch has fired; one that starts just before
-/// is killed by the watch, which runs until the stages return.
-fn unexpired() -> Result<()> {
-    if WATCH.load(Ordering::SeqCst) == EXPIRED {
-        return Err("the session's end passed".into());
-    }
-    Ok(())
+/// `owner-list`: the first listing of the owner's TERM grace fails, once.
+fn owner_list_fails() -> bool {
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    fail_at("owner-list") && !FIRED.swap(true, Ordering::SeqCst)
 }
 
 /// The hooks, then the recipe: its exit code.
@@ -876,15 +982,20 @@ fn dispatch(spec: &Path, result: &Path, request: &Request) -> Result<i32> {
         );
     }
     if let Some(prepare) = &request.hooks.prepare {
-        unexpired()?;
-        let status = Command::new(workdir.join(prepare)).envs(&env).status()?;
+        let (status, _, _) = run_stage(Command::new(workdir.join(prepare)).envs(&env), false)?;
         if !status.success() {
             return Err(format!("prepare hook failed: {status}").into());
         }
     }
     if let Some(hook) = &request.hooks.env {
-        unexpired()?;
-        let bytes = repository::output(Command::new(workdir.join(hook)).envs(&env))?;
+        let (status, bytes, stderr) = run_stage(Command::new(workdir.join(hook)).envs(&env), true)?;
+        if !status.success() {
+            return Err(format!(
+                "command failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )
+            .into());
+        }
         let additions: BTreeMap<String, String> = serde_json::from_slice(&bytes)?;
         if additions
             .iter()
@@ -898,12 +1009,13 @@ fn dispatch(spec: &Path, result: &Path, request: &Request) -> Result<i32> {
         result.with_extension("attempted"),
         b"recipe dispatch begins",
     )?;
-    unexpired()?;
-    let status = Command::new(&request.recipe.command[0])
-        .args(&request.recipe.command[1..])
-        .args(&request.args)
-        .envs(&env)
-        .status()?;
+    let (status, _, _) = run_stage(
+        Command::new(&request.recipe.command[0])
+            .args(&request.recipe.command[1..])
+            .args(&request.args)
+            .envs(&env),
+        false,
+    )?;
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))

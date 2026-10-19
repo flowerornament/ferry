@@ -7,8 +7,9 @@ All notable changes to `ferry` are documented in this file.
 - **A killed supervisor no longer leaves its recipe unbounded.** The session
   owner stops its own session 1 s after the run's timeout or deadline
   (TERM, 10 s, KILL), so a supervisor that is SIGKILLed or OOM-killed no
-  longer leaves the recipe running until it exits. The record still
-  reconciles to `lost`.
+  longer leaves the recipe running until it exits. A recipe that ends
+  after its supervisor was killed no longer leaves the processes it started
+  running either. The record still reconciles to `lost`.
 
 - **Fewer `unknown` survivors on busy Linux hosts.** The marker pass reads a
   process it could not read again every 100 ms for up to 1 s, instead of
