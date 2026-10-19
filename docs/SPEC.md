@@ -433,12 +433,19 @@ Nothing else is written; Ferry writes nowhere outside these.
   its own locks are released (in teardown, after a `--once` retire),
   deletes the history of final runs submitted more than `<n>` days ago (by
   the host record's own `submitted_ms`, on the host's clock). It lists
-  names only, then works oldest first by the time a name carries (a run id
-  starts with its submit time, an account with its `ms`; names that carry
-  none come first), so a large `records/` cannot spend the budget on reads
-  before anything is deleted. The name orders the work; whether an entry
-  is old is still decided by what it records. It never delays its own
-  recipe or its caller, and never counts against a run's timeout.
+  names only and works oldest first by the time a name carries (a run id
+  starts with its submit time, an account with its `ms`); it reads no run
+  or account whose name is less than `<n> - 1` days old, and names that
+  carry no time (retirement records, temporary files) come after the
+  rest. The name only orders and bounds the work; whether an entry is old
+  is decided by what it records. So entries kept for being young are
+  never read, and the work a pass repeats is what it must keep although
+  its name is old: live leftovers, live reservations, and runs from a
+  caller whose clock ran more than a day behind the host's. Those, and
+  listing the names, can still spend a pass's budget: that is a bound on
+  each pass, not a promise that every pass deletes something. It never
+  delays its own recipe or its caller, and never counts against a run's
+  timeout.
 - **Never under a timing run:** the pass first passes the host's gate and
   takes a fresh shared `host` lease the way a shared run does, by try,
   never waiting at either, held by the supervisor alone. If an exclusive
@@ -726,7 +733,11 @@ receipt is seeing this rule, not a bug.
     deleted and a newer one is kept. With the deletion injected to fail
     after the folder, the run's record is unchanged, the record that
     failed stays, the count leaves that run out, and the next pass deletes
-    it.
+    it. Progress: with a one-pass budget too small to read them all, a
+    host holding more young runs and young or timeless retirement records
+    than one pass can read, plus a crashed write's temporary file, still
+    has its two-day-old final run deleted by the first pass; the temporary
+    file is deleted by its age and never read as a record.
 23. **Prune without remembering:** with
     `delete_unused_checkouts_after_days = 1` on the caller, a run on a
     place holding this caller's seat unused for two days and one used an
