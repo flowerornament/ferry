@@ -81,6 +81,35 @@ pub fn boot_id() -> Option<String> {
 /// existing file: a synced temporary file is linked into place (link(2)
 /// fails if the name exists), then the directory is synced. `point` names
 /// the link step for fault injection, and enables the `fsync` point too.
+/// Writes `path` whole, replacing what is there: through a temporary file of
+/// its own (a unique name, created exclusively, so never one a link already
+/// holds), renamed over `path`, which replaces a link and never follows it.
+pub fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
+    static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().ok_or("record path has no directory")?;
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
 pub fn write_new(path: &Path, bytes: &[u8], point: Option<&str>) -> Result<()> {
     static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let injected = |at: &str| point.is_some() && crate::execution::fail_at(at);

@@ -763,15 +763,14 @@ pub fn retire_seat(root: &Path, key: &str, meant: &Meant) -> Result<serde_json::
     let retired = json!({"key": key, "bytes": bytes, "retired_ms": receipt::now_ms()});
     let path = root.join("records").join(format!("retired-{key}.json"));
     // The key's latest retire, replacing an earlier one whole: a key reused
-    // and retired again ages from this retire.
-    let written = if execution::fail_at("retire-record") {
+    // and retired again ages from this retire. A retire that found nothing
+    // to rename (a retry, an earlier retire's key) keeps the record it finds.
+    let written = if tombstone.is_none() && path.exists() {
+        Ok(())
+    } else if execution::fail_at("retire-record") {
         Err("retire-record: injected by FERRY_FAIL_AT".into())
     } else {
-        let tmp = path.with_extension("json.tmp");
-        fs::create_dir_all(root.join("records"))
-            .and_then(|()| fs::write(&tmp, retired.to_string()))
-            .and_then(|()| fs::rename(&tmp, &path))
-            .map_err(|e| e.to_string())
+        record::write_replacing(&path, retired.to_string().as_bytes()).map_err(|e| e.to_string())
     };
     // Not retired until recorded and deleted: the caller's book keeps the
     // seat, so its next prune comes back, finds the key gone and finishes.
@@ -796,12 +795,19 @@ pub fn retire_seat(root: &Path, key: &str, meant: &Meant) -> Result<serde_json::
     let mut said = json!({"retired": key, "bytes": bytes});
     // Only this key's tombstones, left by its own earlier retires: an
     // exclusive run arriving meanwhile waits for this seat's deletes only.
+    // An incomplete sweep is a failure: the caller's book keeps the key, so
+    // its next prune comes back for what is left.
     match delete_tombstones(root, key) {
         // Nothing was under the key, nor left of it: an earlier retire (a
         // --once run's, one by hand) already took it.
         Ok(0) if gone => said["gone"] = true.into(),
         Ok(_) => {}
-        Err(why) => said["tombstones_left"] = why.into(),
+        Err(why) => {
+            return Ok(json!({
+                "failed": key,
+                "why": format!("{why}; the next prune deletes it"),
+            }));
+        }
     }
     Ok(said)
 }
@@ -871,11 +877,22 @@ fn to_tombstone(root: &Path, key: &str) -> std::result::Result<Option<String>, S
 fn delete_tombstones(root: &Path, key: &str) -> std::result::Result<usize, String> {
     let mut first = None;
     let prefix = format!("{TOMBSTONE}{key}-");
-    let names: Vec<String> = fs::read_dir(root.join("seats"))
+    if execution::fail_at("tombstone-sweep") {
+        return Err("tombstone-sweep: injected by FERRY_FAIL_AT".into());
+    }
+    // A listing that fails cannot show the key's tombstones gone.
+    let listed = match fs::read_dir(root.join("seats")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        listed => listed.map_err(|e| format!("listing seats: {e}"))?,
+    };
+    let names: Vec<String> = listed
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .map_err(|e| format!("listing seats: {e}"))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| {
             name.strip_prefix(&prefix)
                 .is_some_and(|ms| !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()))

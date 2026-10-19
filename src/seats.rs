@@ -7,7 +7,6 @@ use crate::{config, transport};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fmt::Write as _,
     fs,
     io::Write,
     os::unix::fs::MetadataExt,
@@ -298,13 +297,10 @@ fn settle(reply: &serde_json::Value, line: Line, why_now: &str, pruned: &mut Pru
     } else if reply["retired"].is_string() {
         let bytes = reply["bytes"].as_u64().unwrap_or_default();
         pruned.bytes += bytes;
-        let mut said = format!(
+        let said = format!(
             "retired {} of {} on {} ({bytes} bytes; {why_now})",
             line.seat, line.repo_path, line.place
         );
-        if let Some(note) = reply["tombstones_left"].as_str() {
-            let _ = write!(said, "; {note}");
-        }
         (Kept::Retired, said)
     } else {
         let (kept, said) = refusal(reply, &line);
@@ -421,8 +417,7 @@ fn claim_hour(place: &str) -> Result<bool> {
         return Ok(false);
     }
     times.insert(place.to_owned(), now);
-    let tmp = dir.join("pruned.json.tmp");
-    fs::write(&tmp, serde_json::to_vec(&times)?)?;
-    fs::rename(&tmp, &path)?;
+    // Through a temporary file of its own, never a link left beside it.
+    crate::record::write_replacing(&path, &serde_json::to_vec(&times)?)?;
     Ok(true)
 }

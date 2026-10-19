@@ -3432,8 +3432,17 @@ fn an_already_retired_seat_is_already_gone_not_failed() {
     let place = dir.path().join("host/.local/state/ferry/v1");
     fs::remove_dir_all(place.join("seats").join(&hand)).unwrap();
     fs::remove_file(place.join("locks").join(format!("seat.{hand}"))).unwrap();
+    let once_key = key_of(dir.path(), &once);
+    let record_path = place.join(format!("records/retired-{once_key}.json"));
+    let record = fs::read(&record_path).unwrap();
     let (code, said) = prune_with(dir.path(), &["--idle", "0s"]);
     assert_eq!(code, Some(0), "{said}");
+    // ferry-hm5: the --once retire's record keeps its bytes and time.
+    assert_eq!(
+        fs::read(&record_path).unwrap(),
+        record,
+        "already gone rewrote the record"
+    );
     for name in ["once", "by-hand"] {
         assert!(
             said.lines()
@@ -3449,6 +3458,86 @@ fn an_already_retired_seat_is_already_gone_not_failed() {
         !said.contains("/once on") && !said.contains("/by-hand on"),
         "considered again: {said}"
     );
+}
+
+/// murail-4a ferry-6p0: the retirement record is written through a
+/// temporary file of its own, never one a link already holds: a link left
+/// at the old fixed temporary name (or any other) is not followed, and its
+/// target outside the state root stays untouched.
+#[test]
+fn the_retirement_record_is_never_written_through_a_link() {
+    let dir = fixture();
+    let repo = workspace(dir.path(), "idle");
+    assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+    let key = key_of(dir.path(), &repo);
+    age(dir.path(), &key, 2 * DAY_MS, false);
+    let records = dir.path().join("host/.local/state/ferry/v1/records");
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("sentinel");
+    fs::write(&sentinel, "keep").unwrap();
+    std::os::unix::fs::symlink(&sentinel, records.join(format!("retired-{key}.json.tmp"))).unwrap();
+    let (code, said) = prune_with(dir.path(), &["--idle", "1d"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.starts_with("retired"), "{said}");
+    assert_eq!(
+        fs::read_to_string(&sentinel).unwrap(),
+        "keep",
+        "written through the link"
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(records.join(format!("retired-{key}.json"))).unwrap())
+            .unwrap();
+    assert_eq!(record["key"], key.as_str());
+}
+
+/// herald-1b: a sweep of the key's earlier tombstones that does not finish
+/// is a failure, so the book keeps the key and the next prune deletes what
+/// is left; the retire's record keeps its bytes.
+#[test]
+fn a_failed_sweep_keeps_the_key_for_the_next_prune() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let repo = workspace(dir.path(), "idle");
+    assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+    let key = key_of(dir.path(), &repo);
+    age(dir.path(), &key, 2 * DAY_MS, false);
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    let older = place.join("seats").join(format!(".retired-{key}-5"));
+    fs::create_dir_all(older.join("checkout")).unwrap();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["seats", "prune", "--idle", "1d"],
+    )
+    .env("FERRY_FAIL_AT", "tombstone-sweep")
+    .output()
+    .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(125), "{said}");
+    assert!(
+        said.starts_with("failed") && said.contains("tombstone-sweep"),
+        "{said}"
+    );
+    assert!(older.exists());
+    assert!(
+        !seats_book(dir.path())
+            .iter()
+            .any(|line| line["key"] == key.as_str() && line["retired_ms"].is_u64()),
+        "an incomplete sweep was booked retired"
+    );
+    let record_path = place.join(format!("records/retired-{key}.json"));
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert!(record["bytes"].as_u64() > Some(0), "{record}");
+    let (code, said) = prune_with(dir.path(), &["--idle", "1d"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.starts_with("retired"), "{said}");
+    assert!(!older.exists(), "the next prune left the tombstone");
+    let again: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(again, record, "the retry rewrote the record");
 }
 
 /// ferry-1a F2: a key reused after a retire and retired again replaces its
