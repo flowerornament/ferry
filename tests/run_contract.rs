@@ -810,6 +810,69 @@ fn an_unlistable_session_still_ends_at_its_timeout() {
     drop(guard);
 }
 
+/// ferry-8d6 (murail-4a): the residue of an unlistable session, reported. A
+/// member that moved to a process group of its own is out of the owner's
+/// reach when nothing can list the session (as for the supervisor's
+/// fallback): the recipe and the owner still end, and `ferry status` lists
+/// the member as a leftover of its run.
+#[test]
+fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
+    let dir = fixture();
+    let (id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "trap \"\" TERM; python3 -c \"import os,time; os.setpgid(0,0); open(\\\"$DIR/split.tmp\\\",\\\"w\\\").write(str(os.getpid())); os.rename(\\\"$DIR/split.tmp\\\",\\\"$DIR/split\\\"); time.sleep(600)\" & echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
+        "session-list",
+        "6",
+    );
+    let started = std::time::Instant::now();
+    let split_path = dir.path().join("split");
+    while !split_path.exists() {
+        assert!(
+            started.elapsed() < common::slack(),
+            "the split member did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let split: i32 = fs::read_to_string(&split_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _split = OwnedMember {
+        pid: split,
+        session: owner,
+    };
+    gone_within(
+        &[recipe, owner],
+        started,
+        std::time::Duration::from_secs(6)
+            + limits::OWNER_LAG
+            + limits::STOP_GRACE
+            + limits::KILL_GRACE
+            + common::slack(),
+        "an unlistable session outlived its bound",
+    );
+    assert!(
+        alive(split),
+        "the residue changed: the split member was reached"
+    );
+    let out = run(dir.path(), &["status", "--json"]);
+    let seen: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let left = &seen["leftovers"];
+    let listed = left["processes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|p| p["pid"] == split && p["run"] == id.as_str());
+    // macOS may withhold a process's environment: then it is counted as
+    // unreadable, never silently absent.
+    assert!(
+        listed || (cfg!(target_os = "macos") && left["unreadable"].as_u64() > Some(0)),
+        "status does not report the split member: {left}"
+    );
+    drop(guard);
+}
+
 /// ferry-8d6 (herald-1b): the owner's stop keeps its TERM grace through a
 /// listing that fails (`owner-list`, once): only a session seen empty ends
 /// it early, so a member that ignores TERM is killed only after

@@ -14,7 +14,8 @@ pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// How long after a run's timeout or deadline its session owner stops the
 /// session itself (ferry-8d6): late enough that a live supervisor's stop
-/// comes first, so each member gets one TERM.
+/// normally comes first, so each member normally gets one TERM. An owner
+/// descheduled past it overlaps that stop; neither writes a result.
 pub const OWNER_LAG: Duration = Duration::from_secs(1);
 
 /// How long a session's output writer gets after the session stop.

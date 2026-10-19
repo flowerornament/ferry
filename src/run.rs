@@ -913,8 +913,11 @@ fn watch(deadline_ms: u128, timeout: Option<Instant>) {
 /// id. Only a listing seen empty ends the grace early. While the session
 /// cannot be listed, the running stage is signalled instead, so every
 /// stage returns; the KILLs go on until the stages have returned, then up
-/// to `KILL_GRACE` more. What it leaves has no record to go to: `ferry
-/// status` lists survivors.
+/// to `KILL_GRACE` more, and the last act kills the owner's own process
+/// group. A member that moved to a process group of its own is then out of
+/// reach, as in the supervisor's fallback (`signal_session`): without a
+/// listing nothing can name it. What it leaves has no record to go to:
+/// `ferry status` lists survivors.
 fn stop_own_session() {
     let me = std::process::id();
     // `owner-list` fails the first listing of the grace, once.

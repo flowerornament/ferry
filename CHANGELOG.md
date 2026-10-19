@@ -10,6 +10,11 @@ All notable changes to `ferry` are documented in this file.
   longer leaves the recipe running until it exits. A recipe that ends
   after its supervisor was killed no longer leaves the processes it started
   running either. The record still reconciles to `lost`.
+- **An env hook that leaves its output open fails the run.** If the
+  `[hooks] env` hook exits while something it started still holds its
+  stdout or stderr, the run now fails 2 s later with "the stage's output
+  still open", instead of waiting forever. The prepare hook and the recipe
+  are not captured, so they are unaffected.
 
 - **Fewer `unknown` survivors on busy Linux hosts.** The marker pass reads a
   process it could not read again every 100 ms for up to 1 s, instead of
