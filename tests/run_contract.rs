@@ -1967,6 +1967,49 @@ fn a_push_whose_state_cannot_be_read_is_not_killed() {
     assert_eq!(record["outcome"], "ran-pass", "{record}");
 }
 
+/// An unreadable state as git exits (murail-4a's and herald-1b's combined
+/// case): git is reaped without a kill while it might be alive, and its
+/// group is killed after the reap all the same, so the run is not delayed
+/// and nothing it left holding its stderr stays.
+#[test]
+fn an_unreadable_state_still_leaves_nothing_of_the_group() {
+    use std::time::{Duration, Instant};
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let pidfile = dir.path().join("push-leaver.pid");
+    let started = Instant::now();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_FAIL_AT", "push-state")
+    .env("FERRY_TEST_PUSH_LEAVER", &pidfile)
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let guard = OwnedPid(pid);
+    let until = Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(Instant::now() < until, "the push's leftover outlived it");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(guard);
+}
+
 /// A push that fails names why: git's fatal line reaches the receipt.
 #[test]
 fn a_failed_push_names_its_fatal_line() {

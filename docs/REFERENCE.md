@@ -410,7 +410,9 @@ or prepares its seat) runs none of them, collect included: nothing ran.
     retry pushes it all again (a failed push keeps nothing), so the first
     run of a repository that big is best made over a fast link.
   A signal to the caller (Ctrl-C) stops the push at once, as before
-  dispatch, and once git exits nothing it left in its group stays. The
+  dispatch, and once git exits nothing it left in its group stays (if
+  git's state cannot be read, it is reaped first and its group stopped
+  after; a live push is never killed for an unreadable state). The
   `ls-remote` check after a failed push runs in the caller's own group, so
   Ctrl-C reaches it directly; on a timeout the caller stops its git, and
   that ssh ends on its pipe or by keepalive (15 s).

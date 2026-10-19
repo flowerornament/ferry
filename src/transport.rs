@@ -353,8 +353,13 @@ fn progressing(command: &mut Command) -> Result<Pushed> {
                 break child.wait()?;
             }
             Some(false) => {}
+            // Unknown: reap only if it has exited, never kill a live push.
+            // The group goes after the reap all the same: a process group's
+            // id is never reused while it has members, and an empty group
+            // only answers ESRCH.
             None => {
                 if let Some(status) = child.try_wait()? {
+                    stop();
                     break status;
                 }
             }
