@@ -59,7 +59,7 @@ final record, and `ferry record <id>` completes the receipt later.
 | `record` | Reserve, finalize once, reconcile a lost supervisor; busy-holder naming. | §8 |
 | `receipt` | The caller's receipt, digests, run ids, capabilities. | §8 |
 | `admission` | Host policy: disk floor, per-seat cap, and every delete in a seat (contained, same device). | §9 |
-| `seats` | The caller's seat book and `ferry seats prune`. | §9 |
+| `seats` | The caller's seat book, `ferry seats prune [--idle]`, and the hourly prune a run makes by itself. | §9 |
 | `status` | `ferry status`: one read-only view of a place (disk, live runs, the gate, seats, leftovers). | §4 |
 | `artifacts` | Collect and hash at the place; fetch and verify at the caller. | §8 |
 | `limits` | Every timing and size bound, shared with the tests. | §5 |

@@ -97,10 +97,14 @@ enum Action {
 }
 #[derive(Subcommand)]
 enum SeatsAction {
-    /// Retire this caller's seats whose workspace is gone (SPEC §9).
+    /// Retire this caller's seats whose workspace is gone, and with
+    /// `--idle <dur>` those it has not used for that long (SPEC §9).
     Prune {
         #[arg(long)]
         on: Option<String>,
+        /// Also retire seats unused for this long (`1d`, `12h`, `0s`).
+        #[arg(long)]
+        idle: Option<String>,
     },
 }
 #[derive(Subcommand)]
@@ -131,10 +135,18 @@ enum PlaceVerb {
     },
     Retire {
         key: String,
+        /// Refuse `used` if the seat ran within this many ms.
+        #[arg(long)]
+        idle_ms: Option<u128>,
+        /// Refuse `used` unless the seat's latest run is this one.
+        #[arg(long)]
+        once_id: Option<String>,
     },
     Status,
 }
 #[derive(Args)]
+// Each bool is one command-line flag, which clap reads as a bool.
+#[allow(clippy::struct_excessive_bools)]
 struct Run {
     #[arg(allow_hyphen_values = true)]
     recipe: String,
@@ -157,6 +169,9 @@ struct Run {
     /// Hold the host alone: wait for in-flight runs, keep new ones out.
     #[arg(long)]
     exclusive: bool,
+    /// The seat lives for this run only: retired once its record is final.
+    #[arg(long)]
+    once: bool,
     /// Arguments appended to the recipe's command, after `--`.
     #[arg(last = true)]
     args: Vec<String>,
@@ -232,9 +247,17 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
             .collect(),
         preserve: record.preserve.clone(),
         args: options.args.clone(),
-        provider_requires: config.provider.requires.clone(),
+        provider_requires: {
+            let mut requires = config.provider.requires.clone();
+            // An older place would keep a one-run seat: refused instead.
+            if options.once {
+                requires.insert("seat-lifetime".into());
+            }
+            requires
+        },
         wait_seconds: options.wait_seconds,
         waits_end_ms: None,
+        once: options.once,
     };
     record.token = Some(request.token.clone());
     execution::interrupted()?;
@@ -383,6 +406,14 @@ fn run(options: &Run) -> Result<i32> {
             record.id
         ));
     }
+    // After the receipt and its output are complete, and never changing the
+    // run's code: prune this place's idle seats, if the caller asked for it.
+    if record.machine != "local"
+        && execution::caught_signal().is_none()
+        && let Ok(hosts) = machines()
+    {
+        seats::prune_by_itself(&record.machine, &hosts);
+    }
     Ok(record.exit_code)
 }
 
@@ -408,8 +439,12 @@ fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Action::Run(options) => run(&options),
         Action::Seats {
-            command: SeatsAction::Prune { on },
-        } => seats::prune(on.as_deref(), &machines()?),
+            command: SeatsAction::Prune { on, idle },
+        } => seats::prune(
+            on.as_deref(),
+            &machines()?,
+            idle.as_deref().map(config::parse_duration).transpose()?,
+        ),
         Action::Machines => {
             println!("{}", serde_json::to_string_pretty(&machines()?.host)?);
             Ok(0)
@@ -461,7 +496,11 @@ fn execute(cli: Cli) -> Result<i32> {
                     signal,
                 } => place::stop(&root, &id, &seat, &who, &why, other, signal),
                 PlaceVerb::Record { id } => place::print_record(&root, &id),
-                PlaceVerb::Retire { key } => place::retire(&root, &key),
+                PlaceVerb::Retire {
+                    key,
+                    idle_ms,
+                    once_id,
+                } => place::retire(&root, &key, &place::Meant { idle_ms, once_id }),
                 PlaceVerb::Status => {
                     println!("{}", status::place(&root));
                     Ok(0)

@@ -1,15 +1,18 @@
 //! The caller's seat book (SPEC §9, §10): each seat this caller used, so
-//! `ferry seats prune` can retire those whose workspace is gone. It is
-//! append-only, one `O_APPEND` line per accepted run, plus a tombstone per
-//! retired seat. It is never rewritten, so concurrent appends are never lost.
+//! `ferry seats prune` can retire those whose workspace is gone or that are
+//! idle. It is append-only, one `O_APPEND` line per accepted run, plus a
+//! tombstone per retired seat. It is never rewritten, so concurrent appends
+//! are never lost.
 use crate::{config, transport};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     fs,
     io::Write,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -23,8 +26,10 @@ pub struct Line {
     pub repo_path: String,
     #[serde(default)]
     pub seat: String,
-    #[serde(default)]
-    pub last_used_ms: u128,
+    /// When this caller last used the seat; absent on a line written
+    /// without it, whose age is then unknown (SPEC §9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_ms: Option<u128>,
     /// The device of the workspace's parent directory when it was used: an
     /// unmounted volume leaves an empty mount point on another device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,7 +78,7 @@ pub fn record(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()
         place: place.to_owned(),
         repo_path: repo_path.display().to_string(),
         seat: seat.to_owned(),
-        last_used_ms: crate::receipt::now_ms(),
+        last_used_ms: Some(crate::receipt::now_ms()),
         parent_device: Some(fs::metadata(parent)?.dev()),
         retired_ms: None,
     })
@@ -109,7 +114,7 @@ fn gone(line: &Line) -> std::result::Result<bool, String> {
 /// retries an append that failed at acceptance.
 pub fn ensure(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()> {
     if latest()?
-        .get(key)
+        .get(&(place.to_owned(), key.to_owned()))
         .is_some_and(|line| line.retired_ms.is_none())
     {
         return Ok(());
@@ -117,72 +122,275 @@ pub fn ensure(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()
     record(key, place, repo_path, seat)
 }
 
-/// The latest line per key, in file order (later lines win). Unreadable
-/// lines are skipped.
-pub(crate) fn latest() -> Result<BTreeMap<String, Line>> {
+/// The latest line per place and key, in file order (later lines win),
+/// carrying the newest `last_used_ms` of that place and key's lines.
+/// Unreadable lines are skipped.
+pub(crate) fn latest() -> Result<BTreeMap<(String, String), Line>> {
     let text = match fs::read_to_string(book()?) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
-    let mut seats = BTreeMap::new();
+    let mut seats: BTreeMap<(String, String), Line> = BTreeMap::new();
     for line in text.lines() {
-        if let Ok(line) = serde_json::from_str::<Line>(line) {
-            seats.insert(line.key.clone(), line);
+        if let Ok(mut line) = serde_json::from_str::<Line>(line) {
+            let at = (line.place.clone(), line.key.clone());
+            if let Some(before) = seats.get(&at) {
+                line.last_used_ms = line.last_used_ms.max(before.last_used_ms);
+            }
+            seats.insert(at, line);
         }
     }
     Ok(seats)
 }
 
-/// Retires this caller's seats whose workspace is gone, through each
-/// place's `retire` verb, and prints one line per seat. 0 when every
-/// candidate was retired or is busy; 125 if a place refused otherwise; 255
-/// if a place could not be reached.
-pub fn prune(only: Option<&str>, hosts: &config::Machines) -> Result<i32> {
-    let mut code = 0;
+/// How one seat a prune considered came out (SPEC §9: retired, busy,
+/// used, unknown or failed, plus exclusive and an old place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    Retired,
+    Busy,
+    Used,
+    Exclusive,
+    Unknown,
+    Failed,
+    Unreachable,
+}
+
+/// What a prune did, seat by seat, and the bytes it retired.
+#[derive(Debug, Default)]
+pub struct Pruned {
+    pub said: Vec<(Kept, String)>,
+    pub bytes: u64,
+}
+impl Pruned {
+    fn note(&mut self, kept: Kept, line: String) {
+        self.said.push((kept, line));
+    }
+    fn count(&self, kept: Kept) -> usize {
+        self.said.iter().filter(|(k, _)| *k == kept).count()
+    }
+    /// 0 when every seat was retired or kept by rule (busy, used,
+    /// exclusive, unknown age); 125 if a place refused otherwise; 255 if a
+    /// place could not be reached.
+    pub fn code(&self) -> i32 {
+        if self.count(Kept::Unreachable) > 0 {
+            255
+        } else if self.count(Kept::Failed) > 0 {
+            125
+        } else {
+            0
+        }
+    }
+}
+
+/// Retires this caller's seats whose workspace is gone, and with `idle`
+/// those it last used longer ago than that, through each place's `retire`
+/// verb, and prints one line per seat it considered.
+pub fn prune(only: Option<&str>, hosts: &config::Machines, idle: Option<Duration>) -> Result<i32> {
+    let pruned = prune_until(only, hosts, idle, None)?;
+    for (_, line) in &pruned.said {
+        println!("{line}");
+    }
+    Ok(pruned.code())
+}
+
+/// The prune itself; past `stop` (if any) it starts no new retire.
+pub fn prune_until(
+    only: Option<&str>,
+    hosts: &config::Machines,
+    idle: Option<Duration>,
+    stop: Option<Instant>,
+) -> Result<Pruned> {
+    let mut pruned = Pruned::default();
+    let now = crate::receipt::now_ms();
     for line in latest()?.into_values() {
         if line.retired_ms.is_some() || only.is_some_and(|place| place != line.place) {
             continue;
         }
-        match gone(&line) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(why) => {
-                println!(
-                    "kept {} on {}: workspace {} unknown: {why}",
-                    line.seat, line.place, line.repo_path
+        let workspace = gone(&line);
+        let age = line.last_used_ms.map(|ms| now.saturating_sub(ms));
+        let meant = match (&workspace, idle) {
+            (Ok(true), _) => crate::place::Meant::default(),
+            (_, Some(idle)) if age.is_some_and(|age| age >= idle.as_millis()) => {
+                crate::place::Meant {
+                    idle_ms: Some(idle.as_millis()),
+                    once_id: None,
+                }
+            }
+            (_, Some(_)) if age.is_none() => {
+                pruned.note(
+                    Kept::Unknown,
+                    format!(
+                        "kept {} of {} on {}: its age is unknown (the book has no last use)",
+                        line.seat, line.repo_path, line.place
+                    ),
                 );
                 continue;
             }
+            (Err(why), _) => {
+                pruned.note(
+                    Kept::Unknown,
+                    format!(
+                        "kept {} on {}: workspace {} unknown: {why}",
+                        line.seat, line.place, line.repo_path
+                    ),
+                );
+                continue;
+            }
+            _ => continue,
+        };
+        if stop.is_some_and(|stop| Instant::now() >= stop) {
+            break;
         }
+        let why_now = if meant.idle_ms.is_some() {
+            format!(
+                "unused for {}",
+                crate::config::show_duration(Duration::from_millis(
+                    u64::try_from(age.unwrap_or_default()).unwrap_or(u64::MAX)
+                ))
+            )
+        } else {
+            format!("workspace {} is gone", line.repo_path)
+        };
         let said = if let Some(machine) = hosts.host.get(&line.place) {
-            transport::retire(&transport::Place::Remote(machine), &line.key)
+            transport::retire(&transport::Place::Remote(machine), &line.key, &meant)
         } else {
             Err(format!("unknown place {}", line.place).into())
         };
-        match said {
-            Ok(reply) if reply["retired"].is_string() => {
-                println!(
-                    "retired {} on {} ({} bytes; workspace {} is gone)",
-                    line.seat, line.place, reply["bytes"], line.repo_path
-                );
-                append(&Line {
-                    retired_ms: Some(crate::receipt::now_ms()),
-                    ..line
-                })?;
-            }
-            Ok(reply) => {
-                let why = reply["why"].as_str().unwrap_or_default();
-                println!("skipped {} on {}: {why}", line.seat, line.place);
-                if !why.starts_with("seat busy") {
-                    code = code.max(125);
-                }
-            }
+        let reply = match said {
+            Ok(reply) => reply,
             Err(error) => {
-                println!("failed {} on {}: {error}", line.seat, line.place);
-                code = 255;
+                pruned.note(
+                    Kept::Unreachable,
+                    format!("failed {} on {}: {error}", line.seat, line.place),
+                );
+                continue;
             }
+        };
+        if reply["retired"].is_string() {
+            let bytes = reply["bytes"].as_u64().unwrap_or_default();
+            pruned.bytes += bytes;
+            let mut said = format!(
+                "retired {} of {} on {} ({bytes} bytes; {why_now})",
+                line.seat, line.repo_path, line.place
+            );
+            if let Some(note) = reply["tombstones_left"].as_str() {
+                let _ = write!(said, "; {note}");
+            }
+            pruned.note(Kept::Retired, said);
+            append(&Line {
+                retired_ms: Some(crate::receipt::now_ms()),
+                ..line
+            })?;
+            continue;
         }
+        let (kept, said) = refusal(&reply, &line);
+        pruned.note(kept, said);
     }
-    Ok(code)
+    Ok(pruned)
+}
+
+/// How a place's reply that retired nothing reads, and what it counts as.
+fn refusal(reply: &serde_json::Value, line: &Line) -> (Kept, String) {
+    let why = reply["why"].as_str().unwrap_or_default();
+    let (kept, verb) = match reply["refused"].as_str() {
+        Some("busy") => (Kept::Busy, "skipped"),
+        Some("used") => (Kept::Used, "skipped (used since)"),
+        Some("exclusive") => (Kept::Exclusive, "skipped (exclusive run)"),
+        // An older place's busy refusal names the seat busy.
+        Some(_) if why.starts_with("seat busy") => (Kept::Busy, "skipped"),
+        _ if reply["unknown"].is_string() => (Kept::Unknown, "kept (unknown)"),
+        _ => (Kept::Failed, "failed"),
+    };
+    (
+        kept,
+        format!(
+            "{verb} {} of {} on {}: {why}",
+            line.seat, line.repo_path, line.place
+        ),
+    )
+}
+
+/// Prunes `place`'s idle seats by itself after a run (SPEC §9, "idle,
+/// without remembering"): at most once an hour per place, claimed under an
+/// flock on the caller's `pruned.lock` before pruning, and starting no new
+/// retire after `AUTO_PRUNE_BUDGET`. Prints one line on stderr when it
+/// pruned or failed; never changes the run's exit code or output.
+pub fn prune_by_itself(place: &str, hosts: &config::Machines) {
+    let Some(days) = hosts.delete_unused_checkouts_after_days else {
+        return;
+    };
+    let started = Instant::now();
+    let said = match claim_hour(place) {
+        Ok(false) => return,
+        Ok(true) => prune_until(
+            Some(place),
+            hosts,
+            Some(Duration::from_secs(days * 86_400)),
+            Some(started + crate::limits::AUTO_PRUNE_BUDGET),
+        )
+        .map(|pruned| {
+            let failed = pruned.count(Kept::Failed) + pruned.count(Kept::Unreachable);
+            let kept = pruned.said.len() - pruned.count(Kept::Retired) - failed;
+            format!(
+                "retired {} unused for {days}d ({} bytes), kept {kept}, failed {failed}",
+                pruned.count(Kept::Retired),
+                pruned.bytes
+            ) + &pruned
+                .said
+                .iter()
+                .find(|(k, _)| matches!(k, Kept::Failed | Kept::Unreachable))
+                .map(|(_, line)| format!("; {line}"))
+                .unwrap_or_default()
+        }),
+        Err(error) => Err(error),
+    };
+    let line = match said {
+        Ok(said) => format!("ferry: pruned {place}: {said}, in {:?}", started.elapsed()),
+        Err(error) => format!("ferry: pruning {place} failed: {error}"),
+    };
+    crate::execution::warn(&line);
+}
+
+/// Claims this hour's prune of `place`: under a held flock on `pruned.lock`,
+/// reads `pruned.json`, and only if `place`'s time is over an hour old writes
+/// now (renamed into place whole). A lock held by another run, or a recent
+/// time, is no claim.
+fn claim_hour(place: &str) -> Result<bool> {
+    use fs2::FileExt;
+    let dir = book()?
+        .parent()
+        .ok_or("seat book has no directory")?
+        .to_owned();
+    fs::create_dir_all(&dir)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("pruned.lock"))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    crate::execution::pause_at("prune-claim", &dir.join("prune-claim"));
+    let path = dir.join("pruned.json");
+    let mut times: BTreeMap<String, u128> = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let now = crate::receipt::now_ms();
+    if times
+        .get(place)
+        .is_some_and(|last| now.saturating_sub(*last) < crate::limits::AUTO_PRUNE_EVERY.as_millis())
+    {
+        return Ok(false);
+    }
+    times.insert(place.to_owned(), now);
+    let tmp = dir.join("pruned.json.tmp");
+    fs::write(&tmp, serde_json::to_vec(&times)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(true)
 }

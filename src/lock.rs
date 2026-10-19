@@ -191,6 +191,35 @@ impl HostLease {
     }
 }
 
+/// A shared host lease taken by try, never waiting (SPEC §9 retire): the
+/// gate, then `host`, both shared, the way a shared run passes the gate. The
+/// held `host` file, or `None` while an exclusive run holds either, so a
+/// retire never deletes during an exclusive run or jumps ahead of one
+/// waiting at the gate.
+pub(crate) fn try_shared_host(root: &Path) -> Result<Option<fs::File>> {
+    let open = |name: &str| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("locks").join(name))
+    };
+    fs::create_dir_all(root.join("locks"))?;
+    let gate = open("host.gate")?;
+    let host = open("host")?;
+    for file in [&gate, &host] {
+        match FileExt::try_lock_shared(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // The gate is passed: it closes once the lease is held.
+    drop(gate);
+    Ok(Some(host))
+}
+
 /// Sets or clears close-on-exec on a lock descriptor.
 pub(crate) fn close_on_exec(file: &fs::File, close: bool) -> Result<()> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};

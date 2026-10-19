@@ -280,7 +280,7 @@ pub fn live(root: &Path) -> Vec<Reservation> {
 pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     // A named run whose supervisor died is lost before it is named.
     if named == crate::place::RETIRING {
-        return "seat busy: it is being retired (its workspace is gone); try again".into();
+        return "seat busy: it is being retired; try again".into();
     }
     if !named.is_empty() {
         let _ = reconcile(root, named);

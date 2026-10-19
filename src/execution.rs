@@ -48,6 +48,9 @@ pub struct Request {
     /// supervisor, so the waits together never pass the deadline.
     #[serde(skip)]
     pub waits_end_ms: Option<u128>,
+    /// The seat lives for this run only (SPEC §9 "one run").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub once: bool,
 }
 impl Request {
     /// The bound on all lock waits together.
@@ -75,6 +78,10 @@ pub fn validate(request: &Request) -> Result<()> {
     }
     for value in [&request.id, &request.token, &request.seat] {
         identifier(value)?;
+    }
+    // `seats/.<name>` is a retire's tombstone, never a seat (SPEC §9).
+    if request.seat.starts_with('.') {
+        return Err("invalid seat key: it starts with '.'".into());
     }
     if !repository::is_commit(&request.commit) {
         return Err("invalid commit".into());
@@ -224,6 +231,12 @@ pub fn prepare(
     // Each lock goes to the supervisor as soon as it is taken, so no later
     // refusal here closes it before the record is final.
     held.seat = Some(seat);
+    // A retire checks it under the lock: the seat ran since its caller
+    // last saw it (SPEC §9). Without it a retire falls back to the
+    // caller's age, so a failure is a note, not a refusal.
+    if let Err(error) = crate::place::mark_used(root, &request.seat, &request.id) {
+        crate::run::note_after(format!("seat used record: {error}"));
+    }
     held.host = Some(crate::lock::HostLease::acquire(
         root,
         request,

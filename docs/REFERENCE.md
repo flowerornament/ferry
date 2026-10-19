@@ -150,6 +150,7 @@ requires = ["admission"]
 | `admission` | host policy admission (`host.toml`), even when not configured |
 | `detach` | detached runs (`ferry place` submit, follow, stop, record); a caller refuses a place without it (125, naming the place's `source_rev`) |
 | `retire` | the place's `retire` verb for `ferry seats prune`; prune refuses a place without it (125, naming its `source_rev`) |
+| `seat-lifetime` | `run --once`, `seats prune --idle`, and a `retire` that checks the seat's latest use, never deletes during an exclusive run, and renames to a tombstone first; a `--once` run or an idle retire refuses a place without it |
 | `ship` | `[[ship]]` requests and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
 | `status` | the place's `status` verb; `ferry status` refuses a place without it (125, naming its `source_rev`) |
 
@@ -213,23 +214,58 @@ receipts or records.
 - **Count.** Each accepted run appends one line to the caller's seat book,
   `~/.local/state/ferry/seats.jsonl` (`{key, place, repo_path, seat,
   last_used_ms}`; one `O_APPEND` write, never rewritten). A failed append is
-  retried when the run completes, and a failure then is a note. `ferry seats
-  prune [--on <machine>]` retires each recorded seat whose workspace is
-  provably gone: its name is absent from a parent directory that can be
-  listed and is on the device recorded with it. Anything else (a denied
-  lookup, a missing parent, an unmounted volume) is reported as `kept …
-  unknown` and never retired. So a workspace removed together with its
-  parent directory (say `~/tmp/x/` deleted whole) is never pruned: its seat
-  stays until an operator removes it on the place. The place's `retire` verb tries the seat's lock once and,
-  if it is free, deletes the seat's checkout and cache, records
-  `records/retired-<key>.json`, and keeps the lock file. A held seat is
-  skipped (busy). A run refused meanwhile is told the seat "is being
-  retired". Prune prints one line per seat and appends a tombstone for each
-  one retired; a later run on the same workspace revives it. Local seats live
-  inside their workspace and go with it, so they are not recorded. Exit 0 when
-  every candidate was retired or busy, 125 if a place refused otherwise
-  (including a place without the `retire` capability, named by revision),
-  255 if a place was unreachable. Prune only ever names this caller's seats.
+  retried when the run completes, and a failure then is a note. The book is
+  the machine user's, not one workspace's: a prune considers every seat
+  this user's caller recorded, whichever agent's workspace it serves, and
+  never another caller's. A seat ends in one of three ways:
+  - **Workspace gone.** `ferry seats prune [--on <machine>]` retires each
+    recorded seat whose workspace is provably gone: its name is absent from
+    a parent directory that can be listed and is on the device recorded with
+    it. Anything else (a denied lookup, a missing parent, an unmounted
+    volume) is reported as `kept … unknown` and never retired by this rule.
+    So a workspace removed together with its parent directory (say
+    `~/tmp/x/` deleted whole) is pruned only by `--idle`.
+  - **Idle.** `ferry seats prune --idle <dur>` (`1d`, `12h`, `30m`, `0s`)
+    also retires each seat whose newest `last_used_ms` for that place is
+    older than `<dur>`. A line without `last_used_ms` has an unknown age and
+    is kept. With `delete_unused_checkouts_after_days = <n>` at the top of
+    `machines.toml` (a whole number, at least 1; a "checkout" is a seat: the
+    place's copy of the repository, with its build cache), every `ferry run`
+    on a remote place also prunes that place with `--idle <n>d`, after its
+    receipt and output are complete: at most once an hour per place (claimed
+    under an flock on `~/.local/state/ferry/pruned.lock`, the time kept in
+    `pruned.json`), starting no new retire after 10 s. It prints one line on
+    stderr (`ferry: pruned <place>: retired …, kept …, in …`) and never
+    changes the run's exit code or `--json` output.
+  - **One run.** `ferry run --once` declares the seat lives for that run
+    only. Once the run's record is final, its supervisor closes the seat
+    lock (never `LOCK_UN`) and retires the seat, checking it is still this
+    run's. A process the run left that kept the seat's lock keeps the seat
+    busy until it exits; a later prune then retires it. The record says
+    `once: true`, never whether the retire happened.
+
+  The place's `retire` verb waits on nothing. It takes a shared host lease
+  by try, through the gate, so it is skipped (`exclusive`) while an
+  exclusive run holds the host or waits for it, then tries the seat's lock
+  (held: skipped, busy). A run refused meanwhile is told the seat "is being
+  retired". Under the lock it reads `seats/<key>/used` (`{ms, id}`, written
+  by each run when it takes the seat): a seat used within the idle age on
+  the place's clock, or by a run other than the `--once` one, is skipped
+  (`used since`); a `used` it cannot read keeps the seat (`unknown`). It
+  then renames `seats/<key>` to a tombstone `seats/.retired-<key>-<ms>`,
+  records `records/retired-<key>.json`, deletes the tombstone, and keeps the
+  lock file. A delete that fails leaves only the tombstone: the key is gone,
+  so the next run on it starts cold and whole; `status` lists the tombstone
+  and the next retire on that place deletes it. Prune prints one line per
+  seat it considered (retired, skipped busy, used since or exclusive, kept
+  unknown, failed) and appends a tombstone line to the book for each one
+  retired; a later run on the same workspace revives it. Local seats live
+  inside their workspace and go with it, so they are not recorded. Exit 0
+  when every seat was retired or kept by rule, 125 if a place refused
+  otherwise (including a place without the capability it needs, named by
+  revision), 255 if a place was unreachable. Below the disk floor, a run's
+  refusal names `ferry status --on <place>` and `ferry seats prune --on
+  <place> --idle <dur>`.
 - **Size.** With `seat_cap_bytes` set, a run measures its seat's preserve
   paths and cache under its seat lock, before the checkout, when the last
   measurement is over an hour old. Only paths proven inside the seat are

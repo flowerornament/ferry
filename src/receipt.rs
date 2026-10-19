@@ -18,6 +18,7 @@ pub const CAPABILITIES: &[&str] = &[
     "admission",
     "detach",
     "retire",
+    "seat-lifetime",
     "ship",
     "status",
 ];

@@ -104,6 +104,17 @@ fn bounded() -> Vec<String> {
 /// keepalives do not reach a jump host's own connection or a stalled key
 /// exchange, so the caller stops its own ssh at the bound and refuses.
 fn replied(command: &mut Command) -> Result<Vec<u8>> {
+    let (status, out, err) = answered(command)?;
+    if !status.success() {
+        return Err(format!("command failed: {}", String::from_utf8_lossy(&err).trim()).into());
+    }
+    Ok(out)
+}
+
+/// A place's reply within `SSH_REPLY`, whatever its exit status (a verb
+/// that refuses exits 125 with its reply on stdout): the status, stdout and
+/// stderr. Past the bound our own child is killed and the wait is an error.
+fn answered(command: &mut Command) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     let bound = execution::debug_bound("FERRY_SSH_REPLY_MS")
         .map_or(crate::limits::SSH_REPLY, Duration::from_millis);
     let mut child = command
@@ -145,10 +156,7 @@ fn replied(command: &mut Command) -> Result<Vec<u8>> {
     let (Ok(out), Ok(err)) = (collect(&out), collect(&err)) else {
         return Err(late().into());
     };
-    if !status.success() {
-        return Err(format!("command failed: {}", String::from_utf8_lossy(&err).trim()).into());
-    }
-    Ok(out)
+    Ok((status, out, err))
 }
 
 /// Removes the empty control directories of callers that are gone (a killed
@@ -777,21 +785,44 @@ fn is_final(place: &Place, record: &Receipt) -> Result<bool> {
 
 /// Asks a place to retire one of this caller's seats (SPEC §6). A place
 /// without `retire` is refused, naming its revision, as for `detach`.
-pub fn retire(place: &Place, key: &str) -> Result<serde_json::Value> {
+pub fn retire(place: &Place, key: &str, meant: &crate::place::Meant) -> Result<serde_json::Value> {
     let info = place.info()?;
-    if !info.capabilities.iter().any(|c| c == "retire") {
+    let lacks = |capability: &str| !info.capabilities.iter().any(|c| c == capability);
+    // An idle or one-run retire needs a place that checks `used` under the
+    // seat lock and never retires during an exclusive run.
+    let needs = if meant.idle_ms.is_some() || meant.once_id.is_some() {
+        "seat-lifetime"
+    } else {
+        "retire"
+    };
+    if lacks(needs) {
         return Ok(serde_json::json!({
-            "refused": "retire",
+            "refused": "old",
             "why": format!(
-                "the place runs ferry {}, which lacks retire",
+                "the place runs ferry {}, which lacks {needs}",
                 info.source_rev.as_deref().unwrap_or("of unknown revision")
             ),
             "next": format!("install this caller's ferry ({}) there", receipt::source_rev()),
         }));
     }
-    let out = place.verb(&["retire", key])?.output()?;
-    serde_json::from_slice(&out.stdout)
-        .map_err(|_| format!("retire gave no reply ({})", failed(&out)).into())
+    let mut args = vec!["retire".to_owned(), key.to_owned()];
+    if let Some(idle) = meant.idle_ms {
+        args.extend(["--idle-ms".to_owned(), idle.to_string()]);
+    }
+    if let Some(once) = &meant.once_id {
+        args.extend(["--once-id".to_owned(), once.clone()]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Bounded like every short reply (SPEC §9: a retire in flight is waited
+    // for up to the ssh reply bound); the place goes on with it regardless.
+    let (status, out, err) = answered(&mut place.verb(&args)?)?;
+    serde_json::from_slice(&out).map_err(|_| {
+        format!(
+            "retire gave no reply ({status}: {})",
+            String::from_utf8_lossy(&err).trim()
+        )
+        .into()
+    })
 }
 
 /// Asks a place what it sees now (SPEC §4). A place without `status` is

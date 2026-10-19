@@ -228,6 +228,51 @@ fn default_binary() -> String {
 pub struct Machines {
     #[serde(default)]
     pub host: BTreeMap<String, Machine>,
+    /// Each run prunes its place's seats this caller has not used for this
+    /// many whole days, at least 1 (SPEC §9); absent, nothing prunes by
+    /// itself.
+    #[serde(default, deserialize_with = "whole_days")]
+    pub delete_unused_checkouts_after_days: Option<u64>,
+}
+
+fn whole_days<'de, D: serde::Deserializer<'de>>(to: D) -> Result<Option<u64>, D::Error> {
+    let days = <Option<u64> as Deserialize>::deserialize(to)?;
+    if days.is_some_and(|days| !(1..=36_500).contains(&days)) {
+        return Err(serde::de::Error::custom(
+            "delete_unused_checkouts_after_days: a whole number of days, from 1 to 36500",
+        ));
+    }
+    Ok(days)
+}
+
+/// A duration as written on the command line: a whole number and a unit,
+/// `s`, `m`, `h` or `d` (`30m`, `1d`, `0s`).
+pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
+    let bad = || format!("{text:?}: a whole number and a unit (s, m, h or d), like 1d or 30m");
+    let unit = text.chars().last().ok_or_else(bad)?;
+    let seconds = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let count: u64 = text[..text.len() - 1].parse().map_err(|_| bad())?;
+    count
+        .checked_mul(seconds)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(bad)
+}
+
+/// A duration in its largest whole unit, the way it is written.
+pub fn show_duration(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    for (unit, size) in [("d", 86_400), ("h", 3600), ("m", 60)] {
+        if seconds >= size {
+            return format!("{}{unit}", seconds / size);
+        }
+    }
+    format!("{seconds}s")
 }
 
 #[derive(Debug, PartialEq)]
@@ -378,6 +423,7 @@ mod tests {
     }
     fn machines() -> Machines {
         Machines {
+            delete_unused_checkouts_after_days: None,
             host: BTreeMap::from([(
                 "bench".into(),
                 Machine {

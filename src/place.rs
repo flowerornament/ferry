@@ -76,6 +76,10 @@ pub struct HostResult {
     /// `final` in a host record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// The seat was declared for this run only; the record never says
+    /// whether its retire happened (SPEC §9).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub once: bool,
 }
 impl HostResult {
     /// A result that says nothing ran yet: refused 125 until the run says more.
@@ -90,6 +94,7 @@ impl HostResult {
             binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
             source_rev: Some(receipt::source_rev()),
             exe: receipt::exe_path(),
+            once: request.once,
             ..Default::default()
         })
     }
@@ -382,7 +387,12 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
     // its live reservation would then name a lock it no longer holds.
     match stored {
         Ok(()) => {
+            // Closed, never unlocked: a survivor that inherited the seat's
+            // descriptor keeps it held, so the retire below finds it busy.
             drop(held);
+            if request.once {
+                retire_once(root, &request);
+            }
             Ok(result.exit_code)
         }
         Err(error) => {
@@ -392,6 +402,33 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             std::process::exit(255)
         }
     }
+}
+
+/// Retires a `--once` run's seat after its record is final and its locks
+/// are closed, through the ordinary retire with `once_id` (SPEC §9): busy
+/// while a survivor holds the lock, `used` if a later run took the seat,
+/// `exclusive` while an exclusive run holds or waits for the host. What it
+/// did goes to the supervisor's log only; a seat it leaves stays for
+/// `status` to show and a later prune to retire.
+fn retire_once(root: &Path, request: &Request) {
+    let meant = Meant {
+        idle_ms: None,
+        once_id: Some(request.id.clone()),
+    };
+    execution::pause_at(
+        "once-retire-pause",
+        &record::run_dir(root, &request.id).join("once"),
+    );
+    let said = if execution::fail_at("once-retire") {
+        Err("once-retire: injected by FERRY_FAIL_AT".into())
+    } else {
+        retire_seat(root, &request.seat, &meant)
+    };
+    let line = match said {
+        Ok(said) => format!("ferry: --once retire: {said}"),
+        Err(error) => format!("ferry: --once retire failed: {error}"),
+    };
+    execution::warn(&line);
 }
 
 /// The artifact status of a run that collected none: none declared, or the
@@ -601,60 +638,225 @@ fn first_stop_signal(dir: &Path) -> Option<i32> {
 /// run refused then is told the seat is being retired.
 pub const RETIRING: &str = "retiring";
 
-/// Retires a seat whose caller's workspace is gone (SPEC §6, §9): tries its
-/// lock once; held → refused, naming the holder; free → deletes its seat
-/// directory (checkout and cache) under the lock and records
-/// `records/retired-<key>.json`. The lock file itself is never removed:
-/// unlinking a held flock file would let a new run lock a fresh file of the
-/// same name beside it.
-pub fn retire(root: &Path, key: &str) -> Result<i32> {
+/// What a retire checks under the seat lock that the seat is still the one
+/// its caller meant (SPEC §9), from `seats/<key>/used`.
+#[derive(Debug, Clone, Default)]
+pub struct Meant {
+    /// Refused `used` when the seat ran within this many ms, on this clock.
+    pub idle_ms: Option<u128>,
+    /// Refused `used` when the seat's latest run is not this one.
+    pub once_id: Option<String>,
+}
+
+/// The seat's latest run, as written when it took the seat lock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Used {
+    pub ms: u128,
+    pub id: String,
+}
+
+/// Writes `seats/<key>/used` for the run that has just taken the seat lock,
+/// renamed into place whole.
+pub fn mark_used(root: &Path, key: &str, id: &str) -> Result<()> {
+    if execution::fail_at("used-write") {
+        return Err("used-write: injected by FERRY_FAIL_AT".into());
+    }
+    let seat = root.join("seats").join(key);
+    fs::create_dir_all(&seat)?;
+    let tmp = seat.join("used.tmp");
+    fs::write(
+        &tmp,
+        serde_json::to_vec(&Used {
+            ms: receipt::now_ms(),
+            id: id.to_owned(),
+        })?,
+    )?;
+    fs::rename(&tmp, seat.join("used"))?;
+    Ok(())
+}
+
+/// The prefix of a retire's tombstone, `seats/.retired-<key>-<ms>`: never a
+/// seat, so never counted, measured or capped as one.
+pub const TOMBSTONE: &str = ".retired-";
+
+/// Retires a seat (SPEC §6, §9), printing the reply: 0 retired, 125 not.
+pub fn retire(root: &Path, key: &str, meant: &Meant) -> Result<i32> {
+    let said = retire_seat(root, key, meant)?;
+    reply(&said);
+    Ok(if said["retired"].is_string() { 0 } else { 125 })
+}
+
+/// Retires a seat, trying every lock and waiting on none: a shared host
+/// lease by try (an exclusive run holding the gate or `host` refuses it
+/// `exclusive`), then the seat lock (held: `busy`, naming the holder), then
+/// `used` under it (`used` when the seat ran since its caller meant it,
+/// `unknown` when `used` cannot be read). Then, under both, it renames
+/// `seats/<key>` to a tombstone, records `records/retired-<key>.json` and
+/// deletes the tombstone; a delete that fails leaves only the tombstone and
+/// is reported failed, so the caller comes back. A retire that retired also
+/// deletes tombstones earlier retires left, under the same lease. The lock file is never removed: unlinking a
+/// held flock file would let a new run lock a fresh file of the same name.
+///
+/// Lock order: host, then seat, the reverse of a run's; safe only because
+/// both are tries, and nothing here waits on a lock while holding one.
+pub fn retire_seat(root: &Path, key: &str, meant: &Meant) -> Result<serde_json::Value> {
+    use serde_json::json;
     crate::config::identifier(key)?;
+    let refused =
+        |kind: &str, why: String, next: &str| json!({"refused": kind, "why": why, "next": next});
     let lock = root.join("locks").join(format!("seat.{key}"));
     if !lock.exists() {
-        return Ok(refuse(
-            &format!("no seat {key} on this place"),
+        return Ok(refused(
+            "absent",
+            format!("no seat {key} on this place"),
             "nothing to retire",
         ));
     }
+    let Some(_host) = crate::lock::try_shared_host(root)? else {
+        return Ok(refused(
+            "exclusive",
+            "an exclusive run holds or waits for this place".into(),
+            "prune again once it has ended",
+        ));
+    };
     let Some(_held) = crate::lock::try_seat(&lock, RETIRING)? else {
         let named = fs::read_to_string(&lock).unwrap_or_default();
         let why = record::busy(root, key, RETIRING, named.trim());
-        return Ok(refuse(&why, "prune again later"));
+        return Ok(refused("busy", why, "prune again later"));
     };
     execution::pause_at("retire-pause", &lock);
-    // The seat's whole directory (checkout, cache, measurement stamp);
-    // `remove` proves it inside the root right before deleting it.
+    let seat = root.join("seats").join(key);
+    if let Some(kept) = not_meant(&seat, key, meant) {
+        return Ok(kept);
+    }
     let rel = Path::new("seats").join(key);
+    // Proven inside the root, no symbolic link on the way, before the
+    // rename moves anything.
+    if let Some(why) = crate::admission::outside(root, &rel) {
+        return Ok(json!({"failed": key, "why": format!("{why}: not retired")}));
+    }
     let bytes = crate::admission::size_in(root, &rel);
-    if execution::fail_at("retire-delete") {
-        return Ok(refuse(
-            "retire-delete: injected by FERRY_FAIL_AT",
-            "prune again",
-        ));
-    }
-    if let Err(e) = crate::admission::remove(root, &rel) {
-        return Ok(refuse(
-            &format!("deleting {}: {e}", rel.display()),
-            "prune again",
-        ));
-    }
-    let retired = serde_json::json!({"key": key, "bytes": bytes, "retired_ms": receipt::now_ms()});
+    // Renamed whole first, so a failed delete never leaves half a seat
+    // under the key.
+    let tombstone = match to_tombstone(root, key) {
+        Ok(tombstone) => tombstone,
+        Err(why) => return Ok(json!({"failed": key, "why": why})),
+    };
+    let retired = json!({"key": key, "bytes": bytes, "retired_ms": receipt::now_ms()});
     let path = root.join("records").join(format!("retired-{key}.json"));
     let written = if execution::fail_at("retire-record") {
         Err("retire-record: injected by FERRY_FAIL_AT".into())
     } else {
         record::write_new(&path, retired.to_string().as_bytes(), None)
     };
+    // Not retired until recorded and deleted: the caller's book keeps the
+    // seat, so its next prune comes back, finds the key gone and finishes.
     if let Err(error) = written
         && !path.exists()
     {
-        return Ok(refuse(
-            &format!("recording the retire: {error}"),
-            "prune again",
-        ));
+        return Ok(json!({"failed": key, "why": format!("recording the retire: {error}")}));
     }
-    reply(&serde_json::json!({"retired": key, "bytes": bytes}));
-    Ok(0)
+    if let Some(name) = tombstone {
+        let deleted = if execution::fail_at("retire-delete") {
+            Err("retire-delete: injected by FERRY_FAIL_AT".to_owned())
+        } else {
+            crate::admission::remove(root, &Path::new("seats").join(&name))
+                .map_err(|e| e.to_string())
+        };
+        if let Err(why) = deleted {
+            return Ok(json!({
+                "failed": key,
+                "why": format!("deleting the tombstone seats/{name}: {why}; the next prune deletes it"),
+            }));
+        }
+    }
+    let mut said = json!({"retired": key, "bytes": bytes});
+    // Only a retire that retired sweeps earlier retires' tombstones, still
+    // under the lease: an exclusive run arriving meanwhile waits for this
+    // seat's delete and theirs, never for every attempt's.
+    if let Err(why) = delete_tombstones(root) {
+        said["tombstones_left"] = why.into();
+    }
+    Ok(said)
+}
+
+/// The refusal when the seat is no longer the one its caller meant (SPEC
+/// §9), read from `seats/<key>/used` under the seat lock: `used` when it ran
+/// within `idle_ms` on this clock or its latest run is not `once_id`,
+/// `unknown` when `used` cannot be read. No `used` means no run since this
+/// rule shipped: the caller's age stands.
+fn not_meant(seat: &Path, key: &str, meant: &Meant) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let used = match fs::read(seat.join("used")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        read => read
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| serde_json::from_slice::<Used>(&bytes).map_err(|e| e.to_string())),
+    };
+    let used = match used {
+        Ok(used) => used,
+        Err(why) => return Some(json!({"unknown": key, "why": format!("its used record: {why}")})),
+    };
+    let now = receipt::now_ms();
+    let why = if meant
+        .idle_ms
+        .is_some_and(|idle| used.ms.saturating_add(idle) > now)
+    {
+        format!(
+            "used {} s ago by run {}",
+            now.saturating_sub(used.ms) / 1000,
+            used.id
+        )
+    } else if meant.once_id.as_ref().is_some_and(|once| *once != used.id) {
+        format!("its latest run is {}, not this one", used.id)
+    } else {
+        return None;
+    };
+    Some(json!({"refused": "used", "why": why, "next": "it is not idle"}))
+}
+
+/// Renames `seats/<key>` to a fresh tombstone `seats/.retired-<key>-<ms>`,
+/// never over an existing one; `None` when there was no seat directory.
+fn to_tombstone(root: &Path, key: &str) -> std::result::Result<Option<String>, String> {
+    let seat = root.join("seats").join(key);
+    if fs::symlink_metadata(&seat).is_err() {
+        return Ok(None);
+    }
+    if execution::fail_at("retire-rename") {
+        return Err("retire-rename: injected by FERRY_FAIL_AT".into());
+    }
+    let mut ms = receipt::now_ms();
+    let named = loop {
+        let name = format!("{TOMBSTONE}{key}-{ms}");
+        if fs::symlink_metadata(root.join("seats").join(&name)).is_err() {
+            break name;
+        }
+        ms += 1;
+    };
+    fs::rename(&seat, root.join("seats").join(&named))
+        .map_err(|e| format!("renaming seats/{key}: {e}"))?;
+    Ok(Some(named))
+}
+
+/// Deletes every retire tombstone under `seats/` (the caller holds a shared
+/// host lease). The first failure is returned; the rest are still tried.
+fn delete_tombstones(root: &Path) -> std::result::Result<(), String> {
+    let mut first = None;
+    let names: Vec<String> = fs::read_dir(root.join("seats"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(TOMBSTONE))
+        .collect();
+    for name in names {
+        let rel = Path::new("seats").join(&name);
+        let deleted = crate::admission::remove(root, &rel).map_err(|e| e.to_string());
+        if let Err(why) = deleted {
+            first.get_or_insert(format!("deleting {}: {why}", rel.display()));
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// Prints the run's final record (exit 0), or its reservation while it is

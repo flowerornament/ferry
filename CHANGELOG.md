@@ -4,6 +4,18 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **Seats no longer pile up.** `ferry seats prune --idle <dur>` also
+  retires this caller's seats unused for that long, and `ferry run --once`
+  retires its seat once the run's record is final. With
+  `delete_unused_checkouts_after_days = <n>` in `machines.toml`, every run
+  prunes its place's seats unused for `n` days by itself, at most once an
+  hour per place, adding one line to stderr. Retire now never deletes during
+  an exclusive run, checks under the seat lock that the seat was not used
+  since, and renames the seat away before deleting it, so a failed delete
+  never leaves half a seat. `ferry status` lists such leftovers as
+  tombstones, and a refusal below the disk floor names what to run. Seen as
+  97 of 104 seats on one shared host idle for over a day.
+
 - **A killed supervisor no longer leaves its recipe unbounded.** The session
   owner stops its own session 1 s after the run's timeout or deadline
   (TERM, 10 s, KILL), so a supervisor that is SIGKILLed or OOM-killed no

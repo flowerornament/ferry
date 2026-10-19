@@ -123,7 +123,9 @@ pub fn admit(root: &Path, admission: &mut Admission) -> Result<()> {
     admission.available = Some(now);
     if now < policy.min_free_bytes {
         return Err(format!(
-            "below host floor: {now} bytes available, {} required",
+            "below host floor: {now} bytes available, {} required; next: \
+             ferry status --on <this place> shows seat sizes and last runs, and \
+             ferry seats prune --on <this place> --idle <dur> retires idle seats",
             policy.min_free_bytes
         )
         .into());

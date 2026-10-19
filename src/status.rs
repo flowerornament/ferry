@@ -34,6 +34,7 @@ pub fn place(root: &Path) -> Value {
         "gate": gate(root, &runs),
         "runs": runs,
         "seats": seats(root),
+        "tombstones": tombstones(root),
         "leftovers": leftovers(root, &live),
     })
 }
@@ -90,11 +91,13 @@ fn gate(root: &Path, runs: &[Value]) -> Value {
 fn seats(root: &Path) -> Vec<Value> {
     let until = Instant::now() + SIZE_BUDGET;
     let dev = fs::metadata(root).map(|m| m.dev()).unwrap_or_default();
+    // A retire's tombstone is never a seat (SPEC §9): `tombstones` lists it.
     let mut keys: Vec<_> = fs::read_dir(root.join("seats"))
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
         .collect();
     keys.sort();
     keys.into_iter()
@@ -121,6 +124,20 @@ fn seats(root: &Path) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// A retire's tombstones, left by a delete that failed: the next prune
+/// deletes them (SPEC §9). Named only, never measured.
+fn tombstones(root: &Path) -> Vec<Value> {
+    let mut names: Vec<_> = fs::read_dir(root.join("seats"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(crate::place::TOMBSTONE))
+        .collect();
+    names.sort();
+    names.into_iter().map(Value::from).collect()
 }
 
 /// Processes carrying a `FERRY_ID`: a leftover when that run is not live
@@ -180,7 +197,11 @@ pub fn show(on: Option<&str>, hosts: &config::Machines, json: bool) -> Result<i3
     let mut seen = transport::status(&place)?;
     let book = crate::seats::latest()?;
     for seat in seen["seats"].as_array_mut().into_iter().flatten() {
-        if let Some(line) = seat["key"].as_str().and_then(|key| book.get(key)) {
+        let name = on.unwrap_or("local").to_owned();
+        if let Some(line) = seat["key"]
+            .as_str()
+            .and_then(|key| book.get(&(name, key.to_owned())))
+        {
             seat["workspace"] = json!({"seat": line.seat, "repo_path": line.repo_path});
         }
     }
@@ -228,6 +249,11 @@ pub fn show(on: Option<&str>, hosts: &config::Machines, json: bool) -> Result<i3
         println!(
             "seat {name}: {} bytes, last run {} {}",
             seat["bytes"], seat["last_run"], seat["outcome"]
+        );
+    }
+    for tombstone in seen["tombstones"].as_array().into_iter().flatten() {
+        println!(
+            "tombstone {tombstone}: a retired seat whose delete failed; the next prune deletes it"
         );
     }
     let left = &seen["leftovers"];

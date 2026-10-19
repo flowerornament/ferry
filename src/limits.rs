@@ -25,6 +25,13 @@ pub const DRAIN: Duration = Duration::from_secs(2);
 /// the survivors are `unknown` and the pass is abandoned.
 pub const MARKER_BOUND: Duration = Duration::from_secs(10);
 
+/// How often a caller's runs prune a place's idle seats by themselves, at
+/// most (SPEC §9).
+pub const AUTO_PRUNE_EVERY: Duration = Duration::from_hours(1);
+
+/// After this, a prune a run makes by itself starts no new retire.
+pub const AUTO_PRUNE_BUDGET: Duration = Duration::from_secs(10);
+
 /// The most a run's output log holds; later output is read and dropped.
 pub const OUTPUT_CAP: u64 = 1 << 30;
 

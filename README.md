@@ -122,8 +122,8 @@ checking `requires`.
 
 ```
 ferry run <recipe> [--on <machine> | --local] [--exclusive] [--seat <name>]
-          [--commit <rev>] [--timeout-seconds <n>] [--wait-seconds <n>]
-          [--json] [-- <args>…]
+          [--once] [--commit <rev>] [--timeout-seconds <n>] [--wait-seconds <n>]
+          [--json] [-- <args>…]           (--once: the seat lives for this run only)
 ferry follow <id>                   re-attach: the run's output, then its receipt
 ferry stop <id> [--other --reason '<why>']
                                     stop your run (another caller's needs a reason)
@@ -132,8 +132,10 @@ ferry record <id>                   the receipt, completed once the run is final
 ferry recipes                       the recipes at this commit
 ferry machines                      the configured machines
 ferry receipt <id>                  print a receipt
-ferry seats prune [--on <machine>]  retire this caller's seats whose workspace
-                                    is gone (SPEC §9)
+ferry seats prune [--on <machine>] [--idle <dur>]
+                                    retire this caller's seats whose workspace
+                                    is gone, and with --idle (1d, 12h, 0s)
+                                    those unused that long (SPEC §9)
 ferry status [--on <machine>] [--json]
                                     what a place sees now: disk, live runs, the
                                     gate, seats, leftovers (default: this

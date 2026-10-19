@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::{
+    collections::BTreeMap,
     fs,
     path::Path,
     process::{Command, Output},
@@ -591,6 +592,15 @@ fn caller_environment_is_declared_forwarded_and_recorded() {
     );
 }
 
+/// A process a control started (through a recipe), killed by its exact pid
+/// when the control ends; its parent is gone, so nothing reaps it here.
+struct OwnedPid(i32);
+impl Drop for OwnedPid {
+    fn drop(&mut self) {
+        let _ = kill(Pid::from_raw(self.0), Signal::SIGKILL);
+    }
+}
+
 /// A member of a session whose owner may be gone, killed when the control
 /// ends while it is still in that session.
 struct OwnedMember {
@@ -873,9 +883,10 @@ fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
         .flatten()
         .any(|p| p["pid"] == split && p["run"] == id.as_str());
     // SPEC §11: listed when its marker can be read; otherwise reported as
-    // unreadable or an error, never silently absent. On Linux every marker
-    // can be read (§7), so only this pid under this run's id will do: an
-    // unrelated unreadable process on a shared host must not pass for it.
+    // unreadable or an error, never silently absent. On Linux this
+    // fixture's marker can be read (an ordinary same-user process; a
+    // non-dumpable one would not be), so only this pid under this run's id
+    // will do: an unrelated unreadable process must not pass for it.
     if cfg!(target_os = "linux") {
         assert!(listed, "status does not list the split member: {left}");
     } else {
@@ -1566,10 +1577,12 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
+    // Top-level keys a control sets (`machines-top.toml`) come first.
+    let top = fs::read_to_string(dir.join("machines-top.toml")).unwrap_or_default();
     fs::write(
         config.join("machines.toml"),
         format!(
-            "[host.test-host]\nssh='test-host'\nbinary='{binary}'\ntriple='{}-{}'\ncores=1\nfeatures=[]\n",
+            "{top}[host.test-host]\nssh='test-host'\nbinary='{binary}'\ntriple='{}-{}'\ncores=1\nfeatures=[]\n",
             std::env::consts::ARCH,
             if cfg!(target_os = "macos") {
                 "apple-darwin"
@@ -2059,11 +2072,14 @@ fn version_one_guards_the_floor() {
     assert_eq!(admission["policy"]["version"], 1);
     assert_eq!(admission["floor_bytes"], 1_000_000_000_000_000_000u64);
     assert!(admission["available"].as_u64().is_some());
+    let reason = record["reason"].as_str().unwrap();
+    assert!(reason.contains("below host floor"), "{reason}");
+    // SPEC §9: the refusal names where to look and what frees room.
     assert!(
-        record["reason"]
-            .as_str()
-            .unwrap()
-            .contains("below host floor")
+        reason.contains("ferry status --on")
+            && reason.contains("ferry seats prune --on")
+            && reason.contains("--idle"),
+        "{reason}"
     );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("committed"));
 }
@@ -2694,8 +2710,10 @@ fn seats_prune_refuses_a_place_without_retire_naming_its_revision() {
     assert!(place.join("seats").join(&key).join("checkout").exists());
 }
 
-/// The release points of retire: a failed delete or record is reported and
-/// refused (125), and a later prune finishes the retire.
+/// The release points of retire: a failed record or delete is reported and
+/// refused (125), and a later prune finishes the retire. A delete that fails
+/// after the rename leaves only the tombstone (SPEC §9, §12 item 21): the
+/// key is gone, `status` lists the tombstone, and the next prune deletes it.
 #[test]
 fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
     if !cfg!(debug_assertions) {
@@ -2720,11 +2738,686 @@ fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
                 .any(|line| line["retired_ms"].is_u64()),
             "{point}: a failed retire left a tombstone"
         );
+        let place = dir.path().join("host/.local/state/ferry/v1");
+        let tombstones = || {
+            fs::read_dir(place.join("seats"))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(&format!(".retired-{key}-")))
+                .collect::<Vec<_>>()
+        };
+        // Never half a seat under the key: it was renamed whole.
+        assert!(!place.join("seats").join(&key).exists(), "{point}: {said}");
+        assert_eq!(tombstones().len(), 1, "{point}: {said}");
+        let status = remote_command(
+            dir.path(),
+            ".local/bin/ferry",
+            &["status", "--on", "test-host", "--json"],
+        )
+        .output()
+        .unwrap();
+        let seen: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(seen["tombstones"].as_array().unwrap().len(), 1, "{seen}");
+        assert!(
+            !seen["seats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|seat| seat["key"].as_str().unwrap().starts_with('.')),
+            "a tombstone counted as a seat: {seen}"
+        );
         let (code, said) = prune(dir.path(), ".local/bin/ferry");
         assert_eq!(code, Some(0), "{point}: {said}");
         assert!(said.contains("retired"), "{said}");
-        let place = dir.path().join("host/.local/state/ferry/v1");
         assert!(place.join(format!("records/retired-{key}.json")).exists());
+        assert!(tombstones().is_empty(), "{point}: the tombstone stayed");
+    }
+}
+
+/// Makes `key` look last used `ago` ms back: on the caller's book (every
+/// line of that key) and, unless `book_only`, on the place's `used` record.
+fn age(dir: &Path, key: &str, ago: u128, book_only: bool) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let book = dir.join("state/ferry/seats.jsonl");
+    let lines: Vec<String> = fs::read_to_string(&book)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["key"] == key {
+                value["last_used_ms"] = serde_json::json!(now - ago);
+            }
+            value.to_string()
+        })
+        .collect();
+    fs::write(&book, lines.join("\n") + "\n").unwrap();
+    if !book_only {
+        let used = dir
+            .join("host/.local/state/ferry/v1/seats")
+            .join(key)
+            .join("used");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&used).unwrap()).unwrap();
+        value["ms"] = serde_json::json!(now - ago);
+        fs::write(&used, value.to_string()).unwrap();
+    }
+}
+
+fn prune_with(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let mut all = vec!["seats", "prune"];
+    all.extend_from_slice(args);
+    let out = remote_command(dir, ".local/bin/ferry", &all)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+const DAY_MS: u128 = 86_400_000;
+
+/// SPEC §12 item 20: `prune --idle` retires a seat idle on both clocks
+/// (this caller's book and the place's `used`), keeps one used since by
+/// either, keeps one whose age is unknown, skips a busy one, and reports
+/// each; records and run folders stay. Item 21: a book that predates a run
+/// on the seat (the place's `used` is newer) is refused `used`.
+#[test]
+fn seats_prune_idle_retires_only_what_is_idle_on_both_clocks() {
+    let dir = fixture();
+    let names = ["idle", "recent", "reused", "ageless", "busy"];
+    let mut keys = BTreeMap::new();
+    for name in names {
+        let repo = workspace(dir.path(), name);
+        assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+        keys.insert(name, key_of(dir.path(), &repo));
+    }
+    age(dir.path(), &keys["idle"], 2 * DAY_MS, false);
+    age(dir.path(), &keys["reused"], 2 * DAY_MS, true);
+    age(dir.path(), &keys["busy"], 2 * DAY_MS, false);
+    // A line written before last_used_ms existed has an unknown age.
+    let book = dir.path().join("state/ferry/seats.jsonl");
+    let lines: Vec<String> = fs::read_to_string(&book)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["key"] == keys["ageless"].as_str() {
+                value.as_object_mut().unwrap().remove("last_used_ms");
+            }
+            value.to_string()
+        })
+        .collect();
+    fs::write(&book, lines.join("\n") + "\n").unwrap();
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    let held = fs::File::open(place.join("locks").join(format!("seat.{}", keys["busy"]))).unwrap();
+    fs2::FileExt::try_lock_exclusive(&held).unwrap();
+    let runs = fs::read_dir(place.join("runs")).unwrap().count();
+    let (code, said) = prune_with(dir.path(), &["--idle", "1d"]);
+    assert_eq!(code, Some(0), "{said}");
+    let seat = |name: &str| place.join("seats").join(&keys[name]);
+    let line = |name: &str| {
+        said.lines()
+            .find(|line| line.contains(&format!("/{name} on test-host")))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(!seat("idle").exists(), "{said}");
+    assert!(
+        line("idle").starts_with("retired") && line("idle").contains("unused for 2d"),
+        "{said}"
+    );
+    for kept in ["recent", "reused", "ageless", "busy"] {
+        assert!(seat(kept).join("checkout").exists(), "{kept}: {said}");
+    }
+    assert!(
+        line("recent").is_empty(),
+        "a recent seat is not considered: {said}"
+    );
+    assert!(line("reused").starts_with("skipped (used since)"), "{said}");
+    assert!(
+        line("ageless").starts_with("kept") && line("ageless").contains("age is unknown"),
+        "{said}"
+    );
+    assert!(line("busy").starts_with("skipped default"), "{said}");
+    assert_eq!(fs::read_dir(place.join("runs")).unwrap().count(), runs);
+    assert!(
+        seats_book(dir.path())
+            .iter()
+            .any(|line| line["key"] == keys["idle"].as_str() && line["retired_ms"].is_u64())
+    );
+    drop(held);
+}
+
+/// SPEC §9: no retire, by hand or by itself, deletes while an exclusive run
+/// holds the host or waits at its gate: it is refused `exclusive`.
+#[test]
+fn retire_is_refused_while_an_exclusive_run_holds_the_host() {
+    for lock in ["host", "host.gate"] {
+        let dir = fixture();
+        let repo = workspace(dir.path(), "idle");
+        assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+        let key = key_of(dir.path(), &repo);
+        age(dir.path(), &key, 2 * DAY_MS, false);
+        let place = dir.path().join("host/.local/state/ferry/v1");
+        let held = fs::File::open(place.join("locks").join(lock)).unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        let (code, said) = prune_with(dir.path(), &["--idle", "1d"]);
+        assert_eq!(code, Some(0), "{lock}: {said}");
+        assert!(
+            said.starts_with("skipped (exclusive run)") && said.contains("/idle on"),
+            "{lock}: {said}"
+        );
+        assert!(
+            place.join("seats").join(&key).join("checkout").exists(),
+            "{lock}"
+        );
+        drop(held);
+        let (code, said) = prune_with(dir.path(), &["--idle", "1d"]);
+        assert_eq!(code, Some(0), "{said}");
+        assert!(
+            said.starts_with("retired") && said.contains("/idle on"),
+            "{lock}: {said}"
+        );
+    }
+}
+
+/// Waits for run `id`'s `--once` retire to be logged by its supervisor,
+/// and returns that line.
+fn once_logged(dir: &Path, id: &str) -> String {
+    let log = dir
+        .join("host/.local/state/ferry/v1/runs")
+        .join(id)
+        .join("supervisor.log");
+    let until = common::startup_deadline();
+    loop {
+        if let Some(line) = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .find(|line| line.starts_with("ferry: --once retire"))
+        {
+            return line.to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the --once retire never ran"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The host record of run `id` on the test place.
+fn host_record(dir: &Path, id: &str) -> serde_json::Value {
+    let path = dir
+        .join("host/.local/state/ferry/v1/records")
+        .join(format!("{id}.json"));
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// SPEC §12 item 19: a `--once` run ends with one final record saying
+/// `once`, the seat retired and recorded, and no `seats/<key>`. With the
+/// retire failing before the rename, the record is the same and final, the
+/// seat stays, `status` lists it, and a later `prune --idle 0s` retires it.
+#[test]
+fn a_once_run_retires_its_seat_after_its_final_record() {
+    let dir = fixture();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--once", "--json"],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let key = key_of(dir.path(), dir.path());
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    let record = host_record(dir.path(), &id);
+    assert_eq!(record["once"], true, "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    // The retire comes after the record is final: wait for its effect.
+    let until = common::startup_deadline();
+    while place.join("seats").join(&key).exists() {
+        assert!(std::time::Instant::now() < until, "the --once seat stayed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(place.join(format!("records/retired-{key}.json")).exists());
+    assert_eq!(
+        host_record(dir.path(), &id),
+        record,
+        "the record changed after final"
+    );
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--once", "--json"],
+    )
+    .env("FERRY_FAIL_AT", "retire-rename")
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let key = key_of(dir.path(), dir.path());
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    let record = host_record(dir.path(), &id);
+    assert_eq!(record["once"], true, "{record}");
+    let line = once_logged(dir.path(), &id);
+    assert!(line.contains("retire-rename"), "{line}");
+    assert!(place.join("seats").join(&key).join("checkout").exists());
+    let status = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["status", "--on", "test-host", "--json"],
+    )
+    .output()
+    .unwrap();
+    let seen: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        seen["seats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|seat| seat["key"] == key.as_str()),
+        "{seen}"
+    );
+    let (code, said) = prune_with(dir.path(), &["--idle", "0s"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(said.contains("retired"), "{said}");
+    assert!(!place.join("seats").join(&key).exists());
+    assert_eq!(host_record(dir.path(), &id), record);
+}
+
+/// SPEC §12 items 19 and 21: a `--once` run that leaves a child holding the
+/// seat's inherited descriptor (item 9's escaped child; also one that
+/// cleared its marker) keeps its seat: the record is final and unchanged,
+/// the seat stays busy, prune skips it while the child lives, and retires it
+/// once the child has exited. Closing, never `LOCK_UN`, is what keeps it.
+#[test]
+fn a_once_seat_held_by_a_survivor_stays_until_it_exits() {
+    for launch in ["", "env -i PATH=\"$PATH\" "] {
+        let dir = fixture();
+        let child = dir.path().join("child");
+        let p = child.display();
+        // Item 9's leaver: its own session, so the run's stop never reaches
+        // it, holding the seat's inherited descriptor.
+        fs::write(
+            dir.path().join("ferry.toml"),
+            format!(
+                "version=1\n[recipe.pass]\ncommand=['sh','-c','{launch}python3 -c \"import os,time; os.setsid(); open(\\\"{p}.tmp\\\",\\\"w\\\").write(str(os.getpid())); os.rename(\\\"{p}.tmp\\\",\\\"{p}\\\"); time.sleep(600)\" </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done']\nroutable=true\n"
+            ),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "ferry.toml"]);
+        git(dir.path(), &["commit", "-m", "an escaped child"]);
+        let out = remote_command(
+            dir.path(),
+            ".local/bin/ferry",
+            &["run", "pass", "--on", "test-host", "--once", "--json"],
+        )
+        .output()
+        .unwrap();
+        let pid: i32 = fs::read_to_string(&child).unwrap().trim().parse().unwrap();
+        let guard = OwnedPid(pid);
+        assert_eq!(out.status.code(), Some(0), "{launch}: {}", receipt(&out));
+        let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+        let key = key_of(dir.path(), dir.path());
+        let place = dir.path().join("host/.local/state/ferry/v1");
+        let record = host_record(dir.path(), &id);
+        let line = once_logged(dir.path(), &id);
+        assert!(line.contains("\"refused\":\"busy\""), "{launch}: {line}");
+        assert!(
+            place.join("seats").join(&key).join("checkout").exists(),
+            "{launch}: the seat was retired under a live child"
+        );
+        let (code, said) = prune_with(dir.path(), &["--idle", "0s"]);
+        assert_eq!(code, Some(0), "{said}");
+        assert!(said.contains("skipped"), "{launch}: {said}");
+        assert!(place.join("seats").join(&key).join("checkout").exists());
+        drop(guard);
+        let until = common::startup_deadline();
+        while alive(pid) {
+            assert!(std::time::Instant::now() < until, "the child stayed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (code, said) = prune_with(dir.path(), &["--idle", "0s"]);
+        assert_eq!(code, Some(0), "{said}");
+        assert!(said.contains("retired"), "{launch}: {said}");
+        assert_eq!(host_record(dir.path(), &id), record, "{launch}");
+    }
+}
+
+/// SPEC §12 item 21: a `--once` retire delayed past another run on the same
+/// seat finds that run's `used` and is refused: the later run keeps it.
+#[test]
+fn a_delayed_once_retire_never_deletes_a_reused_seat() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let once = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--once", "--json"],
+    )
+    .env("FERRY_FAIL_AT", "once-retire-pause")
+    .stdout(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    let until = common::startup_deadline();
+    let paused = loop {
+        let found = fs::read_dir(place.join("runs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|run| run.path().join("once.paused"))
+            .find(|paused| paused.exists());
+        if let Some(paused) = found {
+            break paused;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the --once retire never paused"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let once = once.wait_with_output().unwrap();
+    assert_eq!(once.status.code(), Some(0), "{}", receipt(&once));
+    // The seat is free (its record is final, its lock closed): a later run
+    // takes it and writes its `used`.
+    assert_eq!(remote_pass(dir.path(), dir.path()).status.code(), Some(0));
+    fs::write(paused.with_extension("go"), "").unwrap();
+    let key = key_of(dir.path(), dir.path());
+    let id = paused
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let line = once_logged(dir.path(), &id);
+    assert!(line.contains("\"refused\":\"used\""), "{line}");
+    assert!(
+        place.join("seats").join(&key).join("checkout").exists(),
+        "a delayed --once retire deleted the seat a later run used"
+    );
+}
+
+/// SPEC §12 item 23: with `delete_unused_checkouts_after_days`, a run prunes
+/// its place's idle seats by itself, after its receipt: it retires a seat
+/// unused for two days, keeps one used an hour ago, prints one line on
+/// stderr, and keeps its own code and `--json`. A second run within the
+/// hour does not prune, nor one that finds the claim's lock held.
+#[test]
+fn a_run_prunes_its_places_idle_seats_by_itself() {
+    let dir = fixture();
+    fs::write(
+        dir.path().join("machines-top.toml"),
+        "delete_unused_checkouts_after_days = 1\n",
+    )
+    .unwrap();
+    let old = workspace(dir.path(), "old");
+    let hour = workspace(dir.path(), "hour");
+    for repo in [&old, &hour] {
+        assert_eq!(remote_pass(dir.path(), repo).status.code(), Some(0));
+    }
+    let (old_key, hour_key) = (key_of(dir.path(), &old), key_of(dir.path(), &hour));
+    // The runs above already claimed this hour: start from none.
+    fs::remove_file(dir.path().join("state/ferry/pruned.json")).unwrap();
+    age(dir.path(), &old_key, 2 * DAY_MS, false);
+    age(dir.path(), &hour_key, 3_600_000, false);
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "fail", "--on", "test-host", "--json"],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(125), "the run's own code");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let pruned: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("ferry: pruned test-host"))
+        .collect();
+    assert_eq!(pruned.len(), 1, "{stderr}");
+    assert!(pruned[0].contains("retired 1 unused for 1d"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("pruned"));
+    assert!(!place.join("seats").join(&old_key).exists());
+    assert!(
+        place
+            .join("seats")
+            .join(&hour_key)
+            .join("checkout")
+            .exists()
+    );
+    // Within the hour: no prune, even of a seat now idle.
+    age(dir.path(), &hour_key, 2 * DAY_MS, false);
+    let out = remote_pass(dir.path(), dir.path());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("pruned"));
+    assert!(
+        place
+            .join("seats")
+            .join(&hour_key)
+            .join("checkout")
+            .exists()
+    );
+    // The claim's lock held by another run: skipped silently.
+    fs::remove_file(dir.path().join("state/ferry/pruned.json")).unwrap();
+    let lock = fs::File::create(dir.path().join("state/ferry/pruned.lock")).unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    let out = remote_pass(dir.path(), dir.path());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("pruned"));
+    assert!(
+        place
+            .join("seats")
+            .join(&hour_key)
+            .join("checkout")
+            .exists()
+    );
+    drop(lock);
+    let out = remote_pass(dir.path(), dir.path());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ferry: pruned test-host: retired 1"));
+}
+
+/// SPEC §12 item 23: two runs ending together prune their place once: the
+/// hour is claimed under the lock before pruning.
+#[test]
+fn two_runs_ending_together_prune_once() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    fs::write(
+        dir.path().join("machines-top.toml"),
+        "delete_unused_checkouts_after_days = 1\n",
+    )
+    .unwrap();
+    let repos: Vec<_> = ["a", "b", "old"]
+        .iter()
+        .map(|name| workspace(dir.path(), name))
+        .collect();
+    for repo in &repos {
+        assert_eq!(remote_pass(dir.path(), repo).status.code(), Some(0));
+    }
+    fs::remove_file(dir.path().join("state/ferry/pruned.json")).unwrap();
+    let old = key_of(dir.path(), &repos[2]);
+    age(dir.path(), &old, 2 * DAY_MS, false);
+    // Both runs stop inside the claim (`prune-claim`, after its lock): the
+    // first holds it there; the second must find it held and skip, never
+    // wait to read the same old time.
+    let spawn = |repo: &Path| {
+        remote_command(
+            dir.path(),
+            ".local/bin/ferry",
+            &["run", "pass", "--on", "test-host", "--json"],
+        )
+        .current_dir(repo)
+        .env("FERRY_FAIL_AT", "prune-claim")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+    };
+    let claim = dir.path().join("state/ferry/prune-claim");
+    let mut first = spawn(&repos[0]);
+    let until = common::startup_deadline();
+    while !claim.with_extension("paused").exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the first claim never paused"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut second = spawn(&repos[1]);
+    let until = std::time::Instant::now() + common::slack();
+    while second.try_wait().unwrap().is_none() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fs::write(claim.with_extension("go"), "").unwrap();
+    let mut pruned = 0;
+    for run in [&mut first, &mut second] {
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(run.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+        assert_eq!(run.wait().unwrap().code(), Some(0), "{stderr}");
+        pruned += stderr
+            .lines()
+            .filter(|line| line.starts_with("ferry: pruned test-host"))
+            .count();
+    }
+    assert_eq!(pruned, 1, "two runs pruned the same place in one hour");
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    assert!(!place.join("seats").join(&old).exists());
+}
+
+/// A place without `seat-lifetime` (an older Ferry) is refused an idle
+/// retire, naming its revision, and a `--once` run before acceptance: it
+/// would neither check the seat's latest use nor keep out of an exclusive
+/// run. Its workspace-gone retire still works as before.
+#[test]
+fn a_place_without_seat_lifetime_is_refused_idle_and_once() {
+    let dir = fixture();
+    let bin = dir.path().join("host/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("old-ferry"),
+        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"seat-lifetime\",//' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    let repo = workspace(dir.path(), "idle");
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .current_dir(&repo)
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let key = key_of(dir.path(), &repo);
+    age(dir.path(), &key, 2 * DAY_MS, false);
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["seats", "prune", "--idle", "1d"],
+    )
+    .output()
+    .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(125), "{said}");
+    assert!(
+        said.contains("lacks seat-lifetime") && said.contains("0ld-place-rev"),
+        "{said}"
+    );
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    assert!(place.join("seats").join(&key).join("checkout").exists());
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/old-ferry",
+        &["run", "pass", "--on", "test-host", "--once", "--json"],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(125), "{}", receipt(&out));
+    assert!(
+        receipt(&out)["reason"]
+            .as_str()
+            .unwrap()
+            .contains("seat-lifetime"),
+        "{}",
+        receipt(&out)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("\"submitted\""));
+    fs::remove_dir_all(&repo).unwrap();
+    let out = remote_command(dir.path(), ".local/bin/old-ferry", &["seats", "prune"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!place.join("seats").join(&key).exists());
+}
+
+/// Every wait is bounded (SPEC §9, PRINCIPLES 5): a caller waits for a
+/// retire in flight only up to the ssh reply bound, then reports the place
+/// unreachable (255); the place goes on with the retire.
+#[test]
+fn a_slow_retire_is_waited_for_only_up_to_the_reply_bound() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let repo = workspace(dir.path(), "idle");
+    assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+    let key = key_of(dir.path(), &repo);
+    age(dir.path(), &key, 2 * DAY_MS, false);
+    let lock = dir
+        .path()
+        .join("host/.local/state/ferry/v1/locks")
+        .join(format!("seat.{key}"));
+    let started = std::time::Instant::now();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["seats", "prune", "--idle", "1d"],
+    )
+    .env("FERRY_FAIL_AT", "retire-pause")
+    .env("FERRY_SSH_REPLY_MS", "2000")
+    .output()
+    .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(255), "{said}");
+    assert!(said.contains("did not reply within"), "{said}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2) + common::slack());
+    // Let the paused retire go on, as the place would.
+    fs::write(lock.with_extension("go"), "").unwrap();
+}
+
+/// The book's `delete_unused_checkouts_after_days` is a whole number of
+/// days, at least 1: anything else is a bad `machines.toml`.
+#[test]
+fn delete_unused_checkouts_after_days_is_whole_days_from_one() {
+    for bad in ["0", "1.5", "-1", "'1d'", "36501", "18446744073709551615"] {
+        let dir = fixture();
+        fs::write(
+            dir.path().join("machines-top.toml"),
+            format!("delete_unused_checkouts_after_days = {bad}\n"),
+        )
+        .unwrap();
+        let out = remote_pass(dir.path(), dir.path());
+        assert_eq!(out.status.code(), Some(125), "{bad}");
     }
 }
 
