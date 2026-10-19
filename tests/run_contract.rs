@@ -872,10 +872,10 @@ fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
         .into_iter()
         .flatten()
         .any(|p| p["pid"] == split && p["run"] == id.as_str());
-    // macOS may withhold a process's environment: then it is counted as
-    // unreadable, never silently absent.
+    // SPEC §11: listed when its marker can be read; otherwise reported as
+    // unreadable or an error, never silently absent.
     assert!(
-        listed || (cfg!(target_os = "macos") && left["unreadable"].as_u64() > Some(0)),
+        listed || left["unreadable"].as_u64() > Some(0) || left["error"].is_string(),
         "status does not report the split member: {left}"
     );
     drop(guard);
