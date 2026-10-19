@@ -808,7 +808,9 @@ receipt is seeing this rule, not a bug.
     goes to `bench`, and `--on bench` runs either there. `--on bench` is
     still refused for a recipe without `may_run_elsewhere` and for one
     needing what bench lacks. Without `--on`, a recipe without
-    `may_run_elsewhere` still runs locally. Without `gates`,
+    `may_run_elsewhere` still runs locally. With `reserved_for = ["quiet",
+    "special"]` (both in `has`) on the only capable machine, a recipe
+    needing just `quiet` is chosen there without `--on`. Without `gates`,
     the first is refused, never sent to `bench`. A `reserved_for`
     name missing from that machine's `has` refuses the run as a bad
     `machines.toml`.
