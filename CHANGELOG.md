@@ -4,6 +4,14 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **A stalled push no longer holds the caller.** The caller's object push
+  now has an output watchdog: 60 s without new progress output (git's own,
+  or the place's `remote:` lines) stops the push and refuses the run (125),
+  "the push printed no progress for 60 s". A large push that keeps printing
+  progress is never cut. The store setup now has the same 60 s reply bound
+  as `host-info`. Before, a place's git that stopped reading held the caller
+  forever, with no record.
+
 ## v0.1.2 - 2026-10-19
 
 - **Run history no longer grows forever.** With

@@ -143,7 +143,13 @@ fn answered(command: &mut Command) -> Result<(std::process::ExitStatus, Vec<u8>,
             break status;
         }
         if Instant::now() >= until {
-            // Our own child, by its handle: never a pattern.
+            // Our own child, by its handle: never a pattern. A child that
+            // leads a process group of its own (we made it so) goes with
+            // the group, its ssh included.
+            let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+            if nix::unistd::getpgid(Some(pid)) == Ok(pid) {
+                let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(late().into());
@@ -247,7 +253,11 @@ pub fn host_info() -> Result<HostInfo> {
 /// ref first and win git's ref lock: a failed push whose ref now holds that
 /// commit is published, not an error.
 fn push(root: &Path, ssh: &str, store: &str, refspec: &str) -> Result<()> {
-    let ssh_command = std::iter::once("ssh".to_owned())
+    // Quiet: ssh shares git's stderr, so its own diagnostics would read as
+    // the push's progress (SPEC §6).
+    let ssh_command = ["ssh", "-o", "LogLevel=ERROR"]
+        .into_iter()
+        .map(str::to_owned)
         .chain(ssh_options(ssh)?)
         .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
@@ -262,23 +272,117 @@ fn push(root: &Path, ssh: &str, store: &str, refspec: &str) -> Result<()> {
             .arg(format!("{ssh}:{store}"));
         Ok::<_, Box<dyn std::error::Error>>(command)
     };
-    let pushed = repository::output(git(&["push", "--no-verify"])?.arg(refspec));
-    let Err(error) = pushed else {
-        return Ok(());
+    let error = match progressing(git(&["push", "--no-verify", "--progress"])?.arg(refspec))? {
+        Pushed::Done => return Ok(()),
+        // A stalled place is not asked again: its answer would wait too.
+        Pushed::Stalled(why) => return Err(why.into()),
+        Pushed::Failed(why) => why,
     };
     let (commit, reference) = refspec.split_once(':').ok_or("invalid refspec")?;
     // Any failure to check keeps the push's own error. ls-remote matches
     // pattern tails, so only the line naming exactly this ref counts.
-    let listed =
-        git(&["ls-remote"]).and_then(|mut command| repository::output(command.arg(reference)));
+    // In a group of its own, so the bound stops its ssh too.
+    let listed = git(&["ls-remote"]).and_then(|mut command| {
+        use std::os::unix::process::CommandExt;
+        replied(command.arg(reference).process_group(0))
+    });
     let Ok(listed) = listed else {
-        return Err(error);
+        return Err(error.into());
     };
     let published = String::from_utf8_lossy(&listed).lines().any(|line| {
         let mut fields = line.split_whitespace();
         fields.next() == Some(commit) && fields.next() == Some(reference)
     });
-    if published { Ok(()) } else { Err(error) }
+    if published { Ok(()) } else { Err(error.into()) }
+}
+
+/// How a push ended.
+enum Pushed {
+    Done,
+    Failed(String),
+    Stalled(String),
+}
+
+/// Runs a `git push --progress` in a process group of its own, bounded by
+/// progress, not wall-clock time (SPEC §6): git refreshes its progress while
+/// it counts, compresses and writes, and the place's `remote:` lines arrive
+/// on the same stderr, so a place that stops reading leaves it silent. No
+/// new byte for `PUSH_STALL` (debug builds read `FERRY_PUSH_STALL_MS`) is a
+/// stall: the group, ours and recorded by its pid, is killed.
+fn progressing(command: &mut Command) -> Result<Pushed> {
+    use std::os::unix::process::CommandExt;
+    let stall = execution::debug_bound("FERRY_PUSH_STALL_MS")
+        .map_or(crate::limits::PUSH_STALL, Duration::from_millis);
+    let mut child = command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let group = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
+    let mut pipe = child.stderr.take().ok_or("no push stderr")?;
+    let started = Instant::now();
+    // Milliseconds from `started` to the last progress byte, and the end of
+    // what was said (16 KiB), readable at once when git exits, so a
+    // descendant still holding the pipe neither delays nor blanks it.
+    let heard = std::sync::Arc::new(AtomicU64::new(0));
+    let said = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (last, kept) = (heard.clone(), said.clone());
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        while let Ok(read @ 1..) = pipe.read(&mut buffer) {
+            last.store(
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            if let Ok(mut all) = kept.lock() {
+                all.extend_from_slice(&buffer[..read]);
+                let excess = all.len().saturating_sub(16 << 10);
+                all.drain(..excess);
+            }
+        }
+    });
+    let stop = || {
+        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+    };
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        // In a group of its own, the push never sees the terminal's
+        // signal: the caller that caught one stops it, as before dispatch.
+        if execution::caught_signal().is_some() {
+            stop();
+            let _ = child.wait();
+            execution::interrupted()?;
+        }
+        let quiet = started
+            .elapsed()
+            .saturating_sub(Duration::from_millis(heard.load(Ordering::SeqCst)));
+        if quiet >= stall {
+            stop();
+            let _ = child.wait();
+            return Ok(Pushed::Stalled(format!(
+                "the push printed no progress for {} s",
+                stall.as_secs_f64()
+            )));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if status.success() {
+        return Ok(Pushed::Done);
+    }
+    // The last lines git said: its `fatal:`, `error:` or `!` lines and what
+    // explains them, never only a trailing hint.
+    let all = said.lock().map(|all| all.clone()).unwrap_or_default();
+    let text = String::from_utf8_lossy(&all);
+    let lines: Vec<&str> = text
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let tail = lines[lines.len().saturating_sub(4)..].join("; ");
+    Ok(Pushed::Failed(format!("command failed: {status}: {tail}")))
 }
 
 /// Where a run's place verbs run: a local exec on the repository's state
@@ -442,11 +546,20 @@ fn ship_local(
 ) -> Result<()> {
     fs::create_dir_all(state)?;
     let bare = state.join("store/repo.git");
-    init_store(
+    // A local command: not under the place's reply bound (SPEC §6). Two
+    // runs may race to create it, so a failure is retried.
+    let mut tries = 0;
+    while let Err(error) = repository::output(
         Command::new("git")
             .args(["init", "-q", "--bare"])
             .arg(&bare),
-    )?;
+    ) {
+        tries += 1;
+        if tries > 10 {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     // Two runs may fetch the same object at once: a fetch that loses
     // the ref's lock to the same commit has shipped it.
     let fetch = |repo: &Path, refspec: &str| {
@@ -492,15 +605,23 @@ fn kept(commit: &str) -> String {
     format!("{commit}:refs/ferry/ship/{commit}")
 }
 
-/// Initializes the place's store, again if it exists (harmless). Two first
-/// runs may race on its config lock, so a failure is retried a few times.
+/// Sets up the place's store, again if it exists (harmless), as a short
+/// reply under the reply bound (SPEC §6). Two first runs may race on its
+/// config lock, so git's own failure is retried a few times; ssh's (255,
+/// the link) and a place that does not answer are not.
 fn init_store(command: &mut Command) -> Result<()> {
     let mut tries = 0;
     loop {
-        match repository::output(command) {
-            Ok(_) => return Ok(()),
-            Err(_) if tries < 10 => tries += 1,
-            Err(error) => return Err(error),
+        let (status, _, err) = answered(command)?;
+        // 255 is ssh's own failure (the link), not the race retried here.
+        match (status.success(), status.code()) {
+            (true, _) => return Ok(()),
+            (false, Some(code)) if code != 255 && tries < 10 => tries += 1,
+            (false, _) => {
+                return Err(
+                    format!("command failed: {}", String::from_utf8_lossy(&err).trim()).into(),
+                );
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }

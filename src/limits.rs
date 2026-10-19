@@ -63,5 +63,10 @@ pub const TEARDOWN: Duration = Duration::from_secs(
 /// instead of holding the caller (PRINCIPLES 5).
 pub const SSH_REPLY: Duration = Duration::from_secs(60);
 
+/// How long the caller's object push may go without progress output before
+/// it counts as stalled (SPEC §6): no wall-clock bound, so a large push that
+/// keeps moving is never cut.
+pub const PUSH_STALL: Duration = Duration::from_secs(60);
+
 /// How long a caller keeps trying a place that does not answer.
 pub const UNREACHABLE: Duration = Duration::from_mins(5);

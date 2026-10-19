@@ -393,9 +393,24 @@ or prepares its seat) runs none of them, collect included: nothing ran.
   own connection, so the short replies a caller needs before it submits
   (`host-info`, a file read) also have a 60 s wall-clock bound, covering the
   reply's end too: past it the caller stops its own `ssh` and the run is
-  refused (125), with nothing run. The object push and the store setup have
-  no wall-clock bound yet (a large push can legitimately take long): a push
-  that stalls on a live link waits.
+  refused (125), with nothing run. The store setup and the `ls-remote` check
+  after a failed push are short replies under the same bound. The object
+  push has no wall-clock bound, since a large push can legitimately take
+  long; it has an output watchdog instead. The caller runs `git push
+  --progress` (its ssh quiet, `LogLevel=ERROR`) in a process group of its
+  own, and 60 s without a new byte of progress output (git's own lines or the
+  place's `remote:` lines) ends it: the caller stops that group and the run
+  is refused (125), "the push printed no progress for 60 s". Output is a
+  proxy for progress, so it errs both ways:
+  - a push stuck while something keeps printing (a remote hook, or a
+    `ProxyCommand` wrapper with its own periodic output) is not cut;
+  - real work silent for 60 s is refused. The likeliest case is the first
+    push of a large repository into an empty store: after "Writing objects
+    … done", the place's git checks connectivity without printing. A
+    retry pushes it all again (a failed push keeps nothing), so the first
+    run of a repository that big is best made over a fast link.
+  A signal to the caller (Ctrl-C) stops the push at once, as before
+  dispatch.
 - **Submitted means asked.** The receipt is first written, as `submitted`,
   just before the place is asked to run the request. Anything that fails
   before that is a refusal (125), and a caller killed before it leaves no
