@@ -395,11 +395,16 @@ Nothing else is written; Ferry writes nowhere outside these.
   (`records/<id>.json`). With `delete_run_history_after_days = <n>` in
   `host.toml` (a whole number of days, at least 1; anything else refuses
   the run as a bad `host.toml`), each run, after its record is final and
-  its locks are released (in teardown, after a `--once` retire), deletes
-  the history of final runs submitted more than `<n>` days ago (by the
-  host record's own `submitted_ms`, on the host's clock), oldest first.
-  It never delays a recipe, adds disk work before one, or counts against
-  a run's timeout.
+  its own locks are released (in teardown, after a `--once` retire),
+  deletes the history of final runs submitted more than `<n>` days ago (by
+  the host record's own `submitted_ms`, on the host's clock), oldest
+  first. It never delays its own recipe or its caller, and never counts
+  against a run's timeout.
+- **Never under a timing run:** the pass first takes a fresh shared
+  `host` lease with a try that never waits, held by the supervisor alone.
+  If an exclusive run holds `host`, the pass is skipped and left to a
+  later run. While the pass holds it, no exclusive recipe can start: one
+  that arrives waits for the pass, at most its budget plus one file.
 - **Old reservations:** a reserved record older than `<n>` days is first
   reconciled by the ordinary rule (§8: another boot, a dead supervisor pid
   or a different start time makes it `lost`); a live supervisor's
@@ -417,16 +422,18 @@ Nothing else is written; Ferry writes nowhere outside these.
   `retired_ms` is kept. Without the key, history is kept forever. It never
   touches a live reservation, a seat, `store/`, or a caller's receipts and
   fetched artifacts.
-- **Budget:** after one second the run starts no new deletion; one already
-  under way may overrun it, delaying only the supervisor's exit. What is
+- **Budget:** the pass deletes file by file and checks one second between
+  files, so it overruns by at most one file's unlink; it then releases
+  its lease. What is
   left waits for the next run. A run's folder is deleted before its
   record, so a run deleted only in part keeps its record and stays
   eligible next time. A reader that already has a file open (a `follow`
   in progress) finishes reading it; a new reader of a deleted run gets
   not-found.
 - **The account:** the run's record is already final, so a pass that
-  deleted anything writes `records/history-<ms>.json` (`{run, deleted,
-  older_than_days}`), which ages on the same rule. `deleted` counts whole
+  deleted anything creates `records/history-<ms>-<run>.json` (`{ms, run,
+  deleted, older_than_days}`), never replacing one; it ages by its `ms`
+  on the same rule. `deleted` counts whole
   runs only (folder and record both gone). Two passes may race on the
   same files; a file already gone is not an error, and a run counts for
   the pass that removed its record. Afterwards `ferry record <id>` and
@@ -570,8 +577,11 @@ working tree.
     ago, a reserved run from two days ago with its supervisor live, and a
     reserved run from two days ago whose supervisor is gone, deletes, after
     its own record is final, the first run's and the reconciled fourth
-    run's folders and records, and writes `records/history-<ms>.json` with
-    `deleted: 2`. Its recipe starts with no deletion before it. An old
+    run's folders and records, and writes `records/history-<ms>-<run>.json` with
+    `deleted: 2`. Its recipe starts with no deletion before it. With the
+    pass held mid-delete, an exclusive run submitted then does not start
+    its recipe until the pass has released its lease; with an exclusive
+    run holding `host`, the pass is skipped. An old
     final run whose recorded survivor is still alive (with or without a
     recorded start) is kept. Without the key nothing is deleted; with `0`
     or `1.5` the run is refused as a bad `host.toml`. A seat, `store/` and
