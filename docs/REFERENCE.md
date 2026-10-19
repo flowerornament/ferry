@@ -268,8 +268,10 @@ receipts or records.
   unknown, failed) and appends a tombstone line to the book for each one
   retired; a later run on the same workspace revives it. A retirement line
   carries the last use its prune meant, so one acknowledged late, after a
-  run had already recreated the seat, never hides it (on a caller whose
-  clock does not step back). The other way round, a retire that deleted the
+  run had already recreated the seat, never hides it, as long as the
+  recreating run's last use reads strictly later than the use the retire
+  meant: an equal millisecond, or a caller clock stepped back, can still
+  hide it. The other way round, a retire that deleted the
   recreated seat itself (it ran after the run that recreated it) leaves
   the book listing the seat live: the next prune that considers it finds
   it absent and books it gone. Local seats live
