@@ -424,7 +424,10 @@ Nothing else is written; Ferry writes nowhere outside these.
 **Bound on run history (the host's records):**
 
 - A run's history is its run folder (`runs/<id>/`) and its record
-  (`records/<id>.json`). With `delete_run_history_after_days = <n>` in
+  (`records/<id>.json`), with any reservation (`records/<id>.reserved.json`)
+  a crashed finalize left beside that final record: it is not live, and
+  left alone it would be reconciled into a second, `lost` record once the
+  final one is gone. With `delete_run_history_after_days = <n>` in
   `host.toml` (a whole number of days, at least 1; anything else refuses
   the run as a bad `host.toml`), each run, after its record is final and
   its own locks are released (in teardown, after a `--once` retire),
