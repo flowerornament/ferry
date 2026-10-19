@@ -393,29 +393,43 @@ Nothing else is written; Ferry writes nowhere outside these.
 
 - A run's history is its run folder (`runs/<id>/`) and its record
   (`records/<id>.json`). With `delete_run_history_after_days = <n>` in
-  `host.toml`, each run, at its start and before its recipe starts, deletes
+  `host.toml` (a whole number of days, at least 1; anything else refuses
+  the run as a bad `host.toml`), each run, after its record is final and
+  its locks are released (in teardown, after a `--once` retire), deletes
   the history of final runs submitted more than `<n>` days ago (by the
   host record's own `submitted_ms`, on the host's clock), oldest first.
-  A final record whose survivors (`custody.survivors`) include a process
-  still alive, with the same pid and start time, is kept: its history is
-  what names that leftover. A survivor listed as `"unknown"` is no reason
-  to keep it, or a macOS host would keep everything. A seat's
-  retirement record (`records/retired-<key>.json`) has its own age, its
-  `retired_ms`, and is deleted on the same rule; one without `retired_ms`
-  is kept. Without the key, history is kept forever. It never touches a
-  reserved record or its run folder, a seat, `store/`, or a caller's
-  receipts and fetched artifacts.
+  It never delays a recipe, adds disk work before one, or counts against
+  a run's timeout.
+- **Old reservations:** a reserved record older than `<n>` days is first
+  reconciled by the ordinary rule (§8: another boot, a dead supervisor pid
+  or a different start time makes it `lost`); a live supervisor's
+  reservation is never touched. A reconciled run then ages like any final
+  one, so a killed supervisor's run that nobody read is not kept forever.
+- **Live leftovers keep their run:** a final record whose survivors
+  (`custody.survivors`) include a process still alive is kept, because its
+  history is what names that leftover: a live pid with the same start
+  time, or a live pid alone when the start was not recorded (pid reuse
+  then keeps a record, never deletes one). A survivor listed as
+  `"unknown"` is no reason to keep it, or a macOS host would keep
+  everything.
+- **Retirement records** (`records/retired-<key>.json`) are not a run's:
+  each ages by its own `retired_ms` on the same rule, and one without
+  `retired_ms` is kept. Without the key, history is kept forever. It never
+  touches a live reservation, a seat, `store/`, or a caller's receipts and
+  fetched artifacts.
 - **Budget:** after one second the run starts no new deletion; one already
-  under way may overrun it. What is left waits for the next run. A run's
-  folder is deleted before its record, so a run deleted only in part keeps
-  its record and stays eligible next time. A reader that already has a
-  file open (a `follow` in progress) finishes reading it; a new reader of
-  a deleted run gets not-found.
-- The run that deleted says so in its own record: `history_deleted:
-  <count>`, counting whole runs only (folder and record both gone), never
-  a run deleted in part. Two runs starting together may race on the same
-  files; a file already gone is not an error, and a run counts for the one
-  that removed its record. Afterwards `ferry record <id>` and
+  under way may overrun it, delaying only the supervisor's exit. What is
+  left waits for the next run. A run's folder is deleted before its
+  record, so a run deleted only in part keeps its record and stays
+  eligible next time. A reader that already has a file open (a `follow`
+  in progress) finishes reading it; a new reader of a deleted run gets
+  not-found.
+- **The account:** the run's record is already final, so a pass that
+  deleted anything writes `records/history-<ms>.json` (`{run, deleted,
+  older_than_days}`), which ages on the same rule. `deleted` counts whole
+  runs only (folder and record both gone). Two passes may race on the
+  same files; a file already gone is not an error, and a run counts for
+  the pass that removed its record. Afterwards `ferry record <id>` and
   `ferry follow <id>` answer "not found (this host keeps run history for
   `<n>` days)": context, not proof, since the id may never have existed.
 - **What is lost with it:** a run's history is the only thing that names
@@ -551,14 +565,19 @@ working tree.
     to fail after the rename, only the tombstone remains, `status` lists
     it, the next run on that seat passes cold, and the next prune deletes
     the tombstone.
-22. **Run history:** with `delete_run_history_after_days = 1`, a run starting
-    on a host holding a final run from two days ago, a final run from an
-    hour ago and a reserved run from two days ago (supervisor live) deletes
-    only the first run's folder and records, and says
-    `history_deleted: 1`. An old final run whose recorded survivor is still
-    alive is kept. Without the key nothing is deleted. A seat,
-    `store/` and the caller's receipts are untouched. `ferry record` on the
-    deleted run names the setting as context. A retirement record older
-    than a day is deleted and a newer one is kept. With the deletion
-    injected to fail after the folder, the run still runs, the record
-    stays, the count leaves that run out, and the next run deletes it.
+22. **Run history:** with `delete_run_history_after_days = 1`, a run on a
+    host holding a final run from two days ago, a final run from an hour
+    ago, a reserved run from two days ago with its supervisor live, and a
+    reserved run from two days ago whose supervisor is gone, deletes, after
+    its own record is final, the first run's and the reconciled fourth
+    run's folders and records, and writes `records/history-<ms>.json` with
+    `deleted: 2`. Its recipe starts with no deletion before it. An old
+    final run whose recorded survivor is still alive (with or without a
+    recorded start) is kept. Without the key nothing is deleted; with `0`
+    or `1.5` the run is refused as a bad `host.toml`. A seat, `store/` and
+    the caller's receipts are untouched. `ferry record` on a deleted run
+    names the setting as context. A retirement record older than a day is
+    deleted and a newer one is kept. With the deletion injected to fail
+    after the folder, the run's record is unchanged, the record that
+    failed stays, the count leaves that run out, and the next pass deletes
+    it.

@@ -22,8 +22,8 @@ file.
      place's cap. Anything beyond that is host policy;
    - **record** (receipts, host records, run output): kept until the
      operator's retention says otherwise. The host's retention is
-     `delete_run_history_after_days` in `host.toml`, which runs apply at
-     their start; a caller's receipts are the caller's to keep.
+     `delete_run_history_after_days` in `host.toml`, which each run applies
+     once its record is final; a caller's receipts are the caller's to keep.
 
    Ferry writes nowhere else. Anything else is its creator's to clean up.
 2. **Ferry owns nothing longer than a run.** No daemons, keep-alives or
