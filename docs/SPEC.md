@@ -33,9 +33,9 @@ run, and a seat's caches are capped (§9).
 
 | Concept | State | Rule | Why |
 |---|---|---|---|
-| **Recipe** | `name → {argv, requires, exclusive, timeout, wait, artifacts, preserve}` read from the commit | runs only where `requires ⊆ provides`, on every route | the repository decides what may run |
+| **Recipe** | `name → {argv, needs, exclusive, timeout, wait, artifacts, keep_between_runs}` read from the commit | runs only where `needs ⊆ has`, on every route | the repository decides what may run |
 | **Place** | `local` or an ssh destination; `provides` = declared ∪ detected ∪ binary capabilities; `host.toml` | describes itself through the binary that will run the work | the facts come from the doer |
-| **Seat** | `(caller, repo path, name) → checkout + cache` | reset to the commit each run; `preserve` dirs kept | warm and exact, never shared |
+| **Seat** | `(caller, repo path, name) → checkout + cache` | reset to the commit each run; `keep_between_runs` dirs kept | warm and exact, never shared |
 | **Lock** | flock: `seat.<key>`, `host`, `host.gate` | held means busy; the work inherits the seat's fd only, the supervisor alone holds `host` and `host.gate`; release by `close()` | the kernel is the only judge, and a leftover can hold no more than its own seat |
 | **Run** | `id → phase, deadline` | detached from the client; ends by its deadline or `stop` | its lifetime is not the connection's |
 | **Record** | `<id>.reserved.json` → `<id>.json` | reserved before any effect, final exactly once | one honest account per attempt |
@@ -135,7 +135,7 @@ in records, run directories and the marker.
 - host wait expired (naming the holder);
 - below the disk floor;
 - nested run on the same place;
-- timeout above the host's `max_timeout`;
+- timeout above the host's `max_run_time`;
 - capability missing.
 
 ## 5. Run lifecycle
@@ -146,7 +146,7 @@ caller:  check recipe@commit ─refuse─► 125 receipt
 place:   reserve record (O_EXCL; a duplicate id → follow the existing run) ─► fork supervisor (setsid, no tty) ─► reply id
 super:   seat lock (try; held → refuse busy)
          host lease (shared|exclusive; bounded wait; names holder)
-         floor check (host.toml) ─► reset checkout (keep preserve) ─► objects
+         floor check (host.toml) ─► reset checkout (keeping kept dirs) ─► objects
          hooks: prepare → env → recipe argv+args → collect     stdout+stderr → output.log
          deadline = submit + wait + timeout + grace, absolute, checked every phase
          end/timeout/stop: stop session ─► collect (own session, stopped) ─► marker pass ─► artifacts ─► final record ─► close locks ─► exit
@@ -414,10 +414,10 @@ Nothing else is written; Ferry writes nowhere outside these.
   `prune --idle 1d` retires every idle seat that user's caller recorded,
   whoever's workspace it serves.
 - **Size:** at the start of a run, while the run holds the seat lock, if the
-  seat's preserve paths plus its cache exceed `seat_cap_bytes`, they are
+  seat's kept directories plus its cache exceed `max_cache_per_checkout`, they are
   wiped and the run starts cold. The record says so (`pruned: {bytes, cap}`).
   Source, logs, receipts and records are never touched.
-- **Floor:** below `min_free_bytes` a run refuses with 125, as before. Its
+- **Floor:** below `refuse_runs_below_free_disk` a run refuses with 125, as before. Its
   `next` names `ferry status --on <place>` (seat sizes and last runs) and
   `ferry seats prune --on <place> --idle <dur>`.
   Anything cleverer (shared caches, cross-seat eviction) is the operator's.
@@ -501,18 +501,77 @@ working tree.
 
 ## 10. Configuration
 
-- **`ferry.toml`** (or the JSON emitted by `[catalog] adapter`): `[recipe.*]`,
-  `[hooks]`, `[environment] forwards/watches/local`, `[ship]` extra refs
-  (companion refs and mirrors), `[provider] requires`.
-- **`machines.toml`** (caller): `[host.<name>] ssh, features`;
-  `delete_unused_checkouts_after_days` (§9): a checkout here is a seat, the
-  copy of the repository a place keeps for it, with its build cache.
+Three files, each in a different place and owned by a different person.
+Every key reads as a plain statement of what it does, so a new user can
+read a file without Ferry's vocabulary. Sizes are strings with a unit
+(`"40 GiB"`, `"512 MiB"`, `"40 GB"`), durations a number and unit
+(`"6h"`). A file declares `version = 2`.
+
+- **`ferry.toml`** (the project, committed; or the JSON emitted by
+  `[catalog] adapter`): what can be run.
+
+  ```toml
+  version = 2
+  [recipe.check]
+  command = ["just", "check"]
+  needs = ["linux"]              # what the machine must have
+  may_run_elsewhere = true       # may run on another machine
+  keep_between_runs = ["_build"] # ignored build dirs kept warm
+  [[also_send]]                  # extra refs or dependencies sent with the commit
+  ref = "refs/remotes/origin/main"
+  from = "main@origin"
+  [environment]
+  send = ["MY_FLAG"]             # your variables passed to the recipe
+  refuse_if_set = ["MY_"]        # other set variables with these prefixes refuse the run
+  keep_local = ["MY_SECRET"]     # deliberately kept on the caller
+  [hooks]                        # prepare, env, collect
+  [provider]
+  needs = []                     # what the project needs of Ferry itself
+  ```
+- **`machines.toml`** (the caller, `~/.config/ferry/`): where you can run.
+
+  ```toml
+  version = 2
+  delete_unused_checkouts_after_days = 1   # §9; a checkout here is a seat:
+                                           # a place's copy of the repo, with its build cache
+  [machine.bench]
+  ssh = "bench"
+  platform = "x86_64-unknown-linux-gnu"
+  has = ["linux", "x86_64", "quiet"]
+  ```
+- **`host.toml`** (each place, its operator, `~/.config/ferry/`): the
+  machine's own rules.
+
+  ```toml
+  version = 2
+  refuse_runs_below_free_disk = "40 GiB"
+  max_cache_per_checkout = "15 GiB"
+  max_run_time = "6h"
+  delete_run_history_after_days = 30
+  ```
+- **From version 1:** for one release Ferry reads both versions. A
+  version 2 file that holds a version 1 key, or a version 1 file after
+  that release, is refused, and the refusal names the new key.
+
+  | version 1 | version 2 |
+  |---|---|
+  | `requires` (recipe, `[provider]`) | `needs` |
+  | `routable` | `may_run_elsewhere` |
+  | `preserve` | `keep_between_runs` |
+  | `[[ship]]` | `[[also_send]]` |
+  | `[environment] forwards / watches / local` | `send / refuse_if_set / keep_local` |
+  | `[host.<name>]` | `[machine.<name>]` |
+  | `triple` | `platform` |
+  | `features` | `has` |
+  | `cores` | removed (routing never read it) |
+  | `min_free_bytes` (a byte count) | `refuse_runs_below_free_disk` (a size) |
+  | `seat_cap_bytes` (a byte count) | `max_cache_per_checkout` (a size) |
+  | `max_timeout` | `max_run_time` (a duration) |
+
+  Out of this change, named for later: the `--seat` flag and the hook
+  environment (`FERRY_SEAT`, `FERRY_CACHE_DIR`), which recipes read.
 - **`pruned.json`** (caller state, `~/.local/state/ferry/`): `{<place>: ms}`,
   when this caller's runs last pruned that place by themselves.
-- **`host.toml`** (place, operator): `min_free_bytes`, `max_timeout`,
-  `seat_cap_bytes`, `delete_run_history_after_days`. A new key's name reads
-  as a plain sentence about what the host does, so the file explains
-  itself without Ferry's vocabulary.
 - **`seats.jsonl`** (caller state, `~/.local/state/ferry/`): one line per seat
   this caller used: `{key, place, repo_path, seat, last_used_ms}`.
 - **Hook environment:** `FERRY_ID FERRY_SEAT FERRY_COMMIT FERRY_WORKDIR
@@ -524,7 +583,7 @@ working tree.
 
 | Guarantee | Mechanism | Residue (reported) |
 |---|---|---|
-| exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (listed as a survivor when it carries the marker); a commit ever shipped on the place is fetchable by hash through a served `[[ship]]` URL even if this run did not declare it (refs are isolated, objects are not) |
+| exact commit | pushed objects, reset checkout | a session leaver that closed its fds can write into a later run's checkout and the seat's cache (listed as a survivor when it carries the marker); a commit ever shipped on the place is fetchable by hash through a served `[[also_send]]` URL even if this run did not declare it (refs are isolated, objects are not) |
 | one run per seat | inherited seat flock | work that unlocks its own descriptor |
 | exclusive host (among Ferry runs; not a quiet host) | the supervisor's flock on `host` | a survivor of an earlier run (listed in its record); a killed supervisor: its session runs on without `host` until its session owner stops it at the run's timeout or deadline, and the record reconciles to `lost` |
 | every run ends | an absolute deadline | a killed supervisor: the record is reconciled as `lost`; the session owner stops its session at the timeout or deadline (TERM, grace, KILL), sparing only itself; what that stop leaves is listed by `ferry status` (no marker pass runs without the supervisor) |
@@ -562,10 +621,10 @@ working tree.
     parent on the recorded device). An unreadable or unmounted workspace
     is kept and reported. It never touches another caller's seat, and
     skips a busy one.
-15. **Seat size:** over `seat_cap_bytes`, a run starts cold with `pruned`
+15. **Seat size:** over `max_cache_per_checkout`, a run starts cold with `pruned`
     recorded. Nothing outside `seats/<key>/` is ever
     measured or deleted: not through a symbolic link, not through an
-    unvalidated preserve path.
+    unvalidated `keep_between_runs` path.
 16. **A survivor that closed its fds:** the record lists it (marker; on
     macOS listed or `"unknown"`, never `[]`), the
     next run on the seat is admitted, and `status` lists it as a leftover
@@ -641,3 +700,8 @@ working tree.
     seconds. With an exclusive run holding the place's gate or `host`,
     retire, by hand or by itself, is refused `exclusive` and deletes
     nothing. Without the key, nothing is retired.
+24. **Plain config names:** each of the three files at version 2 is read
+    with the §10 keys, sizes and durations. A version 1 file is read the
+    same for one release; a version 2 file holding a version 1 key is
+    refused naming the new key (`min_free_bytes` → "use
+    `refuse_runs_below_free_disk`"), and so is a size without a unit.
