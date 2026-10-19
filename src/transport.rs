@@ -345,10 +345,19 @@ fn progressing(command: &mut Command) -> Result<Pushed> {
     let exited = || crate::record::exited(group.as_raw());
     let status = loop {
         // Whatever git left in its group (a pipe-holder, a ProxyCommand) is
-        // ours, and goes before git is reaped.
-        if exited() {
-            stop();
-            break child.wait()?;
+        // ours, and goes before git is reaped. A state that cannot be read
+        // proves nothing: this tick reaps only, as before, never kills.
+        match exited() {
+            Some(true) => {
+                stop();
+                break child.wait()?;
+            }
+            Some(false) => {}
+            None => {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+            }
         }
         // In a group of its own, the push never sees the terminal's
         // signal: the caller that caught one stops it, as before dispatch.

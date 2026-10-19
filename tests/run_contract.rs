@@ -1944,6 +1944,29 @@ fn a_push_leaves_nothing_of_its_group_behind() {
     drop(guard);
 }
 
+/// A push whose git's state cannot be read is never taken for exited: the
+/// watchdog only reaps it, as before, and a healthy push passes (ferry-1a's
+/// hold on 738fd0a4).
+#[test]
+fn a_push_whose_state_cannot_be_read_is_not_killed() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_FAIL_AT", "push-state")
+    .env("FERRY_TEST_TRICKLE_PUSH", "1")
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+}
+
 /// A push that fails names why: git's fatal line reaches the receipt.
 #[test]
 fn a_failed_push_names_its_fatal_line() {

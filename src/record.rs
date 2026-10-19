@@ -418,25 +418,42 @@ pub fn bsd_start(info: &libproc::bsd_info::BSDInfo) -> u128 {
 
 /// Whether our child `pid` has exited and waits to be reaped (a zombie):
 /// seen without reaping it, so its pid, and its process group's id, stay
-/// reserved meanwhile. A state that cannot be read counts as exited.
+/// reserved meanwhile. `None` when its state cannot be read: then nothing
+/// is known, and a live process must never be taken for an exited one.
 #[cfg(target_os = "macos")]
-pub fn exited(pid: i32) -> bool {
+pub fn exited(pid: i32) -> Option<bool> {
     // SZOMB in <sys/proc.h>.
     const ZOMBIE: u32 = 5;
-    libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0)
-        .map_or(true, |info| info.pbi_status == ZOMBIE)
+    if crate::execution::fail_at("push-state") {
+        return None;
+    }
+    match libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0) {
+        Ok(info) => Some(info.pbi_status == ZOMBIE),
+        // The kernel's lookup skips zombies: ESRCH for a process that can
+        // still be signalled (unreaped, so it exists) is our zombie. Any
+        // other failure proves nothing.
+        Err(error) if error.contains(&format!("errno = {},", nix::errno::Errno::ESRCH as i32)) => {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                .is_ok()
+                .then_some(true)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Whether our child `pid` has exited and waits to be reaped (a zombie):
 /// seen without reaping it, so its pid, and its process group's id, stay
-/// reserved meanwhile. A state that cannot be read counts as exited.
+/// reserved meanwhile. `None` when its state cannot be read: then nothing
+/// is known, and a live process must never be taken for an exited one.
 #[cfg(not(target_os = "macos"))]
-pub fn exited(pid: i32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |text| {
-        text.rsplit_once(')')
-            .and_then(|(_, fields)| fields.trim_start().chars().next())
-            .is_none_or(|state| matches!(state, 'Z' | 'X'))
-    })
+pub fn exited(pid: i32) -> Option<bool> {
+    if crate::execution::fail_at("push-state") {
+        return None;
+    }
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = text.rsplit_once(')')?;
+    let state = fields.trim_start().chars().next()?;
+    Some(matches!(state, 'Z' | 'X'))
 }
 
 /// A process's start time: microseconds since the epoch on macOS, clock
