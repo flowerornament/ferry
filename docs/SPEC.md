@@ -319,7 +319,7 @@ records" impossible.
   seats/<key>/used                            cache  (`{ms, id}` of the seat's latest run)
   seats/.retired-<key>-<ms>/                  cache  (a retire's tombstone, until deleted)
   runs/<id>/  request.json output.log artifacts.tar  record (with result.json, result.error and stop.json)
-  records/    <id>.reserved.json <id>.json    record (operator retention)
+  records/    <id>.reserved.json <id>.json    record (until the host's run-history limit)
   store/      repo.git                        cache
 <repo>/.ferry/receipts/                       record (the caller's)
 <repo>/.ferry/runs/<id>/                      the run's fetched artifacts (the caller's)
@@ -360,8 +360,9 @@ Nothing else is written; Ferry writes nowhere outside these.
   fails leaves only the tombstone, which `status` lists and the next prune
   deletes. A tombstone name never replaces an existing one, and `status`,
   the seat walk and prune's list never count, measure or cap a
-  `seats/.retired-*` as a seat: they list it only as a tombstone; the key itself is gone, so a later run on it starts cold and
-  whole, never on half a seat. That run re-creates the seat, and its
+  `seats/.retired-*` as a seat: they list it only as a tombstone. The key
+  itself is gone, so a later run on it starts cold and whole, never on
+  half a seat. That run re-creates the seat, and its
   `seats.jsonl` line makes it live again.
 
   The `retire` verb only tries the seat lock: a busy seat is skipped and
@@ -388,6 +389,29 @@ Nothing else is written; Ferry writes nowhere outside these.
   `ferry seats prune --on <place> --idle <dur>`.
   Anything cleverer (shared caches, cross-seat eviction) is the operator's.
 
+**Bound on run history (the host's records):**
+
+- A run's history is its run folder (`runs/<id>/`) and its records
+  (`records/<id>.json`, and `records/retired-<key>.json` for a retired
+  seat). With `delete_run_history_after_days = <n>` in `host.toml`, each
+  run, at its start and before its recipe starts, deletes the history of
+  final runs that started more than `<n>` days ago (by the record's
+  `started_ms`, on the host's clock), oldest first, for at most one second;
+  what is left waits for the next run. Without the key, history is kept
+  forever. It never touches a reserved record or its run folder, a seat,
+  `store/`, or a caller's receipts and fetched artifacts.
+- The run that deleted says so in its own record: `history_deleted: <count>`.
+  Two runs starting together may race on the same files; a file already
+  gone counts for neither and is not an error. Afterwards `ferry record
+  <id>` and `ferry follow <id>` answer "not found: this host deletes run
+  history after `<n>` days" instead of a bare not-found.
+
+**Why:** history only grows when runs happen, so runs can bound it: no
+daemon, no timer, nothing left on the host between runs (PRINCIPLES 2).
+The host's operator sets the limit, because every caller and project shares
+one history and no single project can see the rest. A caller that needs a
+run's evidence for longer keeps its own receipt.
+
 **Why:** only the caller knows whether a workspace still exists, and only a
 run holds its seat's lock. Each bound is enforced by the party that can
 prove it, with no daemon and no second lock protocol.
@@ -402,7 +426,9 @@ working tree.
   (companion refs and mirrors), `[provider] requires`.
 - **`machines.toml`** (caller): `[host.<name>] ssh, features`.
 - **`host.toml`** (place, operator): `min_free_bytes`, `max_timeout`,
-  `seat_cap_bytes`.
+  `seat_cap_bytes`, `delete_run_history_after_days`. A new key's name reads
+  as a plain sentence about what the host does, so the file explains
+  itself without Ferry's vocabulary.
 - **`seats.jsonl`** (caller state, `~/.local/state/ferry/`): one line per seat
   this caller used: `{key, place, repo_path, seat, last_used_ms}`.
 - **Hook environment:** `FERRY_ID FERRY_SEAT FERRY_COMMIT FERRY_WORKDIR
@@ -501,3 +527,12 @@ working tree.
     to fail after the rename, only the tombstone remains, `status` lists
     it, the next run on that seat passes cold, and the next prune deletes
     the tombstone.
+22. **Run history:** with `delete_run_history_after_days = 1`, a run starting
+    on a host holding a final run from two days ago, a final run from an
+    hour ago and a reserved run from two days ago (supervisor live) deletes
+    only the first run's folder and records, and says
+    `history_deleted: 1`. Without the key nothing is deleted. A seat,
+    `store/` and the caller's receipts are untouched. `ferry record` on the
+    deleted run names the setting. With the deletion injected to fail, the
+    run still runs, its count leaves out what failed, and the next run
+    deletes it.

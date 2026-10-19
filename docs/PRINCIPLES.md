@@ -19,10 +19,11 @@ file.
      is gone, when its caller declares it idle past an age it names, or
      after the one run its caller declared it for, and a seat's caches are
      wiped at the start of a run, under its lock, when they exceed the
-     place's cap. Anything beyond that is host
-     policy;
+     place's cap. Anything beyond that is host policy;
    - **record** (receipts, host records, run output): kept until the
-     operator's retention says otherwise.
+     operator's retention says otherwise. The host's retention is
+     `delete_run_history_after_days` in `host.toml`, which runs apply at
+     their start; a caller's receipts are the caller's to keep.
 
    Ferry writes nowhere else. Anything else is its creator's to clean up.
 2. **Ferry owns nothing longer than a run.** No daemons, keep-alives or
