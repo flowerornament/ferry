@@ -4,6 +4,14 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **A late prune no longer hides a recreated seat.** If a run recreated a
+  seat while a prune's retirement of it was still on its way back, the
+  caller's book took the late retirement as the latest word, and later
+  prunes never considered the new seat. A retirement now counts only if it
+  meant the newest use the book holds. If the retire instead deleted the
+  recreated seat, the book lists it live until the next prune finds it
+  gone.
+
 ## v0.1.3 - 2026-10-19
 
 - **A stalled push no longer holds the caller.** The caller's object push

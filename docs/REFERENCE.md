@@ -266,7 +266,13 @@ receipts or records.
   seat it considered (retired, already gone when an earlier retire such as a
   `--once` run's took it, skipped busy, used since or exclusive, kept
   unknown, failed) and appends a tombstone line to the book for each one
-  retired; a later run on the same workspace revives it. Local seats live
+  retired; a later run on the same workspace revives it. A retirement line
+  carries the last use its prune meant, so one acknowledged late, after a
+  run had already recreated the seat, never hides it (on a caller whose
+  clock does not step back). The other way round, a retire that deleted the
+  recreated seat itself (it ran after the run that recreated it) leaves
+  the book listing the seat live: the next prune that considers it finds
+  it absent and books it gone. Local seats live
   inside their workspace and go with it, so they are not recorded. Exit 0
   when every seat was retired or kept by rule, 125 if a place refused
   otherwise (including a place without the capability it needs, named by

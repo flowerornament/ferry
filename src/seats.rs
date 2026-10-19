@@ -123,7 +123,10 @@ pub fn ensure(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()
 
 /// The latest line per place and key, in file order (later lines win),
 /// carrying the newest `last_used_ms` of that place and key's lines.
-/// Unreadable lines are skipped.
+/// Unreadable lines are skipped. A retirement carries the last use its
+/// prune meant: one that meant an older use than the book already holds
+/// is a late acknowledgement (a run recreated the seat after the place
+/// retired it, before the prune booked it), so the seat stays live.
 pub(crate) fn latest() -> Result<BTreeMap<(String, String), Line>> {
     let text = match fs::read_to_string(book()?) {
         Ok(text) => text,
@@ -135,6 +138,9 @@ pub(crate) fn latest() -> Result<BTreeMap<(String, String), Line>> {
         if let Ok(mut line) = serde_json::from_str::<Line>(line) {
             let at = (line.place.clone(), line.key.clone());
             if let Some(before) = seats.get(&at) {
+                if line.retired_ms.is_some() && before.last_used_ms > line.last_used_ms {
+                    continue;
+                }
                 line.last_used_ms = line.last_used_ms.max(before.last_used_ms);
             }
             seats.insert(at, line);
@@ -205,6 +211,8 @@ pub fn prune_until(
 ) -> Result<Pruned> {
     let mut pruned = Pruned::default();
     let now = crate::receipt::now_ms();
+    // A debug pause between a place's reply and its booking.
+    let ack = book()?.with_file_name("prune-ack");
     for line in latest()?.into_values() {
         if line.retired_ms.is_some() || only.is_some_and(|place| place != line.place) {
             continue;
@@ -272,6 +280,7 @@ pub fn prune_until(
         if reply["skipped"] == "budget" {
             break;
         }
+        crate::execution::pause_at("prune-ack", &ack);
         settle(&reply, line, &why_now, &mut pruned)?;
     }
     Ok(pruned)

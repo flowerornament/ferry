@@ -5732,3 +5732,60 @@ fn a_deleted_runs_record_names_how_long_the_host_keeps_history() {
     );
     assert!(both.contains(said), "{both}");
 }
+
+/// ferry-83k (SPEC §9: a run that recreates a seat makes it live again): a
+/// prune's acknowledgement held after the place retired the seat, while a
+/// fresh run recreates it, never hides the recreated seat. Its late
+/// retirement meant an older use than the book now holds, so the next
+/// prune still considers the seat and retires it.
+#[test]
+fn a_late_retirement_never_hides_a_recreated_seat() {
+    use std::time::{Duration, Instant};
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture();
+    let repo = workspace(dir.path(), "reused");
+    assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+    let key = key_of(dir.path(), &repo);
+    age(dir.path(), &key, 2 * DAY_MS, false);
+    let place = dir.path().join("host/.local/state/ferry/v1");
+    let paused = dir.path().join("state/ferry/prune-ack.paused");
+    let held = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["seats", "prune", "--idle", "1d"],
+    )
+    .env("FERRY_FAIL_AT", "prune-ack")
+    .stdout(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    let guard = OwnedPid(i32::try_from(held.id()).unwrap());
+    let until = common::startup_deadline();
+    while !paused.exists() {
+        assert!(Instant::now() < until, "the prune never reached its ack");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The place retired the seat; before the prune books it, a fresh run
+    // recreates it.
+    assert!(!place.join("seats").join(&key).exists());
+    assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+    assert!(place.join("seats").join(&key).join("checkout").exists());
+    fs::write(dir.path().join("state/ferry/prune-ack.go"), "").unwrap();
+    let out = held.wait_with_output().unwrap();
+    drop(guard);
+    let said = String::from_utf8_lossy(&out.stdout);
+    let workspace = repo.canonicalize().unwrap().display().to_string();
+    assert!(
+        said.starts_with("retired") && said.contains(&workspace),
+        "{said}"
+    );
+    // The recreated seat is still in the book: the next prune retires it.
+    let (code, said) = prune_with(dir.path(), &["--idle", "0s"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        said.starts_with("retired") && said.contains(&workspace),
+        "{said}"
+    );
+    assert!(!place.join("seats").join(&key).exists(), "{said}");
+}
