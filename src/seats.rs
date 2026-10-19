@@ -149,6 +149,8 @@ pub(crate) fn latest() -> Result<BTreeMap<(String, String), Line>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kept {
     Retired,
+    /// Nothing left under the key: an earlier retire took it.
+    Gone,
     Busy,
     Used,
     Exclusive,
@@ -254,7 +256,7 @@ pub fn prune_until(
             format!("workspace {} is gone", line.repo_path)
         };
         let said = if let Some(machine) = hosts.host.get(&line.place) {
-            transport::retire(&transport::Place::Remote(machine), &line.key, &meant)
+            transport::retire(&transport::Place::Remote(machine), &line.key, &meant, stop)
         } else {
             Err(format!("unknown place {}", line.place).into())
         };
@@ -268,27 +270,52 @@ pub fn prune_until(
                 continue;
             }
         };
-        if reply["retired"].is_string() {
-            let bytes = reply["bytes"].as_u64().unwrap_or_default();
-            pruned.bytes += bytes;
-            let mut said = format!(
-                "retired {} of {} on {} ({bytes} bytes; {why_now})",
-                line.seat, line.repo_path, line.place
-            );
-            if let Some(note) = reply["tombstones_left"].as_str() {
-                let _ = write!(said, "; {note}");
-            }
-            pruned.note(Kept::Retired, said);
-            append(&Line {
-                retired_ms: Some(crate::receipt::now_ms()),
-                ..line
-            })?;
-            continue;
+        if reply["skipped"] == "budget" {
+            break;
         }
-        let (kept, said) = refusal(&reply, &line);
-        pruned.note(kept, said);
+        settle(&reply, line, &why_now, &mut pruned)?;
     }
     Ok(pruned)
+}
+
+/// Notes what a place's retire reply did to one seat, and books a seat
+/// that is now retired (SPEC §9: retired, already gone, or kept and why).
+fn settle(reply: &serde_json::Value, line: Line, why_now: &str, pruned: &mut Pruned) -> Result<()> {
+    // Nothing under the key: an earlier retire took it (an older place
+    // names it in its refusal's text).
+    let absent = reply["refused"] == "absent"
+        || reply["why"]
+            .as_str()
+            .is_some_and(|why| why.starts_with("no seat ") && why.ends_with(" on this place"));
+    let said = if absent || reply["gone"] == true {
+        (
+            Kept::Gone,
+            format!(
+                "already gone {} of {} on {}",
+                line.seat, line.repo_path, line.place
+            ),
+        )
+    } else if reply["retired"].is_string() {
+        let bytes = reply["bytes"].as_u64().unwrap_or_default();
+        pruned.bytes += bytes;
+        let mut said = format!(
+            "retired {} of {} on {} ({bytes} bytes; {why_now})",
+            line.seat, line.repo_path, line.place
+        );
+        if let Some(note) = reply["tombstones_left"].as_str() {
+            let _ = write!(said, "; {note}");
+        }
+        (Kept::Retired, said)
+    } else {
+        let (kept, said) = refusal(reply, &line);
+        pruned.note(kept, said);
+        return Ok(());
+    };
+    pruned.note(said.0, said.1);
+    append(&Line {
+        retired_ms: Some(crate::receipt::now_ms()),
+        ..line
+    })
 }
 
 /// How a place's reply that retired nothing reads, and what it counts as.
@@ -328,11 +355,16 @@ pub fn prune_by_itself(place: &str, hosts: &config::Machines) {
             Some(place),
             hosts,
             Some(Duration::from_secs(days * 86_400)),
-            Some(started + crate::limits::AUTO_PRUNE_BUDGET),
+            Some(
+                started
+                    + crate::execution::debug_bound("FERRY_AUTO_PRUNE_BUDGET_MS")
+                        .map_or(crate::limits::AUTO_PRUNE_BUDGET, Duration::from_millis),
+            ),
         )
         .map(|pruned| {
             let failed = pruned.count(Kept::Failed) + pruned.count(Kept::Unreachable);
-            let kept = pruned.said.len() - pruned.count(Kept::Retired) - failed;
+            let kept =
+                pruned.said.len() - pruned.count(Kept::Retired) - pruned.count(Kept::Gone) - failed;
             format!(
                 "retired {} unused for {days}d ({} bytes), kept {kept}, failed {failed}",
                 pruned.count(Kept::Retired),

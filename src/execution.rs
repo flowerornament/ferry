@@ -232,11 +232,10 @@ pub fn prepare(
     // refusal here closes it before the record is final.
     held.seat = Some(seat);
     // A retire checks it under the lock: the seat ran since its caller
-    // last saw it (SPEC §9). Without it a retire falls back to the
-    // caller's age, so a failure is a note, not a refusal.
-    if let Err(error) = crate::place::mark_used(root, &request.seat, &request.id) {
-        crate::run::note_after(format!("seat used record: {error}"));
-    }
+    // last saw it (SPEC §9). A stale one would let a delayed retire take
+    // this run's seat, so a run that cannot write it is refused.
+    crate::place::mark_used(root, &request.seat, &request.id)
+        .map_err(|error| format!("seat used record: {error}"))?;
     held.host = Some(crate::lock::HostLease::acquire(
         root,
         request,

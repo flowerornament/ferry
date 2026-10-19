@@ -661,16 +661,34 @@ pub fn mark_used(root: &Path, key: &str, id: &str) -> Result<()> {
     if execution::fail_at("used-write") {
         return Err("used-write: injected by FERRY_FAIL_AT".into());
     }
-    let seat = root.join("seats").join(key);
+    let rel = Path::new("seats").join(key);
+    let seat = root.join(&rel);
+    // Proven inside the root, no symbolic link on the way, before creating
+    // and again before writing: a link there would carry either out of the
+    // state root.
+    let inside = || {
+        crate::admission::outside(root, &rel)
+            .map_or(Ok(()), |why| Err(format!("{why}: not written")))
+    };
+    inside()?;
     fs::create_dir_all(&seat)?;
+    inside()?;
+    // A temporary left by a write that died is unlinked (never followed),
+    // and the new one created exclusively, so it is never a link.
     let tmp = seat.join("used.tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_vec(&Used {
-            ms: receipt::now_ms(),
-            id: id.to_owned(),
-        })?,
-    )?;
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    file.write_all(&serde_json::to_vec(&Used {
+        ms: receipt::now_ms(),
+        id: id.to_owned(),
+    })?)?;
+    // A rename replaces `used` itself, even a link, never what it names.
     fs::rename(&tmp, seat.join("used"))?;
     Ok(())
 }
@@ -744,18 +762,23 @@ pub fn retire_seat(root: &Path, key: &str, meant: &Meant) -> Result<serde_json::
     };
     let retired = json!({"key": key, "bytes": bytes, "retired_ms": receipt::now_ms()});
     let path = root.join("records").join(format!("retired-{key}.json"));
+    // The key's latest retire, replacing an earlier one whole: a key reused
+    // and retired again ages from this retire.
     let written = if execution::fail_at("retire-record") {
         Err("retire-record: injected by FERRY_FAIL_AT".into())
     } else {
-        record::write_new(&path, retired.to_string().as_bytes(), None)
+        let tmp = path.with_extension("json.tmp");
+        fs::create_dir_all(root.join("records"))
+            .and_then(|()| fs::write(&tmp, retired.to_string()))
+            .and_then(|()| fs::rename(&tmp, &path))
+            .map_err(|e| e.to_string())
     };
     // Not retired until recorded and deleted: the caller's book keeps the
     // seat, so its next prune comes back, finds the key gone and finishes.
-    if let Err(error) = written
-        && !path.exists()
-    {
+    if let Err(error) = written {
         return Ok(json!({"failed": key, "why": format!("recording the retire: {error}")}));
     }
+    let gone = tombstone.is_none();
     if let Some(name) = tombstone {
         let deleted = if execution::fail_at("retire-delete") {
             Err("retire-delete: injected by FERRY_FAIL_AT".to_owned())
@@ -771,11 +794,14 @@ pub fn retire_seat(root: &Path, key: &str, meant: &Meant) -> Result<serde_json::
         }
     }
     let mut said = json!({"retired": key, "bytes": bytes});
-    // Only a retire that retired sweeps earlier retires' tombstones, still
-    // under the lease: an exclusive run arriving meanwhile waits for this
-    // seat's delete and theirs, never for every attempt's.
-    if let Err(why) = delete_tombstones(root) {
-        said["tombstones_left"] = why.into();
+    // Only this key's tombstones, left by its own earlier retires: an
+    // exclusive run arriving meanwhile waits for this seat's deletes only.
+    match delete_tombstones(root, key) {
+        // Nothing was under the key, nor left of it: an earlier retire (a
+        // --once run's, one by hand) already took it.
+        Ok(0) if gone => said["gone"] = true.into(),
+        Ok(_) => {}
+        Err(why) => said["tombstones_left"] = why.into(),
     }
     Ok(said)
 }
@@ -838,17 +864,24 @@ fn to_tombstone(root: &Path, key: &str) -> std::result::Result<Option<String>, S
     Ok(Some(named))
 }
 
-/// Deletes every retire tombstone under `seats/` (the caller holds a shared
-/// host lease). The first failure is returned; the rest are still tried.
-fn delete_tombstones(root: &Path) -> std::result::Result<(), String> {
+/// Deletes the tombstones earlier retires of `key` left under `seats/`
+/// (`.retired-<key>-<ms>`, exactly: never another key's), under the
+/// caller's shared host lease: how many there were. The first failure is
+/// returned; the rest are still tried.
+fn delete_tombstones(root: &Path, key: &str) -> std::result::Result<usize, String> {
     let mut first = None;
+    let prefix = format!("{TOMBSTONE}{key}-");
     let names: Vec<String> = fs::read_dir(root.join("seats"))
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(TOMBSTONE))
+        .filter(|name| {
+            name.strip_prefix(&prefix)
+                .is_some_and(|ms| !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()))
+        })
         .collect();
+    let count = names.len();
     for name in names {
         let rel = Path::new("seats").join(&name);
         let deleted = crate::admission::remove(root, &rel).map_err(|e| e.to_string());
@@ -856,7 +889,7 @@ fn delete_tombstones(root: &Path) -> std::result::Result<(), String> {
             first.get_or_insert(format!("deleting {}: {why}", rel.display()));
         }
     }
-    first.map_or(Ok(()), Err)
+    first.map_or(Ok(count), Err)
 }
 
 /// Prints the run's final record (exit 0), or its reservation while it is

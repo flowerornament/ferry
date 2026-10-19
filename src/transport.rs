@@ -785,8 +785,17 @@ fn is_final(place: &Place, record: &Receipt) -> Result<bool> {
 
 /// Asks a place to retire one of this caller's seats (SPEC §6). A place
 /// without `retire` is refused, naming its revision, as for `detach`.
-pub fn retire(place: &Place, key: &str, meant: &crate::place::Meant) -> Result<serde_json::Value> {
+pub fn retire(
+    place: &Place,
+    key: &str,
+    meant: &crate::place::Meant,
+    until: Option<std::time::Instant>,
+) -> Result<serde_json::Value> {
     let info = place.info()?;
+    // A slow `host-info` may use up a prune's budget: then no retire starts.
+    if until.is_some_and(|until| std::time::Instant::now() >= until) {
+        return Ok(serde_json::json!({"skipped": "budget"}));
+    }
     let lacks = |capability: &str| !info.capabilities.iter().any(|c| c == capability);
     // An idle or one-run retire needs a place that checks `used` under the
     // seat lock and never retires during an exclusive run.

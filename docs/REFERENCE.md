@@ -249,15 +249,19 @@ receipts or records.
   exclusive run holds the host or waits for it, then tries the seat's lock
   (held: skipped, busy). A run refused meanwhile is told the seat "is being
   retired". Under the lock it reads `seats/<key>/used` (`{ms, id}`, written
-  by each run when it takes the seat): a seat used within the idle age on
+  by each run when it takes the seat, only inside the state root; a run that
+  cannot write it is refused): a seat used within the idle age on
   the place's clock, or by a run other than the `--once` one, is skipped
   (`used since`); a `used` it cannot read keeps the seat (`unknown`). It
   then renames `seats/<key>` to a tombstone `seats/.retired-<key>-<ms>`,
-  records `records/retired-<key>.json`, deletes the tombstone, and keeps the
-  lock file. A delete that fails leaves only the tombstone: the key is gone,
-  so the next run on it starts cold and whole; `status` lists the tombstone
-  and the next retire on that place deletes it. Prune prints one line per
-  seat it considered (retired, skipped busy, used since or exclusive, kept
+  records `records/retired-<key>.json` (replacing an earlier retire's of
+  the same key), deletes the tombstone, and keeps the lock file. A delete
+  that fails leaves only the tombstone and is reported failed: the key is
+  gone, so the next run on it starts cold and whole; `status` lists the
+  tombstone, and the next prune, retiring that key again, deletes it. A
+  retire deletes only its own key's tombstones. Prune prints one line per
+  seat it considered (retired, already gone when an earlier retire such as a
+  `--once` run's took it, skipped busy, used since or exclusive, kept
   unknown, failed) and appends a tombstone line to the book for each one
   retired; a later run on the same workspace revives it. Local seats live
   inside their workspace and go with it, so they are not recorded. Exit 0
