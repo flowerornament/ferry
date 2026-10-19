@@ -90,6 +90,9 @@ enum Action {
         /// When the session must have ended (unix ms), whatever happens to
         /// its supervisor.
         deadline_ms: u128,
+        /// The supervisor's pid, so an owner whose supervisor died before
+        /// it started knows it is unsupervised.
+        supervisor: i32,
     },
 }
 #[derive(Subcommand)]
@@ -473,8 +476,9 @@ fn execute(cli: Cli) -> Result<i32> {
             spec,
             result,
             deadline_ms,
+            supervisor,
         } => {
-            let owned = crate::run::execute_session(&spec, &result, deadline_ms);
+            let owned = crate::run::execute_session(&spec, &result, deadline_ms, supervisor);
             if let Err(error) = &owned {
                 crate::run::left_error(&result, error.as_ref());
             }

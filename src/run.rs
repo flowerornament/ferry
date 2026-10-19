@@ -534,6 +534,7 @@ fn spawn_session(
         .arg(spec)
         .arg(result_path)
         .arg(deadline_ms.to_string())
+        .arg(std::process::id().to_string())
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
@@ -729,8 +730,13 @@ fn owner_error(result: &Path) -> Option<String> {
 /// nothing unbounded: its watch stops the session at the timeout or
 /// deadline, and an owner whose supervisor is gone once the recipe has
 /// ended stops it then, as the supervisor would have.
-pub fn execute_session(spec: &Path, result: &Path, deadline_ms: u128) -> Result<()> {
-    let supervisor = nix::unistd::getppid();
+pub fn execute_session(
+    spec: &Path,
+    result: &Path,
+    deadline_ms: u128,
+    supervisor: i32,
+) -> Result<()> {
+    let supervisor = Pid::from_raw(supervisor);
     setsid()?;
     let request: Request = serde_json::from_slice(&fs::read(spec)?)?;
     validate(&request)?;
@@ -770,9 +776,10 @@ pub fn execute_session(spec: &Path, result: &Path, deadline_ms: u128) -> Result<
 }
 
 /// Retains the leader for its supervisor's stop, which ends this process;
-/// once the supervisor is gone without it (its parent changed: a direct
-/// parent's identity cannot recycle without the kernel reparenting this
-/// process), stops the session itself, as the supervisor would have.
+/// once the supervisor is gone without it (its parent is no longer the
+/// supervisor it was spawned by: a direct parent's identity cannot recycle
+/// without the kernel reparenting this process), stops the session itself,
+/// as the supervisor would have.
 fn stop_unsupervised(supervisor: Pid) {
     while nix::unistd::getppid() == supervisor {
         thread::sleep(Duration::from_millis(100));
@@ -820,13 +827,15 @@ fn run_stage(
         }
         let mut child = command.spawn()?;
         let read = |pipe: Option<Box<dyn Read + Send>>| {
+            let (sent, received) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let mut bytes = Vec::new();
                 if let Some(mut pipe) = pipe {
                     let _ = pipe.read_to_end(&mut bytes);
                 }
-                bytes
-            })
+                let _ = sent.send(bytes);
+            });
+            received
         };
         let out = read(
             child
@@ -855,11 +864,20 @@ fn run_stage(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    Ok((
-        status,
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
-    ))
+    // A process the stage left may hold its pipes: after the stage is
+    // reaped, they get `DRAIN`, as a session's output does.
+    let until = Instant::now() + crate::limits::DRAIN;
+    let drained = |pipe: std::sync::mpsc::Receiver<Vec<u8>>| {
+        pipe.recv_timeout(until.saturating_duration_since(Instant::now()))
+    };
+    match (drained(out), drained(err)) {
+        (Ok(out), Ok(err)) => Ok((status, out, err)),
+        _ => Err(format!(
+            "the stage's output still open {:?} after it exited",
+            crate::limits::DRAIN
+        )
+        .into()),
+    }
 }
 
 /// The owner's own bound (PRINCIPLES 2, SPEC §11): `OWNER_LAG` after the
@@ -899,7 +917,11 @@ fn watch(deadline_ms: u128, timeout: Option<Instant>) {
 /// status` lists survivors.
 fn stop_own_session() {
     let me = std::process::id();
-    let others = || {
+    // `owner-list` fails the first listing of the grace, once.
+    let others = |grace: bool| {
+        if grace && owner_list_fails() {
+            return Err("owner-list: injected by FERRY_FAIL_AT".into());
+        }
         session_list(me).map(|members| {
             members
                 .into_iter()
@@ -907,34 +929,46 @@ fn stop_own_session() {
                 .collect::<Vec<_>>()
         })
     };
-    let send = |signal, listed: &Result<Vec<i32>>| match listed {
-        Ok(members) => {
-            for pid in members {
-                let _ = kill(Pid::from_raw(*pid), signal);
+    // Under the stage lock, so the stage's own pid is never reaped (and
+    // free for reuse) between the listing and the signal.
+    let send = |signal, listed: &Result<Vec<i32>>| {
+        let current = stage();
+        match listed {
+            Ok(members) => {
+                for pid in members {
+                    let _ = kill(Pid::from_raw(*pid), signal);
+                }
             }
-        }
-        Err(_) => {
-            if let Some(child) = stage().as_ref() {
-                let _ = i32::try_from(child.id()).map(|pid| kill(Pid::from_raw(pid), signal));
+            Err(_) => {
+                if let Some(child) = current.as_ref() {
+                    let _ = i32::try_from(child.id()).map(|pid| kill(Pid::from_raw(pid), signal));
+                }
             }
         }
     };
-    send(Signal::SIGTERM, &others());
-    // `owner-list` fails the first listing of the grace, once.
+    send(Signal::SIGTERM, &others(false));
     let until = Instant::now() + STOP_GRACE;
-    while Instant::now() < until
-        && (owner_list_fails() || !others().is_ok_and(|left| left.is_empty()))
-    {
+    while Instant::now() < until && !others(true).is_ok_and(|left| left.is_empty()) {
         thread::sleep(Duration::from_millis(20));
     }
     let mut returned: Option<Instant> = None;
     loop {
-        let left = others();
+        let left = others(false);
         send(Signal::SIGKILL, &left);
+        let unlisted = left.is_err();
         let empty = left.is_ok_and(|left| left.is_empty());
         if DONE.load(Ordering::SeqCst) {
             let since = *returned.get_or_insert_with(Instant::now);
             if empty || since.elapsed() >= KILL_GRACE {
+                if unlisted {
+                    // The last act: what the stages left in this process
+                    // group, unlisted, ends with the owner, which has
+                    // nothing left to do.
+                    let _ = nix::sys::signal::killpg(
+                        Pid::from_raw(i32::try_from(me).unwrap_or(0)),
+                        Signal::SIGKILL,
+                    );
+                }
                 return;
             }
         }

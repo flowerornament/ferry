@@ -424,7 +424,8 @@ deadline, whichever is first; and once its supervisor is gone after the
 recipe has ended, it stops the session then, as the supervisor would have.
 Either way it stops it like the supervisor (TERM, 10 s, KILL), sparing only
 itself, and the watch writes no result. When the session cannot be listed,
-it signals the hook or recipe it is running instead. Its timeout counts
+it signals the hook or recipe it is running instead, and its last act
+kills its own process group, ending what those left in it. Its timeout counts
 from its own start, after the locks, so with a live supervisor the
 supervisor's stop normally comes first. An owner that is itself killed
 leaves its session unbounded. The record reconciles to `lost`. No marker

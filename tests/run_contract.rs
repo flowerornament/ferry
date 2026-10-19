@@ -760,22 +760,33 @@ fn an_unsupervised_recipes_leftover_is_stopped_at_its_end() {
 }
 
 /// ferry-8d6 (murail-4a R3): with every session listing failing
-/// (`session-list`), the owner still ends its session's stage: it signals
-/// the running stage itself, so the recipe is gone after the timeout and
-/// the owner exits.
+/// (`session-list`), the owner still ends its session: it signals the
+/// running stage itself, and once the stages have returned kills its own
+/// process group, so the recipe and what it started in the background are
+/// gone after the timeout, and the owner with them.
 #[test]
 fn an_unlistable_session_still_ends_at_its_timeout() {
     let dir = fixture();
     let started = std::time::Instant::now();
     let (_id, owner, recipe, guard, _caller) = unsupervised(
         dir.path(),
-        "trap \"\" TERM; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
+        "trap \"\" TERM; sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
         "session-list",
         "3",
     );
-    // TERM is ignored: only the KILL after the grace ends it.
+    let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _sleeper = OwnedMember {
+        pid: sleeper,
+        session: owner,
+    };
+    // TERM is ignored: only the KILL after the grace ends the recipe, and
+    // the owner's last act ends what it left in the background.
     gone_within(
-        &[recipe, owner],
+        &[recipe, sleeper, owner],
         started,
         std::time::Duration::from_secs(25),
         "an unlistable session outlived its bound",
