@@ -400,10 +400,11 @@ Nothing else is written; Ferry writes nowhere outside these.
   the host record's own `submitted_ms`, on the host's clock), oldest
   first. It never delays its own recipe or its caller, and never counts
   against a run's timeout.
-- **Never under a timing run:** the pass first takes a fresh shared
-  `host` lease with a try that never waits, held by the supervisor alone.
-  If an exclusive run holds `host`, the pass is skipped and left to a
-  later run. While the pass holds it, no exclusive recipe can start: one
+- **Never under a timing run:** the pass first passes the host's gate and
+  takes a fresh shared `host` lease the way a shared run does, by try,
+  never waiting at either, held by the supervisor alone. If an exclusive
+  run holds the gate (waiting) or `host` (running), the pass is skipped
+  and left to a later run, so it never jumps ahead of an exclusive run. While the pass holds it, no exclusive recipe can start: one
   that arrives waits for the pass, at most its budget plus one file.
 - **Old reservations:** a reserved record older than `<n>` days is first
   reconciled by the ordinary rule (§8: another boot, a dead supervisor pid
@@ -422,9 +423,10 @@ Nothing else is written; Ferry writes nowhere outside these.
   `retired_ms` is kept. Without the key, history is kept forever. It never
   touches a live reservation, a seat, `store/`, or a caller's receipts and
   fetched artifacts.
-- **Budget:** the pass deletes file by file and checks one second between
-  files, so it overruns by at most one file's unlink; it then releases
-  its lease. What is
+- **Budget:** the pass lists, reads and deletes entry by entry and checks
+  one second between entries, then releases its lease. That bounds how
+  much work it starts, not the filesystem: one listing or unlink in
+  progress may take longer. What is
   left waits for the next run. A run's folder is deleted before its
   record, so a run deleted only in part keeps its record and stays
   eligible next time. A reader that already has a file open (a `follow`
