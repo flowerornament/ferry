@@ -181,6 +181,91 @@ pub struct CatalogContract {
     #[serde(default)]
     pub provider: Provider,
 }
+/// A catalog adapter's version 2 JSON in its own names (SPEC §10), read
+/// natively, so `serde_json` refuses a duplicate, unknown or mistyped field
+/// as at version 1, and null is absent only where a field is optional.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractV2 {
+    #[allow(dead_code)]
+    version: i64,
+    recipe: BTreeMap<String, RecipeV2>,
+    #[serde(default)]
+    also_send: Vec<Ship>,
+    environment: Option<EnvironmentV2>,
+    #[serde(default)]
+    companion_refs: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    mirror: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    keep_between_runs: Vec<String>,
+    #[serde(default)]
+    provider: ProviderV2,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeV2 {
+    command: Vec<String>,
+    #[serde(default)]
+    needs: BTreeSet<String>,
+    #[serde(default)]
+    may_run_elsewhere: bool,
+    #[serde(default)]
+    artifacts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentV2 {
+    #[serde(default)]
+    send: BTreeSet<String>,
+    #[serde(default)]
+    refuse_other_vars_starting_with: Vec<String>,
+    #[serde(default)]
+    keep_local: BTreeSet<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2 {
+    #[serde(default)]
+    needs: BTreeSet<String>,
+}
+
+impl From<ContractV2> for CatalogContract {
+    fn from(v2: ContractV2) -> Self {
+        Self {
+            version: 2,
+            recipe: v2
+                .recipe
+                .into_iter()
+                .map(|(name, r)| {
+                    let recipe = Recipe {
+                        command: r.command,
+                        requires: r.needs,
+                        routable: r.may_run_elsewhere,
+                        artifacts: r.artifacts,
+                    };
+                    (name, recipe)
+                })
+                .collect(),
+            ship: v2.also_send,
+            environment: v2.environment.map(|e| Environment {
+                forwards: e.send,
+                watches: e.refuse_other_vars_starting_with,
+                local: e.keep_local,
+            }),
+            companion_refs: v2.companion_refs,
+            mirror: v2.mirror,
+            preserve: v2.keep_between_runs,
+            provider: Provider {
+                requires: v2.provider.needs,
+            },
+        }
+    }
+}
+
 fn recipe_table() -> String {
     "recipe".into()
 }

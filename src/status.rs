@@ -18,7 +18,7 @@ const SIZE_BUDGET: Duration = Duration::from_secs(5);
 /// What the place sees now, as one JSON document.
 pub fn place(root: &Path) -> Value {
     let mut disk = crate::admission::Admission::default();
-    let below = crate::admission::admit(root, &mut disk).err();
+    let below = crate::admission::admit(root, &mut disk, None).err();
     // One read of the live runs, shared by every part of the document.
     let live = record::live(root);
     let runs: Vec<Value> = live.iter().map(|r| run(root, r)).collect();

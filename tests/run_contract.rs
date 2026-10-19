@@ -6174,3 +6174,121 @@ fn a_reserved_machine_is_chosen_only_for_what_it_is_reserved_for() {
         "{record}"
     );
 }
+
+/// murail-4a's and herald-1b's returns on 9092e976: an adapter's version 2
+/// JSON is read natively. A null where a field is required, a version 1 key
+/// (even as null), an unknown key and a duplicate field all refuse, as at
+/// version 1; null stays absent only where a field is optional.
+#[test]
+fn a_version_two_adapter_refuses_what_version_one_refused() {
+    for (json, said) in [
+        (
+            r#"{"version":2,"recipe":{"pass":{"command":["true"],"needs":null}}}"#,
+            "invalid type: null",
+        ),
+        (
+            r#"{"version":2,"recipe":{"pass":{"command":["true"]}},"provider":{"needs":null}}"#,
+            "invalid type: null",
+        ),
+        (
+            r#"{"version":2,"recipe":{"pass":{"command":["true"]}},"unknown":null}"#,
+            "unknown field `unknown`",
+        ),
+        (
+            r#"{"version":2,"recipe":{"pass":{"command":["true"],"requires":null}}}"#,
+            "recipe.pass.`requires` is version 1: use `needs`",
+        ),
+        (
+            r#"{"version":2,"recipe":{"pass":{"command":["false"],"command":["true"]}}}"#,
+            "duplicate field `command`",
+        ),
+    ] {
+        let dir = fixture();
+        with_adapter(dir.path(), &format!("#!/bin/sh\nprintf '%s' '{json}'\n"));
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        let both = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(125), "{json}: {both}");
+        assert!(both.contains(said), "{json}: {both}");
+    }
+    // An optional field as null is absent, as at version 1.
+    let dir = fixture();
+    with_adapter(
+        dir.path(),
+        "#!/bin/sh\nprintf '%s' '{\"version\":2,\"recipe\":{\"pass\":{\"command\":[\"true\"]}},\"environment\":null,\"mirror\":null}'\n",
+    );
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+}
+
+/// murail-4a's seam: the policy read at admission, under the seat lock,
+/// decides a run's timeout, and is the one its receipt records. A run that
+/// waits at the host lease while `host.toml` lowers `max_run_time` from 6h
+/// to 1h is refused at admission, naming the new limit.
+#[test]
+fn a_policy_lowered_while_a_run_waits_refuses_it_at_admission() {
+    use std::time::{Duration, Instant};
+    let dir = fixture();
+    let root = local_root(dir.path());
+    let policy = |time: &str| {
+        with_host_policy(
+            dir.path(),
+            &format!("version = 2\nrefuse_runs_below_free_disk = '1 B'\nmax_run_time = '{time}'\n"),
+        );
+    };
+    policy("6h");
+    assert_eq!(
+        run(dir.path(), &["run", "pass", "--local", "--json"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let held = fs::File::open(root.join("locks/host")).unwrap();
+    fs2::FileExt::try_lock_exclusive(&held).unwrap();
+    let waiting = command(dir.path())
+        .args([
+            "run",
+            "pass",
+            "--local",
+            "--json",
+            "--timeout-seconds",
+            "7200",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let guard = OwnedPid(i32::try_from(waiting.id()).unwrap());
+    // Submitted under 6h, it now waits for the host lease.
+    let until = Instant::now() + common::slack();
+    while !fs::read_dir(root.join("records"))
+        .unwrap()
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".reserved.json")
+        })
+    {
+        assert!(Instant::now() < until, "the run was never submitted");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    policy("1h");
+    drop(held);
+    let out = waiting.wait_with_output().unwrap();
+    drop(guard);
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_run_time (3600 s)"),
+        "{record}"
+    );
+    assert_eq!(record["admission"]["result"], "refused", "{record}");
+}

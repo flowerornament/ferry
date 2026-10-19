@@ -207,6 +207,8 @@ refuse_runs_below_free_disk = "40 GiB"
 # Optional: a seat whose kept directories and cache exceed this starts cold.
 max_cache_per_checkout = "20 GiB"
 # Optional: the longest timeout a run may ask for, from 1s to 7d (else 6h).
+# Checked at submit, and again at admission: the reading under the seat
+# lock decides, so a limit lowered while a run waits refuses it.
 max_run_time = "6h"
 # Optional: each run deletes the history of runs submitted over 7 days ago.
 delete_run_history_after_days = 7

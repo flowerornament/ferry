@@ -210,19 +210,20 @@ fn project(text: &str) -> Result<Config, Box<dyn std::error::Error>> {
 }
 
 /// An adapter's contract of either version, checked on its own (SPEC §10):
-/// version 1 straight from its JSON, as before; version 2 renamed, its
-/// nulls read as absent.
+/// version 1 straight from its JSON, as before; version 2 natively in its
+/// own names, after a version 1 key is refused by name. Both refuse a
+/// duplicate, unknown or mistyped field, and read null as absent only where
+/// a field is optional.
 fn contract(emitted: &[u8]) -> Result<crate::config::CatalogContract, Box<dyn std::error::Error>> {
     let json: serde_json::Value = serde_json::from_slice(emitted)?;
     match json.get("version").and_then(serde_json::Value::as_i64) {
         Some(1) => Ok(serde_json::from_slice(emitted)?),
         Some(2) => {
-            let mut value: toml::Value = serde_json::from_value(crate::names::without_nulls(json))?;
-            crate::names::project(&mut value).map_err(|e| format!("the catalog contract: {e}"))?;
-            value.try_into().map_err(|e: toml::de::Error| {
-                let said = crate::names::spoken(&e.to_string(), crate::names::File::Project);
-                format!("the catalog contract: {said}").into()
-            })
+            crate::names::refuse_version_one_json(&json)
+                .map_err(|e| format!("the catalog contract: {e}"))?;
+            let v2: crate::config::ContractV2 = serde_json::from_slice(emitted)
+                .map_err(|e| format!("the catalog contract: {e}"))?;
+            Ok(v2.into())
         }
         _ => Err("unsupported catalog contract version".into()),
     }

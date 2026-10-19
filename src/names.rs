@@ -42,21 +42,26 @@ pub enum File {
     Host,
 }
 
-/// Strips `null` from adapter JSON (absent, as version 1 always read it)
-/// before it becomes TOML, which has no null.
-pub fn without_nulls(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter()
-                .filter(|(_, value)| !value.is_null())
-                .map(|(key, value)| (key, without_nulls(value)))
-                .collect(),
-        ),
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(without_nulls).collect())
+/// Refuses a version 1 key in an adapter's version 2 JSON, naming the new
+/// key, whatever its value (null included), before it is read natively.
+pub fn refuse_version_one_json(json: &serde_json::Value) -> Result<(), String> {
+    let refuse = |table: Option<&serde_json::Value>, renames: &[Rename], at: &str| {
+        let Some(table) = table.and_then(serde_json::Value::as_object) else {
+            return Ok(());
+        };
+        match renames.iter().find(|(_, old)| table.contains_key(*old)) {
+            Some((new, old)) => Err(format!("{at}`{old}` is version 1: use `{new}`")),
+            None => Ok(()),
         }
-        other => other,
+    };
+    refuse(Some(json), PROJECT, "")?;
+    if let Some(recipes) = json.get("recipe").and_then(serde_json::Value::as_object) {
+        for (name, recipe) in recipes {
+            refuse(Some(recipe), RECIPE, &format!("recipe.{name}."))?;
+        }
     }
+    refuse(json.get("environment"), ENVIRONMENT, "environment.")?;
+    refuse(json.get("provider"), PROVIDER, "provider.")
 }
 
 /// Renames `table`'s version 2 keys to version 1's, refusing a version 1

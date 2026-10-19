@@ -243,7 +243,11 @@ pub fn prepare(
         &mut held.partial,
     )?);
     // Measured after any wait for the lease, under this seat's lock.
-    crate::admission::admit(root, admission.get_or_insert_with(Default::default))?;
+    crate::admission::admit(
+        root,
+        admission.get_or_insert_with(Default::default),
+        request.timeout_seconds,
+    )?;
     // The per-seat cap, under this run's seat lock, before the checkout: a
     // failure to wipe is a note, and the run goes on with what is there.
     let admitted = admission.get_or_insert_with(Default::default);

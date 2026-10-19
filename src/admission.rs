@@ -136,7 +136,10 @@ pub(crate) fn available(root: &Path) -> Result<u64> {
 
 /// Admits a session under the seat lock it already holds, or refuses.
 /// `admission` is filled as far as the decision got, refused or not.
-pub fn admit(root: &Path, admission: &mut Admission) -> Result<()> {
+/// `timeout` is the run's own (seconds), checked against the policy read
+/// here, under the seat lock: that reading decides, and is the one the
+/// receipt records (a policy lowered while the run waited refuses it).
+pub fn admit(root: &Path, admission: &mut Admission, timeout: Option<u64>) -> Result<()> {
     admission.result = "refused".into();
     let read = policy_path().map(|path| (fs::read(&path), path));
     let (bytes, path) = match read {
@@ -164,6 +167,16 @@ pub fn admit(root: &Path, admission: &mut Admission) -> Result<()> {
     admission.floor_bytes = Some(policy.min_free_bytes);
     admission.seat_cap_bytes = policy.seat_cap_bytes;
     admission.history_days = policy.delete_run_history_after_days;
+    let limit = policy
+        .max_run_time
+        .unwrap_or(crate::limits::MAX_TIMEOUT.as_secs());
+    if timeout.is_some_and(|timeout| timeout > limit) {
+        return Err(format!(
+            "timeout above this place's max_run_time ({limit} s), as its host.toml says now; \
+             next: ask for at most {limit} s with --timeout-seconds"
+        )
+        .into());
+    }
     admission.filesystem = Some(Filesystem {
         path: root.display().to_string(),
         device: fs::metadata(root)?.dev(),
