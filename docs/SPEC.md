@@ -423,15 +423,18 @@ Nothing else is written; Ferry writes nowhere outside these.
   named, and a marked survivor that was not seen alive at deletion (one
   listed as `"unknown"`) shows in `status` as `record: none` instead of a
   leftover of that run. The caller's receipt keeps the outcome, exit code
-  and digests, not the output or the artifacts: a caller that needs a
-  run's output or artifacts longer than `<n>` days fetches them (`collect`
-  into `<repo>/.ferry/runs/<id>/`) before then.
+  and digests, not the output or the artifacts. The artifacts a recipe
+  declares are already fetched to the caller's `<repo>/.ferry/runs/<id>/`
+  when the run ends (§8); its output is not, so a caller that needs the
+  output longer than `<n>` days saves it (`ferry follow` prints it) before
+  then.
 
 **Why:** history only grows when runs happen, so runs can bound it: no
 daemon, no timer, nothing left on the host between runs (PRINCIPLES 2).
 The host's operator sets the limit, because every caller and project shares
-one history and no single project can see the rest. A caller that needs a
-run's evidence for longer keeps its own receipt.
+one history and no single project can see the rest. What outlives it is
+the caller's: its receipt, the artifacts it fetched and any output it
+saved.
 
 **Why:** only the caller knows whether a workspace still exists, and only a
 run holds its seat's lock. Each bound is enforced by the party that can
