@@ -171,7 +171,7 @@ leaves none, and the reason says so).
 | `describe` | — | `{protocol, source_rev, exe, capabilities, boot_id, os, arch}` |
 | `submit` | request JSON (`id`, `token`, `commit`, `seat`, `recipe`, `args`, `env`, `hooks`, `deadline`) | `{id}` or `{refused, why, next}` |
 | `follow` | `id`, `offset` | output bytes from that offset; ends when the record is final |
-| `retire` | seat `key`, and `idle_ms` or `once_id` | per seat: `{retired, bytes}` (under the seat lock, try only), `{refused: busy}`, `{refused: used}` (used since), `{unknown, why}` or `{failed, why}` |
+| `retire` | seat `key`; optionally `idle_ms` or `once_id` (neither for a workspace-gone prune: no `used` check) | per seat: `{retired, bytes}` (under the seat lock, try only), `{refused: busy}`, `{refused: used}` (used since), `{unknown, why}` or `{failed, why}` |
 | `stop` | `id`, `who`, `why` | `{accepted}` or `{refused}` |
 | `record` | `id` | the final or reserved record |
 
@@ -358,7 +358,9 @@ Nothing else is written; Ferry writes nowhere outside these.
   `seats/.retired-<key>-<ms>/` (atomic, same device), writes
   `records/retired-<key>.json`, then deletes the tombstone. A delete that
   fails leaves only the tombstone, which `status` lists and the next prune
-  deletes; the key itself is gone, so a later run on it starts cold and
+  deletes. A tombstone name never replaces an existing one, and `status`,
+  the seat walk and prune's list never count, measure or cap a
+  `seats/.retired-*` as a seat: they list it only as a tombstone; the key itself is gone, so a later run on it starts cold and
   whole, never on half a seat. That run re-creates the seat, and its
   `seats.jsonl` line makes it live again.
 
@@ -368,7 +370,9 @@ Nothing else is written; Ferry writes nowhere outside these.
   seat lock. With `idle_ms`, a seat whose `used.ms` is newer than the
   place's clock minus `idle_ms` is refused `used`. With `once_id`, a seat
   whose `used.id` is not that run is refused `used`. A seat with no `used`
-  has not run since this rule shipped, so the caller's age stands. The
+  has not run since this rule shipped, so the caller's age stands; a
+  `used` that cannot be read or parsed is `unknown`, and the seat is
+  kept. The
   caller reports every seat it considered: retired, busy, used, unknown
   or failed. Records, receipts and `runs/<id>/` are never touched. A caller
   retires only seats it recorded, never another caller's. "This caller" is
@@ -445,8 +449,9 @@ working tree.
     place.
 14. **Seat count:** without `--idle`, `ferry seats prune` retires a seat
     only when its workspace is provably gone (`NotFound`, a listable
-    parent on the recorded device). An unreadable or unmounted workspace is kept and
-    reported. It never touches another caller's seat, and skips a busy one.
+    parent on the recorded device). An unreadable or unmounted workspace
+    is kept and reported. It never touches another caller's seat, and
+    skips a busy one.
 15. **Seat size:** over `seat_cap_bytes`, a run starts cold with `pruned`
     recorded. Nothing outside `seats/<key>/` is ever
     measured or deleted: not through a symbolic link, not through an
@@ -474,8 +479,8 @@ working tree.
     not the same values.
 19. **One-run seat:** `ferry run --once` ends with exactly one final record
     (with `once: true`), `records/retired-<key>.json`, and no
-    `seats/<key>/`. With the retire injected to fail, the record is the
-    same and final, the seat stays, `status` lists it, and a later
+    `seats/<key>/`. With the retire injected to fail before the rename, the
+    record is the same and final, the seat stays, `status` lists it, and a later
     `prune --idle 0s` retires it. With an escaped child that inherited the
     seat's fd (the item 9 fixture), the record is final and unchanged, the
     seat stays and is busy, prune skips it while the child lives, and
@@ -488,7 +493,8 @@ working tree.
     readable after retirement).
 21. **Retire against a newer use:** a prune whose list predates a run on
     the seat (injected between the list and the retire) is refused `used`
-    and the seat stays. A `--once` retire that finds another run's `used`
+    and the seat stays, when that run is still inside `idle_ms`: the check
+    is the seat's current age, not a version. A `--once` retire that finds another run's `used`
     is refused `used`. With the supervisor's seat fd released by `LOCK_UN`
     instead of close (knockout), item 19's inherited-child case fails, and
     so does one whose child cleared its marker. With the delete injected
