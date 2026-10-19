@@ -7,6 +7,7 @@ mod execution;
 mod history;
 mod limits;
 mod lock;
+mod names;
 mod place;
 mod receipt;
 mod record;
@@ -183,7 +184,8 @@ fn machines() -> Result<config::Machines> {
         .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".config")))
         .ok_or("no configuration directory")?;
     match fs::read_to_string(base.join("ferry/machines.toml")) {
-        Ok(text) => Ok(toml::from_str(&text)?),
+        Ok(text) => config::Machines::read(&text)
+            .map_err(|e| format!("machines.toml is malformed: {e}").into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(config::Machines::default()),
         Err(e) => Err(e.into()),
     }

@@ -142,7 +142,8 @@ pub fn submit(root: &Path) -> Result<i32> {
             return Ok(refuse(&format!("parsing the request: {e}"), &same_ferry()));
         }
     };
-    let limit = crate::limits::MAX_TIMEOUT.as_secs();
+    // The host's own limit (SPEC §4: a timeout above its max_run_time).
+    let limit = crate::admission::max_run_time().as_secs();
     if request.timeout_seconds.is_some_and(|t| t > limit) {
         return Ok(refuse(
             &format!("timeout above this place's maximum ({limit} s)"),

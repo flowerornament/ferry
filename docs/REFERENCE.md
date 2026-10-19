@@ -9,6 +9,7 @@ introduction; [SPEC.md](SPEC.md) is the normative target.
 - [Machines](#machines) ([host policy](#host-policy-and-admission),
   [seat bounds](#seat-bounds-spec-9))
 - [Hooks and environment](#hooks-and-environment)
+- [Version 2 names](#version-2-names) (and reading version 1)
 - [How a run is kept honest](#how-a-run-is-kept-honest)
 - [`ferry status`](#ferry-status)
 - [Development](#development)
@@ -18,12 +19,12 @@ introduction; [SPEC.md](SPEC.md) is the normative target.
 Commit `ferry.toml`:
 
 ```toml
-version = 1
+version = 2
 
 [recipe.test]
 command = ["devenv", "shell", "--", "mix", "test"]
-requires = ["linux-x86_64"]
-routable = true
+needs = ["linux-x86_64"]     # what the machine must have
+may_run_elsewhere = true     # may run on another machine
 
 [hooks]
 prepare = "scripts/ferry-prepare"
@@ -34,10 +35,10 @@ collect = "scripts/ferry-collect"
 - **Read from the exact commit.** Recipes and requirements always come from
   the commit being run, never the working tree.
 - **Explicit argv.** Ferry never infers a tool from a recipe's name.
-- **Only `routable = true` recipes go remote.** Publishing and certifying
+- **Only `may_run_elsewhere = true` recipes go remote.** Publishing and certifying
   recipes stay unroutable; for example, a repository's `just land` stays
   local.
-- **`exclusive`.** `requires = ["exclusive"]` (or `--exclusive`) holds the host
+- **`exclusive`.** `needs = ["exclusive"]` (or `--exclusive`) holds the host
   lease alone. It is an execution lock, not a machine feature: routing ignores
   it.
 
@@ -61,7 +62,7 @@ its status says so.
   or files already on disk. After a failure nothing is left there, unless
   the earlier directory could not be removed: that is reported as `archive`
   failed, and what remains is never vouched for.
-- **Never stale.** A file in a `preserve` path fails collection: the checkout
+- **Never stale.** A file in a `keep_between_runs` path fails collection: the checkout
   reset keeps those, so it may be an earlier run's.
 
 ### An existing catalog or adapter
@@ -69,23 +70,24 @@ its status says so.
 If recipes already have a catalog, point to it:
 
 ```toml
-version = 1
+version = 2
 [catalog]
-path = ".config/gates.toml"
+path = ".config/gates.toml"   # its entries use requires/routable at either version
 table = "recipe"
 ```
 
 If the catalog has another schema, set `[catalog] adapter =
 "scripts/ferry-catalog"`.
 - **What the adapter emits:** this committed executable runs caller-side in
-  fresh checkouts of the pinned commit and prints `{"version":1,"recipe":{...}}`.
-  It may also emit:
-  - a `ship` list (the `[[ship]]` entries below), for example dependencies
+  fresh checkouts of the pinned commit and prints `{"version":2,"recipe":{...}}`
+  (its own version, checked on its own: either 1 or 2 during the
+  compatibility release, whatever `ferry.toml` declares). It may also emit:
+  - an `also_send` list (the `[[also_send]]` entries below), for example dependencies
     derived from the repository's lockfile. Entries from the adapter and
     from `ferry.toml` are combined; the same ref or URL declared twice
     refuses;
   - an `environment` declaration;
-  - `preserve`, a list of ignored build directories kept across resets, for
+  - `keep_between_runs`, a list of ignored build directories kept across resets, for
     example `["_build", "deps", ".devenv"]`.
 - **Checks:** Ferry checks repeatability, validates the whole contract before
   routing, and records the digests of the adapter and the emitted contract.
@@ -97,19 +99,19 @@ If the catalog has another schema, set `[catalog] adapter =
 - paths must be literal ignored directories with no tracked files, never
   `.git`, `.jj` or `.ferry`;
 - tracked files, HEAD and hidden index flags are still checked;
-- omit `preserve` for a clean run.
+- omit `keep_between_runs` for a clean run.
 
 ### Shipped objects
 
-A run can ship more than its commit. Each `[[ship]]` entry is either an
+A run can send more than its commit. Each `[[also_send]]` entry is either an
 extra ref in the checkout or a dependency served at its URL:
 
 ```toml
-[[ship]]          # an extra ref in the checkout
+[[also_send]]     # an extra ref in the checkout
 ref = 'refs/remotes/origin/master'
 from = { remote = 'origin', branch = 'master' }   # or a revision: 'master@origin'
 
-[[ship]]          # a dependency, served from the place at its URL
+[[also_send]]     # a dependency, served from the place at its URL
 url = 'https://github.com/org/dep'
 path = 'deps/dep' # a caller-local repository
 commit = 'abc123…'
@@ -138,7 +140,7 @@ rollback or an older binary on one end cannot silently run without them:
 
 ```toml
 [provider]
-requires = ["admission"]
+needs = ["admission"]
 ```
 
 | capability | meaning |
@@ -152,7 +154,7 @@ requires = ["admission"]
 | `retire` | the place's `retire` verb for `ferry seats prune`; prune refuses a place without it (125, naming its `source_rev`) |
 | `seat-lifetime` | `run --once`, `seats prune --idle`, and a `retire` that checks the seat's latest use, never deletes during an exclusive run, and renames to a tombstone first; a `--once` run or an idle retire refuses a place without it |
 | `run-history` | `delete_run_history_after_days` in `host.toml`, and a not-found answer that names it |
-| `ship` | `[[ship]]` requests and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
+| `ship` | `[[also_send]]` requests (`[[ship]]` in version 1) and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
 | `status` | the place's `status` verb; `ferry status` refuses a place without it (125, naming its `source_rev`) |
 
 A run is refused (125) before any hook runs if:
@@ -169,34 +171,43 @@ receipt records `provider_requires`.
 `$XDG_CONFIG_HOME/ferry/machines.toml` (default `~/.config/ferry`):
 
 ```toml
-[host.bench]
+version = 2
+[machine.bench]
 ssh = "bench"
-triple = "x86_64-unknown-linux-gnu"
-cores = 16
-features = ["linux", "x86_64", "quiet"]
+platform = "x86_64-unknown-linux-gnu"
+has = ["linux", "x86_64", "quiet"]
+reserved_for = ["quiet"]   # optional: chosen without --on only for recipes that need one of these
 ```
 
 - **`binary`** (default `.local/bin/ferry`, relative to the host's home) is
   the path to `ferry` on the host. After `nix profile install`, set
   `binary = ".nix-profile/bin/ferry"`.
-- **Routing:** Ferry chooses the first machine whose features contain every
-  requirement. `--on` names a machine; it does not bypass requirements.
+- **Routing:** a `may_run_elsewhere` recipe run without `--on` or `--local`
+  goes to the first machine, by name, that `has` everything it `needs`.
+  A machine with `reserved_for` is skipped in that choice unless the recipe
+  needs one of the listed features (one is enough); with no other machine,
+  the run is refused naming it (`bench is reserved_for quiet; use --on
+  bench`), never sent there. `--on` names a machine: it bypasses a
+  reservation, never `may_run_elsewhere` or `needs`. Every `reserved_for`
+  name must be in that machine's `has`, or `machines.toml` is refused.
 - **SSH:** aliases come from your SSH configuration. Ferry copies no
   credentials and provisions nothing.
 - **Features are declarations,** not measurements.
 
 ### Host policy and admission
 
-A machine's operator may set a disk floor in `~/.config/ferry/host.toml` on
+A machine's operator may set its rules in `~/.config/ferry/host.toml` on
 that machine. Each run is admitted under its seat lock, after the host lease,
 before checkout and hooks.
 
 ```toml
-# Version 1: a guard. Below the floor, refuse (125).
-version = 1
-min_free_bytes = 42949672960
-# Optional: a seat whose preserve paths and cache exceed this starts cold.
-seat_cap_bytes = 21474836480
+version = 2
+# Below this much free disk, a run is refused (125).
+refuse_runs_below_free_disk = "40 GiB"
+# Optional: a seat whose kept directories and cache exceed this starts cold.
+max_cache_per_checkout = "20 GiB"
+# Optional: the longest timeout a run may ask for, from 1s to 7d (else 6h).
+max_run_time = "6h"
 # Optional: each run deletes the history of runs submitted over 7 days ago.
 delete_run_history_after_days = 7
 ```
@@ -281,8 +292,8 @@ receipts or records.
   revision), 255 if a place was unreachable. Below the disk floor, a run's
   refusal names `ferry status --on <place>` and `ferry seats prune --on
   <place> --idle <dur>`.
-- **Size.** With `seat_cap_bytes` set, a run measures its seat's preserve
-  paths and cache under its seat lock, before the checkout, when the last
+- **Size.** With `max_cache_per_checkout` set, a run measures its seat's
+  kept directories and cache under its seat lock, before the checkout, when the last
   measurement is over an hour old. Only paths proven inside the seat are
   measured or wiped: one behind a symbolic link, or on another device (a
   volume mounted inside the seat), is skipped with a note, and every delete
@@ -371,21 +382,58 @@ or prepares its seat) runs none of them, collect included: nothing ran.
   (`<state>/seats/<seat>/cache`, mode 0700). Put regenerable build output there,
   for example `CARGO_TARGET_DIR=$FERRY_CACHE_DIR/cargo-target`.
 - **The `environment` declaration** has three lists:
-  - `forwards`: caller variables sent to the recipe, recorded in the receipt,
+  - `send`: caller variables sent to the recipe, recorded in the receipt,
     so never put secrets there;
-  - `watches`: prefixes whose unlisted, nonempty variables refuse before any
-    push;
-  - `local`: variables deliberately kept on the caller.
+  - `refuse_other_vars_starting_with`: prefixes whose other nonempty
+    variables refuse before any push (one listed in `send` or `keep_local`
+    never refuses);
+  - `keep_local`: variables deliberately kept on the caller.
 - **Projects own** their own database preparation and artifact collection. A
   service a run starts and expects to outlive it belongs to the operator's
   service manager (`PRINCIPLES.md`, worked example).
+
+## Version 2 names
+
+Each file declares `version = 2` and uses names a new user can read
+(SPEC §10). Sizes are strings with a unit: `"40 GiB"`, `"512 MiB"` (binary),
+`"40 GB"` (decimal), case-sensitive; durations a number and unit (`"6h"`,
+`"30m"`).
+
+| version 1 | version 2 |
+|---|---|
+| `requires` (recipe, `[provider]`) | `needs` |
+| `routable` | `may_run_elsewhere` |
+| `preserve` | `keep_between_runs` |
+| `[[ship]]` | `[[also_send]]` |
+| `[environment] forwards / watches / local` | `send / refuse_other_vars_starting_with / keep_local` |
+| `[host.<name>]` | `[machine.<name>]` |
+| `triple` | `platform` |
+| `features` | `has` |
+| `cores` | removed (routing never read it) |
+| `min_free_bytes` (bytes) | `refuse_runs_below_free_disk` (a size) |
+| `seat_cap_bytes` (bytes) | `max_cache_per_checkout` (a size) |
+| (none; `max_timeout` was never read, and is refused naming the new key) | `max_run_time` (a duration, 1s to 7d) |
+
+- **One release of both.** Ferry reads version 1 and version 2 of each file
+  and of an adapter's JSON. `machines.toml` without a `version` is version 1.
+- **No mixing.** A version 2 file that holds a version 1 key is refused,
+  naming the new key (`min_free_bytes` is version 1: use
+  `refuse_runs_below_free_disk`), and so is a size without a unit. Version 2
+  keys (`reserved_for`, `max_run_time`) need `version = 2`.
+- **A project and its adapter** each declare their own version and are read
+  by it; the merged contract is the same either way.
+- **What keeps its names:** records, receipts, the request and the protocol
+  (`requires`, `routable`, `preserve`, `forwarded_env`, `ship`, …), and a
+  catalog file named by `[catalog] path`, which is the project's own data:
+  its entries keep `requires` and `routable` (other keys are ignored).
+- **Order:** move a file only once every tool that reads it reads version 2.
 
 ## How a run is kept honest
 
 ### Transport
 
 - **Exact objects only.** The caller pushes only the exact commit (and any
-  `[[ship]]` objects) to the machine's private bare repository, under
+  `[[also_send]]` objects) to the machine's private bare repository, under
   `refs/ferry/<repo key>-<seat>/<commit>`, never to origin. Two concurrent
   runs of the same commit may race to create that ref. A push that loses the
   race to an identical ref counts as published.

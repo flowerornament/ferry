@@ -191,19 +191,53 @@ pub fn ship(
     Ok(resolved)
 }
 
+/// A `ferry.toml` of either version (SPEC §10): version 1 straight from its
+/// text, as before; version 2 by its plain names, renamed. What refuses says
+/// why in the file's own names.
+fn project(text: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let mut value: toml::Value = toml::from_str(text)?;
+    match crate::names::version(&value, 0) {
+        1 => Ok(toml::from_str(text)?),
+        2 => {
+            crate::names::project(&mut value).map_err(|e| format!("ferry.toml: {e}"))?;
+            value.try_into().map_err(|e: toml::de::Error| {
+                let said = crate::names::spoken(&e.to_string(), crate::names::File::Project);
+                format!("ferry.toml: {said}").into()
+            })
+        }
+        _ => Err("unsupported ferry.toml version".into()),
+    }
+}
+
+/// An adapter's contract of either version, checked on its own (SPEC §10):
+/// version 1 straight from its JSON, as before; version 2 renamed, its
+/// nulls read as absent.
+fn contract(emitted: &[u8]) -> Result<crate::config::CatalogContract, Box<dyn std::error::Error>> {
+    let json: serde_json::Value = serde_json::from_slice(emitted)?;
+    match json.get("version").and_then(serde_json::Value::as_i64) {
+        Some(1) => Ok(serde_json::from_slice(emitted)?),
+        Some(2) => {
+            let mut value: toml::Value = serde_json::from_value(crate::names::without_nulls(json))?;
+            crate::names::project(&mut value).map_err(|e| format!("the catalog contract: {e}"))?;
+            value.try_into().map_err(|e: toml::de::Error| {
+                let said = crate::names::spoken(&e.to_string(), crate::names::File::Project);
+                format!("the catalog contract: {said}").into()
+            })
+        }
+        _ => Err("unsupported catalog contract version".into()),
+    }
+}
+
 pub fn declaration(
     root: &Path,
     sha: &str,
     evidence: &mut DeclarationEvidence,
 ) -> Result<Declaration, Box<dyn std::error::Error>> {
-    let mut config: Config = toml::from_str(&String::from_utf8(committed_file(
+    let mut config = project(&String::from_utf8(committed_file(
         root,
         sha,
         "ferry.toml",
     )?)?)?;
-    if config.version != 1 {
-        return Err("unsupported ferry.toml version".into());
-    }
     crate::config::retired([&config.companion_refs, &config.mirror])?;
     config.hooks.check()?;
     let recipes = if let Some(catalog) = &config.catalog {
@@ -212,6 +246,8 @@ pub fn declaration(
         }
         match (&catalog.path, &catalog.adapter) {
             (Some(path), None) => {
+                // The project's own catalog: not one of the three files, so
+                // its keys are never renamed (SPEC §10).
                 let value: toml::Value =
                     toml::from_str(&String::from_utf8(committed_file(root, sha, path)?)?)?;
                 crate::config::catalog_recipes(&value, &catalog.table)?
@@ -224,10 +260,9 @@ pub fn declaration(
                 if emitted != adapter(root, sha, path)? {
                     return Err("catalog adapter is nondeterministic".into());
                 }
-                let contract: crate::config::CatalogContract = serde_json::from_slice(&emitted)?;
-                if contract.version != 1 {
-                    return Err("unsupported catalog contract version".into());
-                }
+                // Its own version, checked on its own (SPEC §10): either may
+                // be 1 or 2 during the compatibility release.
+                let contract = contract(&emitted)?;
                 // Both may ship: a ref or URL declared twice is refused
                 // where the entries are resolved.
                 crate::config::retired([&contract.companion_refs, &contract.mirror])?;

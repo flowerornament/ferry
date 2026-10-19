@@ -60,6 +60,7 @@ final record, and `ferry record <id>` completes the receipt later.
 | `record` | Reserve, finalize once, reconcile a lost supervisor; busy-holder naming. | §8 |
 | `receipt` | The caller's receipt, digests, run ids, capabilities. | §8 |
 | `admission` | Host policy: disk floor, per-seat cap, and every delete in a seat (contained, same device). | §9 |
+| `names` | Version 2's plain config names: a version 2 file renamed to the version 1 names the structs read, sizes and durations converted, version 1 keys in it refused naming the new ones. Deleted with version 1. | §10 |
 | `history` | The host's run history bound: after a run's record is final, delete the runs, retirement records and accounts older than `delete_run_history_after_days`. | §9 |
 | `seats` | The caller's seat book, `ferry seats prune [--idle]`, and the hourly prune a run makes by itself. | §9 |
 | `status` | `ferry status`: one read-only view of a place (disk, live runs, the gate, seats, leftovers). | §4 |

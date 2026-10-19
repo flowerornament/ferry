@@ -61,7 +61,9 @@ pub fn retired(keys: [&Option<serde::de::IgnoredAny>; 2]) -> Result<(), String> 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub version: u32,
+    /// Read only to choose the names (`names::version`).
+    #[allow(dead_code)]
+    version: i64,
     #[serde(default)]
     pub recipe: BTreeMap<String, Recipe>,
     pub catalog: Option<Catalog>,
@@ -163,7 +165,9 @@ pub struct Catalog {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogContract {
-    pub version: u32,
+    /// Read only to choose the names (`names::version`).
+    #[allow(dead_code)]
+    version: i64,
     pub recipe: BTreeMap<String, Recipe>,
     #[serde(default)]
     pub ship: Vec<Ship>,
@@ -218,6 +222,10 @@ pub struct Machine {
     pub features: BTreeSet<String>,
     #[serde(default = "default_binary")]
     pub binary: String,
+    /// Features a run must need for the automatic choice to take this
+    /// machine (SPEC §10, version 2 only); `--on` still chooses it.
+    #[serde(default)]
+    pub reserved_for: BTreeSet<String>,
 }
 fn default_binary() -> String {
     ".local/bin/ferry".into()
@@ -226,6 +234,10 @@ fn default_binary() -> String {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Machines {
+    /// Read only to choose the names (`names::version`).
+    #[serde(default)]
+    #[allow(dead_code)]
+    version: Option<i64>,
     #[serde(default)]
     pub host: BTreeMap<String, Machine>,
     /// Each run prunes its place's seats this caller has not used for this
@@ -233,6 +245,45 @@ pub struct Machines {
     /// itself.
     #[serde(default, deserialize_with = "unused_days")]
     pub delete_unused_checkouts_after_days: Option<u64>,
+}
+
+impl Machines {
+    /// Reads `machines.toml` of either version (SPEC §10): version 1 by its
+    /// own keys, version 2 by its plain names, renamed. A machine's
+    /// `reserved_for` names only features it `has`.
+    pub fn read(text: &str) -> Result<Self, String> {
+        let mut value: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+        let machines: Self = match crate::names::version(&value, 1) {
+            1 => {
+                let reserving = value
+                    .get("host")
+                    .and_then(toml::Value::as_table)
+                    .into_iter()
+                    .flat_map(|hosts| hosts.values())
+                    .any(|host| host.get("reserved_for").is_some());
+                if reserving {
+                    return Err("`reserved_for` needs version = 2".into());
+                }
+                // Straight from the text, so a refusal keeps its line.
+                toml::from_str(text).map_err(|e| e.to_string())?
+            }
+            2 => {
+                crate::names::machines(&mut value)?;
+                value.try_into().map_err(|e: toml::de::Error| {
+                    crate::names::spoken(&e.to_string(), crate::names::File::Machines)
+                })?
+            }
+            _ => return Err("not a supported version (1 or 2)".into()),
+        };
+        for (name, machine) in &machines.host {
+            if let Some(missing) = machine.reserved_for.difference(&machine.features).next() {
+                return Err(format!(
+                    "machine {name} is reserved_for {missing}, which it does not have"
+                ));
+            }
+        }
+        Ok(machines)
+    }
 }
 
 fn unused_days<'de, D: serde::Deserializer<'de>>(to: D) -> Result<Option<u64>, D::Error> {
@@ -333,12 +384,33 @@ pub fn route<'a>(
     if !recipe.routable || machines.host.is_empty() {
         return Ok(Route::Local);
     }
-    machines
+    // A reserved machine is taken only for a recipe that needs one of what
+    // it is reserved for (SPEC §10); never as a fallback.
+    let chosen = |(_, m): &(&String, &Machine)| {
+        supports(recipe, m)
+            && (m.reserved_for.is_empty() || !m.reserved_for.is_disjoint(&recipe.requires))
+    };
+    if let Some((name, _)) = machines.host.iter().find(chosen) {
+        return Ok(Route::Remote(name.as_str()));
+    }
+    // Every capable machine left is reserved: each is named, with its --on.
+    let reserved: Vec<String> = machines
         .host
         .iter()
-        .find(|(_, m)| supports(recipe, m))
-        .map(|(name, _)| Route::Remote(name.as_str()))
-        .ok_or_else(|| "no configured machine meets requirements".into())
+        .filter(|(_, m)| supports(recipe, m))
+        .map(|(name, machine)| {
+            let what: Vec<&str> = machine.reserved_for.iter().map(String::as_str).collect();
+            format!(
+                "{name} is reserved_for {}; use --on {name}",
+                what.join(", ")
+            )
+        })
+        .collect();
+    if reserved.is_empty() {
+        Err("no configured machine meets requirements".into())
+    } else {
+        Err(reserved.join("; or "))
+    }
 }
 fn supports(recipe: &Recipe, machine: &Machine) -> bool {
     let mut required = recipe.requires.clone();
@@ -431,6 +503,7 @@ mod tests {
     }
     fn machines() -> Machines {
         Machines {
+            version: None,
             delete_unused_checkouts_after_days: None,
             host: BTreeMap::from([(
                 "bench".into(),
@@ -440,6 +513,7 @@ mod tests {
                     cores: Some(16),
                     features: BTreeSet::new(),
                     binary: default_binary(),
+                    reserved_for: BTreeSet::new(),
                 },
             )]),
         }

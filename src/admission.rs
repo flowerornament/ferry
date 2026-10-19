@@ -4,13 +4,19 @@
 //! `~/.config/ferry/host.toml`), read on the machine that runs the session:
 //!
 //! - absent: not configured; the run proceeds and the receipt says so;
-//! - `version = 1`, `min_free_bytes`: below the floor, refuse; optional
-//!   `seat_cap_bytes`: a seat whose preserve paths and cache exceed it is
-//!   wiped at run start and runs cold (SPEC §9); optional
-//!   `delete_run_history_after_days`: each run then deletes the history of
-//!   runs submitted more than that many days ago (SPEC §9, `history`).
+//! - `version = 2` (SPEC §10): `refuse_runs_below_free_disk` (a size):
+//!   below it, refuse; optional `max_cache_per_checkout` (a size): a seat
+//!   whose kept directories and cache exceed it is wiped at run start and
+//!   runs cold (SPEC §9); optional `delete_run_history_after_days`: each run
+//!   then deletes the history of runs submitted more than that many days ago
+//!   (SPEC §9, `history`); optional `max_run_time` (a duration): the longest
+//!   timeout a run may ask for;
+//! - `version = 1`, for one release: the same with `min_free_bytes` and
+//!   `seat_cap_bytes` in bytes, and no `max_run_time`. Read by the version 1
+//!   names below; `names::host` renames a version 2 file to them.
 //!
-//! Anything else (malformed TOML, another version, an unknown key) refuses.
+//! Anything else (malformed TOML, another version, an unknown key, a
+//! version 1 key in a version 2 file) refuses.
 //! Seats are bounded by `ferry seats prune` and `seat_cap_bytes` (SPEC §9),
 //! not by evicting idle seats.
 use serde::{Deserialize, Serialize};
@@ -24,11 +30,52 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Policy {
-    version: u32,
+    /// The file's version: 1, or 2 for the plain names.
+    #[serde(default)]
+    version: i64,
     min_free_bytes: u64,
     seat_cap_bytes: Option<u64>,
     #[serde(default, deserialize_with = "history_days")]
     delete_run_history_after_days: Option<u64>,
+    /// The longest timeout a run here may ask for, in seconds (version 2's
+    /// `max_run_time`); absent, `limits::MAX_TIMEOUT`.
+    #[serde(default)]
+    max_run_time: Option<u64>,
+}
+
+/// Reads a policy file of either version (SPEC §10): version 1 by its own
+/// keys, version 2 by its plain names, renamed. What refuses says why in the
+/// file's own names.
+fn read_policy(text: &str) -> std::result::Result<Policy, String> {
+    let mut value: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    let version = crate::names::version(&value, 0);
+    let mut policy: Policy = match version {
+        1 if value.get("max_run_time").is_some() => {
+            return Err("`max_run_time` needs version = 2".into());
+        }
+        // Straight from the text, so a refusal keeps its line.
+        1 => toml::from_str(text).map_err(|e| e.to_string())?,
+        2 => {
+            crate::names::host(&mut value)?;
+            value.try_into().map_err(|e: toml::de::Error| {
+                crate::names::spoken(&e.to_string(), crate::names::File::Host)
+            })?
+        }
+        _ => return Err("not a supported version (1 or 2)".into()),
+    };
+    policy.version = version;
+    Ok(policy)
+}
+
+/// The longest timeout a run on this host may ask for: its policy's
+/// `max_run_time`, else `limits::MAX_TIMEOUT`. A policy that cannot be read
+/// refuses the run at admission; here it leaves the default.
+pub fn max_run_time() -> std::time::Duration {
+    policy_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| read_policy(&text).ok())
+        .and_then(|policy| policy.max_run_time)
+        .map_or(crate::limits::MAX_TIMEOUT, std::time::Duration::from_secs)
 }
 
 fn history_days<'de, D: serde::Deserializer<'de>>(
@@ -76,8 +123,7 @@ fn policy_path() -> Option<PathBuf> {
 /// for a not-found answer's context; `None` when unset or unreadable.
 pub fn history_kept_days() -> Option<u64> {
     let text = fs::read_to_string(policy_path()?).ok()?;
-    let policy: Policy = toml::from_str(&text).ok()?;
-    policy.delete_run_history_after_days
+    read_policy(&text).ok()?.delete_run_history_after_days
 }
 
 // statvfs field widths differ between platforms (u32 or u64), so the
@@ -110,28 +156,8 @@ pub fn admit(root: &Path, admission: &mut Admission) -> Result<()> {
         "sha256": crate::receipt::digest(&bytes),
     }));
     let text = std::str::from_utf8(&bytes)?;
-    // The version first, whatever else the file holds: a version 2 policy
-    // (with its `evict` block) gets the retirement and its remedy, not a
-    // schema error. Unknown fields of a version 1 policy still refuse.
-    let version = toml::from_str::<toml::Value>(text)
-        .ok()
-        .and_then(|value| value.get("version").and_then(toml::Value::as_integer));
-    if version == Some(2) {
-        return Err(format!(
-            "host policy {}: version 2 eviction is retired: keep min_free_bytes as version 1",
-            path.display()
-        )
-        .into());
-    }
-    let policy: Policy = toml::from_str(text)
+    let policy = read_policy(text)
         .map_err(|e| format!("host policy {} is malformed: {e}", path.display()))?;
-    if policy.version != 1 {
-        return Err(format!(
-            "host policy {} is not a supported version 1 policy",
-            path.display()
-        )
-        .into());
-    }
     if let Some(serde_json::Value::Object(fields)) = admission.policy.as_mut() {
         fields.insert("version".into(), policy.version.into());
     }

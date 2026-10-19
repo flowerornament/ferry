@@ -4,6 +4,20 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **Config files read in plain words.** `ferry.toml`, `machines.toml` and
+  `host.toml` take `version = 2`, whose keys say what they do: `needs`,
+  `may_run_elsewhere`, `keep_between_runs`, `[[also_send]]`,
+  `send` / `refuse_other_vars_starting_with` / `keep_local`,
+  `[machine.<name>]` with `platform` and `has`, and
+  `refuse_runs_below_free_disk = "40 GiB"` instead of a byte count. Version 1
+  files are still read for this release; a version 2 file holding a version 1
+  key is refused, naming the new one. `host.toml` gains `max_run_time`, the
+  longest timeout a run may ask for.
+- **A reserved machine.** `reserved_for = ["quiet"]` in a version 2
+  `machines.toml` keeps a machine out of the automatic choice unless a
+  recipe needs one of those features, so a timing host is not taken by runs
+  that forgot `--on`. `--on` still chooses it.
+
 - **A late prune no longer hides a recreated seat.** If a run recreated a
   seat while a prune's retirement of it was still on its way back, the
   caller's book took the late retirement as the latest word, and later

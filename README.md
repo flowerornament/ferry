@@ -75,21 +75,22 @@ upgrades, rollback and cutting a release.
 # 1. Declare recipes in the repository, and commit them: Ferry reads them
 #    from the commit it runs, never from the working tree
 cat > ferry.toml <<'EOF'
-version = 1
+version = 2
 [recipe.test]
 command = ["cargo", "test", "--locked"]
-requires = ["linux"]
-routable = true
+needs = ["linux"]                   # what the machine must have
+may_run_elsewhere = true            # may run on a configured machine
 EOF
 git add ferry.toml && git commit -m "Add ferry.toml"
 
 # 2. Declare machines once, on the caller
 mkdir -p ~/.config/ferry
 cat > ~/.config/ferry/machines.toml <<'EOF'
-[host.bench]
+version = 2
+[machine.bench]
 ssh = "bench"                       # an alias from your SSH configuration
-triple = "x86_64-unknown-linux-gnu"
-features = ["linux", "x86_64"]
+platform = "x86_64-unknown-linux-gnu"
+has = ["linux", "x86_64"]
 EOF
 
 # 3. Run
@@ -103,7 +104,11 @@ ferry receipt <id>               # what happened
 
 With no machines configured, runs are local. A machine that lacks a required
 feature refuses rather than running. `--local` runs on this machine without
-checking `requires`.
+checking `needs`. Version 1 files (`requires`, `routable`, `[host.<name>]`,
+`triple`, `features`) are still read for one release; see
+[docs/REFERENCE.md](docs/REFERENCE.md#version-2-names). If another tool also
+reads your `machines.toml`, keep it at version 1 until that tool reads
+version 2.
 
 ## Concepts
 

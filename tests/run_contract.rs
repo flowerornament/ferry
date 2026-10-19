@@ -2551,36 +2551,24 @@ fn ferry_record_completes_a_run_whose_record_has_the_old_shapes() {
     assert_eq!(after["admission"], old_admission, "{after}");
 }
 
-/// A real version 2 policy, with its `evict` block, gets the retirement and
-/// its remedy, not a schema error (murail-4a's db0c1892).
+/// The retired version 2 eviction policy (its `evict` block) is refused
+/// naming what bounds seats now, not as a schema error (murail-4a's
+/// db0c1892, carried into version 2's plain names).
 #[test]
-fn an_actual_version_two_eviction_policy_names_the_version_one_remedy() {
+fn a_retired_eviction_policy_names_what_bounds_seats_now() {
     let dir = fixture();
     with_host_policy(
         dir.path(),
-        "version = 2\nmin_free_bytes = 1\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
+        "version = 2\nrefuse_runs_below_free_disk = '1 B'\nevict = { mode = 'idle-seat-targets', targets = ['cargo-target'] }\n",
     );
     let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
     assert_eq!(out.status.code(), Some(125));
     let record = receipt(&out);
     let reason = record["reason"].as_str().unwrap();
     assert!(
-        reason.contains("version 2 eviction is retired")
-            && reason.contains("keep min_free_bytes as version 1"),
+        reason.contains("`evict` is retired") && reason.contains("max_cache_per_checkout"),
         "{record}"
     );
-}
-
-/// Eviction is retired with the idle records it read: a version 2 policy
-/// refuses, naming what to keep (slice 4b; seats are bounded by slice 5).
-#[test]
-fn a_version_two_policy_refuses_naming_version_one() {
-    let dir = fixture();
-    with_host_policy(dir.path(), "version = 2\nmin_free_bytes = 1\n");
-    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
-    assert_eq!(out.status.code(), Some(125));
-    let reason = receipt(&out)["reason"].as_str().unwrap().to_owned();
-    assert!(reason.contains("version 2 eviction is retired"), "{reason}");
 }
 
 #[test]
@@ -5788,4 +5776,401 @@ fn a_late_retirement_never_hides_a_recreated_seat() {
         "{said}"
     );
     assert!(!place.join("seats").join(&key).exists(), "{said}");
+}
+
+/// The platform `remote_command`'s `machines.toml` declares for the test host.
+fn test_platform() -> String {
+    format!(
+        "{}-{}",
+        std::env::consts::ARCH,
+        if cfg!(target_os = "macos") {
+            "apple-darwin"
+        } else {
+            "unknown-linux-gnu"
+        }
+    )
+}
+
+/// Replaces the caller's `machines.toml` (after `remote_command` wrote its own).
+fn with_machines(dir: &Path, text: &str) {
+    fs::create_dir_all(dir.join("config/ferry")).unwrap();
+    fs::write(dir.join("config/ferry/machines.toml"), text).unwrap();
+}
+
+/// Commits `ferry.toml` with `text`.
+fn with_project(dir: &Path, text: &str) {
+    fs::write(dir.join("ferry.toml"), text).unwrap();
+    // Kept build directories are ignored ones.
+    fs::write(dir.join(".gitignore"), "_build/\n").unwrap();
+    git(dir, &["add", "ferry.toml", ".gitignore"]);
+    git(dir, &["commit", "-m", "ferry.toml"]);
+}
+
+/// SPEC §12 item 24: each of the three files at version 2 is read with the
+/// §10 keys, sizes and durations; a variable under a
+/// `refuse_other_vars_starting_with` prefix that is listed in `send` or
+/// `keep_local` does not refuse.
+#[test]
+fn version_two_files_are_read_by_their_plain_names() {
+    let dir = fixture();
+    with_project(
+        dir.path(),
+        "version = 2\nkeep_between_runs = ['_build']\n[environment]\nsend = ['APP_ALLOWED']\nrefuse_other_vars_starting_with = ['APP_']\nkeep_local = ['APP_LOCAL']\n[provider]\nneeds = ['admission']\n[recipe.pass]\ncommand = ['sh', '-c', 'echo forwarded-$APP_ALLOWED']\nneeds = []\nmay_run_elsewhere = true\n",
+    );
+    with_host_policy(
+        dir.path(),
+        "version = 2\nrefuse_runs_below_free_disk = '1 B'\nmax_cache_per_checkout = '1 GiB'\nmax_run_time = '1h'\n",
+    );
+    let out = command(dir.path())
+        .args(["run", "pass", "--local", "--json"])
+        .env("APP_ALLOWED", "selected")
+        .env("APP_LOCAL", "kept")
+        .output()
+        .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(
+        record["forwarded_env"],
+        serde_json::json!({"APP_ALLOWED": "selected"})
+    );
+    assert_eq!(record["preserve"], serde_json::json!(["_build"]));
+    assert_eq!(
+        record["provider_requires"],
+        serde_json::json!(["admission"])
+    );
+    assert_eq!(record["admission"]["floor_bytes"], 1, "{record}");
+    assert_eq!(
+        record["admission"]["seat_cap_bytes"],
+        1u64 << 30,
+        "{record}"
+    );
+    assert_eq!(record["admission"]["policy"]["version"], 2, "{record}");
+    // max_run_time bounds what a run may ask for.
+    let out = run(
+        dir.path(),
+        &[
+            "run",
+            "pass",
+            "--local",
+            "--json",
+            "--timeout-seconds",
+            "7200",
+        ],
+    );
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("3600 s"),
+        "{record}"
+    );
+    // machines.toml at version 2: [machine.<name>], platform, has.
+    let remote = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    );
+    with_machines(
+        dir.path(),
+        &format!(
+            "version = 2\n[machine.test-host]\nssh = 'test-host'\nbinary = '.local/bin/ferry'\nplatform = '{}'\nhas = ['quiet']\n",
+            test_platform()
+        ),
+    );
+    let out = { remote }.output().unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(record["machine"], "test-host", "{record}");
+    assert!(
+        record["machine_features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "quiet"),
+        "{record}"
+    );
+}
+
+/// SPEC §12 item 24, `host.toml`: a version 1 key in a version 2 policy is
+/// refused naming the new key; so is a size without a unit, `max_timeout`
+/// (named version 1 in SPEC §10), a `max_run_time` outside 1s to 7d, and
+/// `max_run_time` in a version 1 policy.
+#[test]
+fn a_version_two_host_policy_names_its_rules() {
+    let dir = fixture();
+    for (policy, said) in [
+        (
+            "version = 2\nmin_free_bytes = 1\n",
+            "`min_free_bytes` is version 1: use `refuse_runs_below_free_disk`",
+        ),
+        (
+            "version = 2\nrefuse_runs_below_free_disk = 40\n",
+            "a size with a unit",
+        ),
+        (
+            "version = 2\nrefuse_runs_below_free_disk = '40'\n",
+            "a size with a unit",
+        ),
+        (
+            "version = 1\nmin_free_bytes = 1\nmax_run_time = '1h'\n",
+            "needs version = 2",
+        ),
+        (
+            "version = 2\nrefuse_runs_below_free_disk = '1 B'\nmax_timeout = 60\n",
+            "`max_timeout` is version 1: use `max_run_time`",
+        ),
+        (
+            "version = 2\nrefuse_runs_below_free_disk = '1 B'\nmax_run_time = '0s'\n",
+            "from 1s to 7d",
+        ),
+        (
+            "version = 2\nrefuse_runs_below_free_disk = '1 B'\nmax_run_time = '8d'\n",
+            "from 1s to 7d",
+        ),
+    ] {
+        with_host_policy(dir.path(), policy);
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        let record = receipt(&out);
+        assert_eq!(out.status.code(), Some(125), "{policy}: {record}");
+        assert!(
+            record["reason"].as_str().unwrap_or_default().contains(said),
+            "{policy}: {record}"
+        );
+    }
+}
+
+/// SPEC §12 item 24: a version 2 file holding a version 1 key is refused,
+/// naming the new key; so is a size without a unit, and a version 2 file's
+/// unknown key is named in version 2's words.
+#[test]
+fn a_version_two_file_with_a_version_one_key_names_the_new_key() {
+    let dir = fixture();
+    for (project, said) in [
+        (
+            "version = 2\n[recipe.pass]\ncommand = ['true']\nrequires = []\n",
+            "recipe.pass.`requires` is version 1: use `needs`",
+        ),
+        (
+            "version = 2\npreserve = ['_build']\n[recipe.pass]\ncommand = ['true']\n",
+            "`preserve` is version 1: use `keep_between_runs`",
+        ),
+        (
+            "version = 2\n[environment]\nforwards = ['A']\n[recipe.pass]\ncommand = ['true']\n",
+            "environment.`forwards` is version 1: use `send`",
+        ),
+        (
+            "version = 2\n[recipe.pass]\ncommand = ['true']\nneed = []\n",
+            "`needs`",
+        ),
+        // A version 2 key in a version 1 file, and a version that is no
+        // whole number.
+        (
+            "version = 1\n[recipe.pass]\ncommand = ['true']\nneeds = []\n",
+            "unknown field `needs`",
+        ),
+        (
+            "version = '2'\n[recipe.pass]\ncommand = ['true']\n",
+            "unsupported ferry.toml version",
+        ),
+    ] {
+        with_project(dir.path(), project);
+        let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(125), "{project}: {stdout}{stderr}");
+        assert!(
+            stdout.contains(said) || stderr.contains(said),
+            "{project}: {stdout}{stderr}"
+        );
+    }
+    with_project(
+        dir.path(),
+        "version = 1\n[recipe.pass]\ncommand = ['true']\nroutable = true\n",
+    );
+    for (machines, said) in [
+        (
+            "version = 2\n[machine.m]\nssh = 'm'\ntriple = 'x'\n",
+            "machine.m.`triple` is version 1: use `platform`",
+        ),
+        (
+            "version = 2\n[machine.m]\nssh = 'm'\nplatform = 'x'\ncores = 4\n",
+            "`cores` is gone in version 2",
+        ),
+        (
+            "version = 2\n[host.m]\nssh = 'm'\nplatform = 'x'\n",
+            "`host` is version 1: use `machine`",
+        ),
+        (
+            "[host.m]\nssh = 'm'\ntriple = 'x'\nhas = ['quiet']\n",
+            "unknown field `has`",
+        ),
+    ] {
+        with_machines(dir.path(), machines);
+        let out = run(dir.path(), &["run", "pass", "--json"]);
+        let both = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(125), "{machines}: {both}");
+        assert!(both.contains(said), "{machines}: {both}");
+    }
+}
+
+/// SPEC §12 item 24: a version 2 ferry.toml with a version 1 adapter, and
+/// the reverse, run with the same merged contract as both at version 1. The
+/// adapter carries every renamed part (recipe needs, the environment,
+/// `keep_between_runs`, `[provider] needs`, `also_send`) and a JSON `null`,
+/// which version 1 always read as absent.
+#[test]
+fn a_mixed_version_adapter_merges_the_same_contract() {
+    let v1_json = r#"{"version":1,"recipe":{"pass":{"command":["sh","-c","echo forwarded-$APP_ALLOWED"],"requires":["linux"],"routable":false}},"environment":{"forwards":["APP_ALLOWED"],"watches":["APP_"],"local":[]},"preserve":["_build"],"provider":{"requires":["admission"]},"ship":[{"ref":"refs/heads/extra","from":"HEAD"}],"companion_refs":null}"#;
+    let v2_json = r#"{"version":2,"recipe":{"pass":{"command":["sh","-c","echo forwarded-$APP_ALLOWED"],"needs":["linux"],"may_run_elsewhere":false}},"environment":{"send":["APP_ALLOWED"],"refuse_other_vars_starting_with":["APP_"],"keep_local":[]},"keep_between_runs":["_build"],"provider":{"needs":["admission"]},"also_send":[{"ref":"refs/heads/extra","from":"HEAD"}],"mirror":null}"#;
+    let mut contracts = vec![];
+    for (version, json) in [(1, v1_json), (2, v1_json), (1, v2_json), (2, v2_json)] {
+        let dir = fixture();
+        let project = format!("version = {version}\n[catalog]\nadapter = 'catalog'\n");
+        fs::write(dir.path().join("ferry.toml"), &project).unwrap();
+        // Kept build directories are ignored ones.
+        fs::write(dir.path().join(".gitignore"), "_build/\n").unwrap();
+        fs::write(
+            dir.path().join("catalog"),
+            format!("#!/bin/sh\nprintf '%s' '{json}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(
+            dir.path().join("catalog"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "ferry.toml", "catalog", ".gitignore"]);
+        git(dir.path(), &["commit", "-m", "adapter"]);
+        let out = command(dir.path())
+            .args(["run", "pass", "--local", "--json"])
+            .env("APP_ALLOWED", "selected")
+            .output()
+            .unwrap();
+        let record = receipt(&out);
+        assert_eq!(out.status.code(), Some(0), "{project}{json}: {record}");
+        let shipped: Vec<_> = record["ship"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["ref"].clone())
+            .collect();
+        contracts.push((
+            record["forwarded_env"].clone(),
+            record["preserve"].clone(),
+            record["requirements"].clone(),
+            record["provider_requires"].clone(),
+            shipped,
+        ));
+    }
+    assert_eq!(
+        contracts[0],
+        (
+            serde_json::json!({"APP_ALLOWED": "selected"}),
+            serde_json::json!(["_build"]),
+            serde_json::json!(["linux"]),
+            serde_json::json!(["admission"]),
+            vec![serde_json::json!("refs/heads/extra")],
+        )
+    );
+    assert!(
+        contracts.windows(2).all(|pair| pair[0] == pair[1]),
+        "{contracts:?}"
+    );
+}
+
+/// SPEC §12 item 26: `reserved_for` keeps a machine out of the automatic
+/// choice unless the recipe needs one of its listed features; --on still
+/// chooses it, never past `may_run_elsewhere` or `needs`; with no other machine
+/// a run is refused naming the reservation, never sent to it.
+#[test]
+fn a_reserved_machine_is_chosen_only_for_what_it_is_reserved_for() {
+    let dir = fixture();
+    with_project(
+        dir.path(),
+        "version = 2\n[recipe.pass]\ncommand = ['true']\nmay_run_elsewhere = true\n[recipe.timing]\ncommand = ['true']\nneeds = ['quiet']\nmay_run_elsewhere = true\n[recipe.gpu]\ncommand = ['true']\nneeds = ['gpu']\nmay_run_elsewhere = true\n[recipe.here]\ncommand = ['true']\n",
+    );
+    let platform = test_platform();
+    let both = format!(
+        "version = 2\n[machine.bench]\nssh = 'test-host'\nbinary = '.local/bin/ferry'\nplatform = '{platform}'\nhas = ['quiet']\nreserved_for = ['quiet']\n[machine.gates]\nssh = 'test-host'\nbinary = '.local/bin/ferry'\nplatform = '{platform}'\n"
+    );
+    let ran = |args: &[&str], machines: &str| {
+        let mut all = vec!["run"];
+        all.extend_from_slice(args);
+        all.push("--json");
+        let command = remote_command(dir.path(), ".local/bin/ferry", &all);
+        with_machines(dir.path(), machines);
+        let out = { command }.output().unwrap();
+        (out.status.code(), receipt(&out))
+    };
+    let (code, record) = ran(&["pass"], &both);
+    assert_eq!(
+        (code, record["machine"].as_str()),
+        (Some(0), Some("gates")),
+        "{record}"
+    );
+    let (code, record) = ran(&["timing"], &both);
+    assert_eq!(
+        (code, record["machine"].as_str()),
+        (Some(0), Some("bench")),
+        "{record}"
+    );
+    let (code, record) = ran(&["pass", "--on", "bench"], &both);
+    assert_eq!(
+        (code, record["machine"].as_str()),
+        (Some(0), Some("bench")),
+        "{record}"
+    );
+    let (code, record) = ran(&["here", "--on", "bench"], &both);
+    assert_eq!(code, Some(125), "{record}");
+    let (code, record) = ran(&["gpu", "--on", "bench"], &both);
+    assert_eq!(code, Some(125), "{record}");
+    let (code, record) = ran(&["here"], &both);
+    assert_eq!(
+        (code, record["machine"].as_str()),
+        (Some(0), Some("local")),
+        "{record}"
+    );
+    // Only bench: never a fallback; the refusal names the reservation.
+    let bench_only = both[..both.find("[machine.gates]").unwrap()].to_owned();
+    let (code, record) = ran(&["pass"], &bench_only);
+    assert_eq!(code, Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bench is reserved_for quiet; use --on bench"),
+        "{record}"
+    );
+    // One listed feature is enough: reserved for quiet and special.
+    let two = bench_only
+        .replace("has = ['quiet']", "has = ['quiet', 'special']")
+        .replace(
+            "reserved_for = ['quiet']",
+            "reserved_for = ['quiet', 'special']",
+        );
+    let (code, record) = ran(&["timing"], &two);
+    assert_eq!(
+        (code, record["machine"].as_str()),
+        (Some(0), Some("bench")),
+        "{record}"
+    );
+    // A reserved_for name the machine does not have refuses machines.toml.
+    let (code, record) = ran(
+        &["timing"],
+        &bench_only.replace("reserved_for = ['quiet']", "reserved_for = ['gpu']"),
+    );
+    assert_eq!(code, Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reserved_for gpu, which it does not have"),
+        "{record}"
+    );
 }
