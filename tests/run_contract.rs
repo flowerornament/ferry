@@ -778,6 +778,10 @@ fn an_unsupervised_recipes_leftover_is_stopped_at_its_end() {
 /// gone after the timeout, and the owner with them.
 #[test]
 fn an_unlistable_session_still_ends_at_its_timeout() {
+    // Injection exists only in debug builds.
+    if !cfg!(debug_assertions) {
+        return;
+    }
     let dir = fixture();
     let (_id, owner, recipe, guard, _caller) = unsupervised(
         dir.path(),
@@ -817,6 +821,10 @@ fn an_unlistable_session_still_ends_at_its_timeout() {
 /// the member as a leftover of its run.
 #[test]
 fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
+    // Injection exists only in debug builds.
+    if !cfg!(debug_assertions) {
+        return;
+    }
     let dir = fixture();
     let (id, owner, recipe, guard, _caller) = unsupervised(
         dir.path(),
@@ -879,6 +887,10 @@ fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
 /// `STOP_GRACE`.
 #[test]
 fn a_failed_listing_does_not_cut_the_owners_term_grace() {
+    // Injection exists only in debug builds.
+    if !cfg!(debug_assertions) {
+        return;
+    }
     let dir = fixture();
     let termed = dir.path().join("termed");
     let (_id, owner, recipe, guard, _caller) = unsupervised(
