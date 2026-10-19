@@ -586,7 +586,15 @@ receipt is seeing this rule, not a bug.
   ssh = "bench"
   platform = "x86_64-unknown-linux-gnu"
   has = ["linux", "x86_64", "quiet"]
+  reserved_for = ["quiet"]       # chosen without --on only for recipes that need one of these
   ```
+
+  A run without `--on` goes to the first machine, by name, that has what
+  its recipe needs. A machine with `reserved_for` is skipped in that
+  choice unless the recipe needs one of the listed features, so a timing
+  host is not taken by runs that merely forgot `--on`. `--on <machine>`
+  still chooses it explicitly; every name in `reserved_for` must also be
+  in its `has`, or `machines.toml` is refused.
 - **`host.toml`** (each place, its operator, `~/.config/ferry/`): the
   machine's own rules.
 
@@ -787,3 +795,9 @@ receipt is seeing this rule, not a bug.
     push that keeps printing progress for longer than the bound is not cut and
     its run passes; a store setup that never answers is refused within
     the reply bound.
+26. **Reserved machine:** with `bench` (`reserved_for = ["quiet"]`) and
+    `gates` both able to run a recipe, a run without `--on` of a recipe
+    that does not need `quiet` goes to `gates`, one that needs `quiet`
+    goes to `bench`, and `--on bench` runs either there. A `reserved_for`
+    name missing from that machine's `has` refuses the run as a bad
+    `machines.toml`.
