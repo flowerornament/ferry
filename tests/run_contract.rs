@@ -1578,11 +1578,15 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     // file: a push's ssh writes its pid there and hangs, a live link whose
     // git never reads (printing ssh diagnostics meanwhile, unless asked for
     // LogLevel=ERROR); FERRY_TEST_THROTTLE_PUSH: a push's ssh passes git's
-    // data on at about 320 KB/s, so a large push takes a while; FERRY_TEST_TRICKLE_PUSH holds seconds: a push's ssh
+    // data on at about 320 KB/s, so a large push takes a while;
+    // FERRY_TEST_FAIL_PUSH: a push fails at once, saying a fatal line;
+    // FERRY_TEST_PUSH_LEAVER names a file: a push's ssh leaves a process
+    // holding its stderr (pid there); FERRY_TEST_HANG_LSREMOTE names a file:
+    // an ls-remote's ssh writes its pid there and hangs; FERRY_TEST_TRICKLE_PUSH holds seconds: a push's ssh
     // first prints a progress byte every 0.2 s for that long, then pushes;
     // FERRY_TEST_HANG_INIT names a file: the store setup writes its pid
     // there and hangs.
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi; if [ -n \"$FERRY_TEST_HANG_PUSH\" ]; then echo $$ > \"$FERRY_TEST_HANG_PUSH\"; case \" $* \" in *LogLevel=ERROR*) ;; *) (n=0; while [ $n -lt 240 ]; do echo \"debug1: an ssh diagnostic\" >&2; sleep 0.5; n=$((n + 1)); done) & ;; esac; exec sleep 120; fi; if [ -n \"$FERRY_TEST_THROTTLE_PUSH\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; t=$(mktemp); { while :; do dd bs=32768 count=1 of=\"$t\" 2>/dev/null; [ -s \"$t\" ] || break; cat \"$t\"; sleep 0.1; done; rm -f \"$t\"; } | sh -c \"$last\"; exit $?; fi; if [ -n \"$FERRY_TEST_TRICKLE_PUSH\" ]; then n=0; while [ $n -lt $((FERRY_TEST_TRICKLE_PUSH * 5)) ]; do printf . >&2; sleep 0.2; n=$((n + 1)); done; fi;; *\"git init\"*) if [ -n \"$FERRY_TEST_HANG_INIT\" ]; then echo $$ > \"$FERRY_TEST_HANG_INIT\"; exec sleep 30; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_SLOW_INFO\" ] && [ -e \"$FERRY_TEST_SLOW_INFO\" ]; then sleep \"$(cat \"$FERRY_TEST_SLOW_INFO\")\"; fi; if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi; if [ -n \"$FERRY_TEST_HOLD_PIPE\" ]; then sleep 600 & echo $! > \"$FERRY_TEST_HOLD_PIPE\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_FAIL_PUSH\" ]; then echo \"fatal: the place refused the push\" >&2; exit 1; fi; if [ -n \"$FERRY_TEST_PUSH_LEAVER\" ]; then sleep 120 & echo $! > \"$FERRY_TEST_PUSH_LEAVER\"; fi; if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi; if [ -n \"$FERRY_TEST_HANG_PUSH\" ]; then echo $$ > \"$FERRY_TEST_HANG_PUSH\"; case \" $* \" in *LogLevel=ERROR*) ;; *) (n=0; while [ $n -lt 240 ]; do echo \"debug1: an ssh diagnostic\" >&2; sleep 0.5; n=$((n + 1)); done) & ;; esac; exec sleep 120; fi; if [ -n \"$FERRY_TEST_THROTTLE_PUSH\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; t=$(mktemp); { while :; do dd bs=32768 count=1 of=\"$t\" 2>/dev/null; [ -s \"$t\" ] || break; cat \"$t\"; sleep 0.1; done; rm -f \"$t\"; } | sh -c \"$last\"; exit $?; fi; if [ -n \"$FERRY_TEST_TRICKLE_PUSH\" ]; then n=0; while [ $n -lt $((FERRY_TEST_TRICKLE_PUSH * 5)) ]; do printf . >&2; sleep 0.2; n=$((n + 1)); done; fi;; *git-upload-pack*) if [ -n \"$FERRY_TEST_HANG_LSREMOTE\" ]; then echo $$ > \"$FERRY_TEST_HANG_LSREMOTE\"; exec sleep 120; fi;; *\"git init\"*) if [ -n \"$FERRY_TEST_HANG_INIT\" ]; then echo $$ > \"$FERRY_TEST_HANG_INIT\"; exec sleep 30; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_SLOW_INFO\" ] && [ -e \"$FERRY_TEST_SLOW_INFO\" ]; then sleep \"$(cat \"$FERRY_TEST_SLOW_INFO\")\"; fi; if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi; if [ -n \"$FERRY_TEST_HOLD_PIPE\" ]; then sleep 600 & echo $! > \"$FERRY_TEST_HOLD_PIPE\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
@@ -1837,6 +1841,129 @@ fn a_slow_push_is_kept_alive_by_gits_own_progress() {
         started.elapsed() > std::time::Duration::from_secs(6),
         "{:?}",
         started.elapsed()
+    );
+}
+
+/// A push that fails at once, then an ls-remote check that hangs: a signal
+/// to the caller's group (a terminal's Ctrl-C) ends the caller at once,
+/// lost with the signal and the push's cause, its ls-remote's ssh gone
+/// (murail-4a's return).
+#[test]
+fn a_terminal_signal_stops_the_ls_remote_after_a_failed_push() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let dir = fixture();
+    let pidfile = dir.path().join("hung-ls-remote.pid");
+    let mut child = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_FAIL_PUSH", "1")
+    .env("FERRY_TEST_HANG_LSREMOTE", &pidfile)
+    .process_group(0)
+    .stdout(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    let caller = Pid::from_raw(i32::try_from(child.id()).unwrap());
+    let deadline = common::startup_deadline();
+    while !pidfile.exists() {
+        assert!(Instant::now() < deadline, "the ls-remote never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let signalled = Instant::now();
+    killpg(caller, Signal::SIGINT).unwrap();
+    while child.try_wait().unwrap().is_none() {
+        if signalled.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!("the caller waited on its ls-remote after a signal");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    let record = receipt(&output);
+    assert_eq!(output.status.code(), Some(130), "{record}");
+    // The signal, and the push's own cause.
+    let reason = record["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("caller received SIGINT")
+            && reason.contains("fatal: the place refused the push"),
+        "{record}"
+    );
+    let until = Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(
+            Instant::now() < until,
+            "the ls-remote's ssh outlived the signal"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A push whose ssh leaves a process holding its stderr, in the push's
+/// group: the run is not delayed by it, and the leftover is gone once git
+/// has exited (herald-1b's return).
+#[test]
+fn a_push_leaves_nothing_of_its_group_behind() {
+    use std::time::{Duration, Instant};
+    let dir = fixture();
+    let pidfile = dir.path().join("push-leaver.pid");
+    let started = Instant::now();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_PUSH_LEAVER", &pidfile)
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+    let pid: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let guard = OwnedPid(pid);
+    let until = Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(Instant::now() < until, "the push's leftover outlived it");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(guard);
+}
+
+/// A push that fails names why: git's fatal line reaches the receipt.
+#[test]
+fn a_failed_push_names_its_fatal_line() {
+    let dir = fixture();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_FAIL_PUSH", "1")
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fatal: the place refused the push"),
+        "{record}"
     );
 }
 

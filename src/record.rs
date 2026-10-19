@@ -416,6 +416,29 @@ pub fn bsd_start(info: &libproc::bsd_info::BSDInfo) -> u128 {
     u128::from(info.pbi_start_tvsec) * 1_000_000 + u128::from(info.pbi_start_tvusec)
 }
 
+/// Whether our child `pid` has exited and waits to be reaped (a zombie):
+/// seen without reaping it, so its pid, and its process group's id, stay
+/// reserved meanwhile. A state that cannot be read counts as exited.
+#[cfg(target_os = "macos")]
+pub fn exited(pid: i32) -> bool {
+    // SZOMB in <sys/proc.h>.
+    const ZOMBIE: u32 = 5;
+    libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0)
+        .map_or(true, |info| info.pbi_status == ZOMBIE)
+}
+
+/// Whether our child `pid` has exited and waits to be reaped (a zombie):
+/// seen without reaping it, so its pid, and its process group's id, stay
+/// reserved meanwhile. A state that cannot be read counts as exited.
+#[cfg(not(target_os = "macos"))]
+pub fn exited(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |text| {
+        text.rsplit_once(')')
+            .and_then(|(_, fields)| fields.trim_start().chars().next())
+            .is_none_or(|state| matches!(state, 'Z' | 'X'))
+    })
+}
+
 /// A process's start time: microseconds since the epoch on macOS, clock
 /// ticks since boot elsewhere. With the pid it identifies a process.
 #[cfg(not(target_os = "macos"))]

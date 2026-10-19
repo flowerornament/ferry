@@ -410,7 +410,10 @@ or prepares its seat) runs none of them, collect included: nothing ran.
     retry pushes it all again (a failed push keeps nothing), so the first
     run of a repository that big is best made over a fast link.
   A signal to the caller (Ctrl-C) stops the push at once, as before
-  dispatch.
+  dispatch, and once git exits nothing it left in its group stays. The
+  `ls-remote` check after a failed push runs in the caller's own group, so
+  Ctrl-C reaches it directly; on a timeout the caller stops its git, and
+  that ssh ends on its pipe or by keepalive (15 s).
 - **Submitted means asked.** The receipt is first written, as `submitted`,
   just before the place is asked to run the request. Anything that fails
   before that is a refusal (125), and a caller killed before it leaves no

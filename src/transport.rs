@@ -143,13 +143,7 @@ fn answered(command: &mut Command) -> Result<(std::process::ExitStatus, Vec<u8>,
             break status;
         }
         if Instant::now() >= until {
-            // Our own child, by its handle: never a pattern. A child that
-            // leads a process group of its own (we made it so) goes with
-            // the group, its ssh included.
-            let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id())?);
-            if nix::unistd::getpgid(Some(pid)) == Ok(pid) {
-                let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
-            }
+            // Our own child, by its handle: never a pattern.
             let _ = child.kill();
             let _ = child.wait();
             return Err(late().into());
@@ -281,11 +275,10 @@ fn push(root: &Path, ssh: &str, store: &str, refspec: &str) -> Result<()> {
     let (commit, reference) = refspec.split_once(':').ok_or("invalid refspec")?;
     // Any failure to check keeps the push's own error. ls-remote matches
     // pattern tails, so only the line naming exactly this ref counts.
-    // In a group of its own, so the bound stops its ssh too.
-    let listed = git(&["ls-remote"]).and_then(|mut command| {
-        use std::os::unix::process::CommandExt;
-        replied(command.arg(reference).process_group(0))
-    });
+    // In the caller's own process group, so a terminal's signal reaches it
+    // directly; on a timeout its git is killed, and its ssh ends on its pipe
+    // or by keepalive.
+    let listed = git(&["ls-remote"]).and_then(|mut command| replied(command.arg(reference)));
     let Ok(listed) = listed else {
         return Err(error.into());
     };
@@ -328,6 +321,7 @@ fn progressing(command: &mut Command) -> Result<Pushed> {
     let heard = std::sync::Arc::new(AtomicU64::new(0));
     let said = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (last, kept) = (heard.clone(), said.clone());
+    let (ended, drained) = std::sync::mpsc::channel::<()>();
     thread::spawn(move || {
         let mut buffer = [0u8; 4096];
         while let Ok(read @ 1..) = pipe.read(&mut buffer) {
@@ -341,13 +335,20 @@ fn progressing(command: &mut Command) -> Result<Pushed> {
                 all.drain(..excess);
             }
         }
+        let _ = ended.send(());
     });
     let stop = || {
         let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
     };
+    // Whether git has exited, seen without reaping it: until it is reaped
+    // its pid, and so the group's id, cannot be reused.
+    let exited = || crate::record::exited(group.as_raw());
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        // Whatever git left in its group (a pipe-holder, a ProxyCommand) is
+        // ours, and goes before git is reaped.
+        if exited() {
+            stop();
+            break child.wait()?;
         }
         // In a group of its own, the push never sees the terminal's
         // signal: the caller that caught one stops it, as before dispatch.
@@ -372,6 +373,9 @@ fn progressing(command: &mut Command) -> Result<Pushed> {
     if status.success() {
         return Ok(Pushed::Done);
     }
+    // Its stderr ends with its group; what was still in the pipe is read,
+    // within a bound, so the last lines are not lost.
+    let _ = drained.recv_timeout(crate::limits::DRAIN);
     // The last lines git said: its `fatal:`, `error:` or `!` lines and what
     // explains them, never only a trailing hint.
     let all = said.lock().map(|all| all.clone()).unwrap_or_default();
