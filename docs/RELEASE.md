@@ -106,12 +106,17 @@ live beside it under `~/.local/state/ferry`. A change of state layout gets a
 new root, so old and new binaries never share one; the move to `v1` is
 recorded in [`design/2026-10-12-m1-joint-window.md`](design/2026-10-12-m1-joint-window.md).
 
-**Install windows.** On a host shared by several users or agents, announce
-a window first, with its start, its end and the refusals expected during
-it, and ask them not to start runs meanwhile. Runs already in flight finish
-on the binary they started with: nobody stops them. Install places before
-their callers: a new caller refuses an old place with a typed 125 that names
-its revision, while an old caller may meet a new place it cannot read.
+**Activation.** Activation is one atomic rename under `install.lock`, and
+runs already in flight finish on the binary they started with. A run whose
+`host-info` precedes the rename and whose `submit` follows it runs on the
+new binary, and its record names that binary, but its capability and
+protocol checks were made against the old one. After a forward install that
+is harmless. After a rollback, or a release that drops a capability, a run
+checked by one binary is executed by another, and a protocol change is
+refused only after the run has run. Pinned launch (`ferry-ljc.2`) closes
+that gap. Install places before their callers: a new caller refuses an old
+place with a typed 125 that names its revision, while an old caller may
+meet a new place it cannot read.
 
 **What this guarantees and what it does not.**
 
@@ -122,7 +127,8 @@ its revision, while an old caller may meet a new place it cannot read.
   names that binary (`binary_sha256`), so an install during a run is never
   mis-attributed. A caller refuses a place without `detach` (125, naming the
   place's `source_rev`): install places before or with their callers.
-- Activating on a shared host still needs an announced window.
+- A run submitted across an activation is checked by the old binary and
+  executed by the new one (see **Activation**).
 - Builds from before receipts carried the source revision report it as
   unknown. A receipt without these fields says nothing about provenance.
 

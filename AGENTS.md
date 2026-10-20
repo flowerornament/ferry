@@ -55,10 +55,9 @@ object store; nobody edits code there.
   `jj rebase -d main`), and any edit made while the check ran. If the push
   fails, `main` moves back. One land at a time per repository
   (`.jj/land.lock`). Never push by hand: that skips the gate.
-- **Review:** an implementer lands after the coordinator's GO. A change to a
-  contract that consumer projects rely on also needs their reviewers' GO,
-  given by executing it, not only reading it. Each freeze lists every
-  control it claims with `grep -c 'fn <name>'` run at the frozen commit.
+- **Review:** an implementer lands after the coordinator's GO. Each freeze
+  lists every control it claims with `grep -c 'fn <name>'` run at the
+  frozen commit.
 - **Critics and knockouts:** before a freeze, an adversarial review of the
   diff, and a knockout per new control: undo the fix in a separate copy of
   the tree, with its own `CARGO_TARGET_DIR`, and show the control fail.
@@ -88,7 +87,6 @@ Ferry's build hosts are shared by many agents.
 - **Freeing disk, retrying, queueing and containment** are operator and
   project decisions, not Ferry's (see `docs/PRINCIPLES.md`). Ask before deleting
   anything on a shared host.
-- **Installs** happen only in an announced window (see `docs/RELEASE.md`).
 
 ## Done means landed
 

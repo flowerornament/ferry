@@ -17,7 +17,7 @@
 # a receipt joins caller and host to <rev> and to the executables that ran;
 # rollback and forward; a refused install after a good one keeps <rev> active;
 # and a second activation is refused while a holder has confirmed it owns the
-# install lock. Activating <rev> on the live root is a separate, announced step.
+# install lock. Activating <rev> on the live root is a separate step (ferry-install).
 set -euo pipefail
 
 # Git runs only in the colocated checkout: a jj workspace has no .git, and git
