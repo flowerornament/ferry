@@ -178,8 +178,8 @@ leaves none, and the reason says so).
   advertises `detach`. Otherwise it refuses with 125, naming the place's
   `source_rev` and the next step (install the caller's build on that place).
   There is no legacy `host-run` shim: a caller is never installed before
-  its places, and both move in one announced window (decided 2026-10-10
-  on ferry-ljc.3; it supersedes the shim in ferry-minimal §7).
+  its places (decided 2026-10-10 on ferry-ljc.3; it supersedes the shim in
+  ferry-minimal §7).
 - **Version skew:** old and new binaries never share a state root: the
   current root is a new path (`…/ferry/v1`) that earlier binaries never
   read. A new
@@ -621,8 +621,8 @@ receipt is seeing this rule, not a bug.
 - **From version 1:** for one release Ferry reads both versions, of each
   file and of adapter JSON. A version 2 file or JSON that holds a version
   1 key is refused, and the refusal names the new key. Version 1 is
-  removed only after Herald and Murail have each moved and given GO by
-  execution, not merely at the next version number.
+  removed by a later release of its own, not merely at the next version
+  number.
 - **Order:** a file another tool also reads moves only after that tool
   reads version 2 (Murail's `remote-hosts.py` reads `machines.toml`
   itself), so a shared file never flips under a reader Ferry does not
