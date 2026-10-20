@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.4 - 2026-10-20
+
 - **Config files read in plain words.** `ferry.toml`, `machines.toml` and
   `host.toml` take `version = 2`, whose keys say what they do: `needs`,
   `may_run_elsewhere`, `keep_between_runs`, `[[also_send]]`,
