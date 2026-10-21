@@ -2,7 +2,7 @@
 name: ferry
 description: "Run a repository's recipe at an exact commit on a build machine (or locally in a clean checkout) and read what happened, with Ferry. Use this skill whenever you need to run a project's gate, tests or measurements on another machine (`ferry run … --on <machine>`), when a repository has a ferry.toml or a `just remote …` recipe that wraps ferry, when you must interpret a Ferry receipt, exit code (124, 125, 128+n, 255) or refusal, when a seat is busy or refuses, when an exclusive/timing run waits for the host lease, or when you must decide whether a red result is your code or the infrastructure."
 metadata:
-  { "version": "0.1.0", "openclaw": { "emoji": "⛴️", "os": ["darwin", "linux"], "requires": { "bins": ["ferry", "git", "ssh"] } } }
+  { "version": "0.1.6", "openclaw": { "emoji": "⛴️", "os": ["darwin", "linux"], "requires": { "bins": ["ferry", "git", "ssh"] } } }
 ---
 
 # ferry
@@ -30,7 +30,12 @@ ferry run test --on bench --json       # NDJSON events, for tools
 
 - **Commit first.** Ferry runs a commit, not your working tree. The commit
   must exist and be described (jj) or committed (git); uncommitted edits are
-  not part of the run.
+  not part of the run (in git, Ferry says so: `uncommitted changes are not
+  in <short>`).
+- **What it prints.** Ferry's own lines go to stderr and start `ferry: `:
+  where the run went (`<id> → <machine>, seat <seat>, commit <short>`), why
+  it waits, and last the verdict (`<outcome>, exit <code>, run <id>`), after
+  its reason. The recipe's output is unchanged.
 - **One seat per workspace.** `--seat <name>` (default `default`) picks your
   private checkout. A seat runs one run at a time, and a second run on a
   busy seat is refused at once (125, naming the run that holds it): use a
@@ -73,7 +78,6 @@ a program decides by the `--json` receipt, `state` first, then `outcome`,
 never by the exit code alone (SPEC §4).
 
 ```bash
-ferry receipt <id>                     # the stored receipt (JSON)
 ferry record <id>                      # the receipt once final; exit 3 = no verdict yet
 ferry follow <id>                      # re-attach: the run's output, then its receipt
 ferry stop <id>                        # stop your run (another's: --other --reason '<why>')
@@ -101,7 +105,7 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 - **First look:** `ferry status --on <machine>` shows, read-only, who holds
   the gate and who waits for it, each live run's phase and deadline, every
   seat with its last run and size, and processes left by ended runs (by pid).
-- **Seat busy:** `seat busy: run <id>, submitted <n> min ago` means your seat
+- **Seat busy:** `seat busy: run <id>, submitted <age> ago` means your seat
   already has a run. `ferry follow <id>` or `ferry stop <id>`, or use another
   `--seat`. "Held after run <id> ended" means something that run started
   still holds the seat's lock: stop what it left running (its processes in
@@ -114,8 +118,8 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
   longer `--wait-seconds` if shared runs are long. "Released as the wait
   ended; retry" means just that.
 
-- **Unmet requirement or unknown machine:** the recipe's `requires` are not
-  all in a machine's features. Pick another `--on`, or run `--local` if the
+- **Unmet requirement or unknown machine:** the recipe's `needs` are not
+  all in a machine's `has`. Pick another `--on`, or run `--local` if the
   recipe allows it.
 - **Provider capability missing:** the machine runs an older Ferry. Tell the
   operator; do not work around it.
@@ -142,8 +146,8 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 
 ## Waiting lines
 
-`ferry: waiting for lock …: another run holds it` means another run holds
-the host lease. That is normal while another agent's exclusive
+`ferry: waiting for lock …: held by run <id>` means that run holds the host
+lease. That is normal while another agent's exclusive
 measurement runs. Wait (at most `--wait-seconds`), or Ctrl-C (the run is then
 `stopped` 130; nothing ran yet).
 
