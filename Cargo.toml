@@ -1,6 +1,6 @@
 [package]
 name = "ferry"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.99"
 description = "Run a repository's recipe at an exact commit, locally or on a machine over SSH, and record exactly what happened"

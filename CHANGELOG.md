@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.7 - 2026-10-21
+
 - **One binary checks and runs a request.** If a place's Ferry is replaced
   between the caller's `host-info` and its `submit` (an install or a
   rollback during the push), the run is refused before anything is reserved
