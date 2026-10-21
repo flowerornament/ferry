@@ -4,9 +4,11 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
-- **`needs` is checked on every route.** `--local`, a recipe that may not
-  run elsewhere, and a caller with no machines used to run whatever the
-  recipe needed; they now refuse (125) a need this machine lacks, naming it.
+- **`needs` is checked on every route.** `--local` now refuses (125) a
+  recipe whose `needs` this machine lacks, naming what is missing: a recipe
+  that needs `linux-x86_64`, run `--local` on a Mac, is refused instead of
+  running on macOS. The same holds for a recipe that may not run elsewhere
+  and for a caller with no machines.
   A place has what it detects (OS, architecture, and both), its Ferry's
   capabilities, and on a machine its declared `has`; a remote run is
   checked again on what the place reports before anything is sent, which
