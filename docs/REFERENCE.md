@@ -41,6 +41,16 @@ collect = "scripts/ferry-collect"
 - **`exclusive`.** `needs = ["exclusive"]` (or `--exclusive`) holds the host
   lease alone. It is an execution lock, not a machine feature: routing ignores
   it.
+- **`needs ⊆ has`, on every route (SPEC §3).** A place `has` what it
+  detects of itself (its OS, its architecture, and both: `linux`,
+  `x86_64`, `linux-x86_64`), its Ferry's capabilities (`status`,
+  `run-history`, …), and on a machine, the `has` its `machines.toml` entry
+  declares. The local place declares nothing. A machine is chosen on what
+  the caller knows (its declared `has` and `platform`, any capability
+  name), and checked again on what the place reports (`host-info`) before
+  anything is sent. A missing need is refused (125) with the place and what
+  it has: `local does not have linux (it has aarch64, macos, macos-aarch64,
+  and its Ferry's capabilities); run it --on a machine that does`.
 
 ### Artifacts (SPEC §8)
 
@@ -192,7 +202,9 @@ reserved_for = ["quiet"]   # optional: chosen without --on only for recipes that
   name must be in that machine's `has`, or `machines.toml` is refused.
 - **SSH:** aliases come from your SSH configuration. Ferry copies no
   credentials and provisions nothing.
-- **Features are declarations,** not measurements.
+- **`has` is a declaration,** not a measurement: Ferry trusts it. What a
+  place detects (OS, architecture) and its capabilities come from the place
+  itself (see `needs ⊆ has` above).
 
 ### Host policy and admission
 

@@ -420,7 +420,7 @@ fn run(options: &Run) -> Result<i32> {
     record.args.clone_from(&options.args);
     record.args_sha256 = Some(receipt::digest(&serde_json::to_vec(&options.args)?));
     if let Err(error) = dispatch(&root, options, &mut record) {
-        record.reason = Some(error.to_string());
+        record.reason = Some(receipt::one_line(&error.to_string()));
     }
     // The place's verdict stands, whatever its outcome (a stop is its own
     // verdict); a caller signal after it is only noted. A run the caller
@@ -581,7 +581,7 @@ fn main() {
     let code = match execute(Cli::parse()) {
         Ok(code) => code,
         Err(error) => {
-            execution::warn(&format!("ferry: {error}"));
+            execution::warn(&format!("ferry: {}", receipt::one_line(&error.to_string())));
             125
         }
     };

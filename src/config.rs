@@ -475,8 +475,9 @@ pub enum Route<'a> {
 }
 
 impl Machine {
+    /// What the caller may route on before the place is asked: its declared
+    /// `has` and what its declared platform implies (SPEC §3).
     pub fn capabilities(&self) -> BTreeSet<String> {
-        let mut features = self.features.clone();
         let arch = self.triple.split('-').next().unwrap_or("");
         let os = if self.triple.contains("linux") {
             "linux"
@@ -485,9 +486,44 @@ impl Machine {
         } else {
             "unknown"
         };
-        features.insert(format!("{os}-{arch}"));
+        let mut features = self.features.clone();
+        features.extend(detected(os, arch));
         features
     }
+}
+
+/// What a place detects of itself (SPEC §3): its OS, its architecture,
+/// and the two together (`linux`, `x86_64`, `linux-x86_64`).
+pub fn detected(os: &str, arch: &str) -> BTreeSet<String> {
+    BTreeSet::from([os.to_owned(), arch.to_owned(), format!("{os}-{arch}")])
+}
+
+/// Refuses unless `needs ⊆ has` (SPEC §3), where a place's `has` is its
+/// `facts` (declared and detected) and its Ferry's `capabilities`, and
+/// `exclusive` is aside (a lock, not a fact). The refusal names what is
+/// missing, the place and its facts.
+pub fn lacks(
+    recipe: &Recipe,
+    place: &str,
+    facts: &BTreeSet<String>,
+    capabilities: &[String],
+) -> Result<(), String> {
+    let missing: Vec<&str> = recipe
+        .requires
+        .iter()
+        .filter(|need| *need != "exclusive" && !facts.contains(*need))
+        .filter(|need| !capabilities.contains(need))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let facts: Vec<&str> = facts.iter().map(String::as_str).collect();
+    Err(format!(
+        "{place} does not have {} (it has {}, and its Ferry's capabilities); run it --on a machine that does",
+        missing.join(", "),
+        facts.join(", ")
+    ))
 }
 
 pub fn route<'a>(
@@ -496,8 +532,14 @@ pub fn route<'a>(
     on: Option<&'a str>,
     local: bool,
 ) -> Result<Route<'a>, String> {
+    // Nothing is declared for the local place: what it detects, and what
+    // this Ferry can do.
+    let local_route = || {
+        let facts = detected(std::env::consts::OS, std::env::consts::ARCH);
+        lacks(recipe, "local", &facts, &crate::receipt::capabilities()).map(|()| Route::Local)
+    };
     if local {
-        return Ok(Route::Local);
+        return local_route();
     }
     if on.is_some() && !recipe.routable {
         return Err("recipe is not routable".into());
@@ -507,13 +549,10 @@ pub fn route<'a>(
             .host
             .get(name)
             .ok_or_else(|| format!("unknown machine: {name}"))?;
-        if supports(recipe, machine) {
-            return Ok(Route::Remote(name));
-        }
-        return Err(format!("machine {name} lacks required features"));
+        return supported(recipe, name, machine).map(|()| Route::Remote(name));
     }
     if !recipe.routable || machines.host.is_empty() {
-        return Ok(Route::Local);
+        return local_route();
     }
     // A reserved machine is taken only for a recipe that needs one of what
     // it is reserved for (SPEC §10); never as a fallback.
@@ -538,16 +577,30 @@ pub fn route<'a>(
         })
         .collect();
     if reserved.is_empty() {
-        Err("no configured machine meets requirements".into())
+        // Each machine, with what it lacks.
+        Err(machines
+            .host
+            .iter()
+            .filter_map(|(name, machine)| supported(recipe, name, machine).err())
+            .collect::<Vec<_>>()
+            .join("; "))
     } else {
         Err(reserved.join("; or "))
     }
 }
+/// Whether a machine may be chosen before it is asked: every need is in its
+/// declared `has` or platform, or is a Ferry capability, which its place
+/// confirms once it answers (`transport::ship`).
+fn supported(recipe: &Recipe, name: &str, machine: &Machine) -> Result<(), String> {
+    lacks(
+        recipe,
+        &format!("machine {name}"),
+        &machine.capabilities(),
+        &crate::receipt::capabilities(),
+    )
+}
 fn supports(recipe: &Recipe, machine: &Machine) -> bool {
-    let mut required = recipe.requires.clone();
-    // Exclusivity is an execution lock, not a hardware capability.
-    required.remove("exclusive");
-    required.is_subset(&machine.capabilities())
+    supported(recipe, "", machine).is_ok()
 }
 
 pub fn identifier(value: &str) -> Result<(), String> {
@@ -649,11 +702,29 @@ mod tests {
             )]),
         }
     }
+    /// A recipe needing what this machine detects of itself.
+    fn here() -> Recipe {
+        Recipe {
+            requires: BTreeSet::from([format!(
+                "{}-{}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )]),
+            ..recipe()
+        }
+    }
     #[test]
-    fn absent_configuration_is_local() {
+    fn absent_configuration_is_local_when_it_has_the_needs() {
         assert_eq!(
-            route(&recipe(), &Machines::default(), None, false).unwrap(),
+            route(&here(), &Machines::default(), None, false).unwrap(),
             Route::Local
+        );
+        let mut r = here();
+        r.requires.insert("gpu".into());
+        let refused = route(&r, &Machines::default(), None, false).unwrap_err();
+        assert!(
+            refused.starts_with("local does not have gpu (it has "),
+            "{refused}"
         );
     }
     #[test]
@@ -668,7 +739,12 @@ mod tests {
         let mut r = recipe();
         r.requires.insert("gpu".into());
         assert!(route(&r, &machines(), None, false).is_err());
-        assert_eq!(route(&r, &machines(), None, true).unwrap(), Route::Local);
+        // --local checks the needs too (SPEC §3: on every route).
+        assert!(route(&r, &machines(), None, true).is_err());
+        assert_eq!(
+            route(&here(), &machines(), None, true).unwrap(),
+            Route::Local
+        );
     }
     #[test]
     fn publication_cannot_be_forced_remote() {

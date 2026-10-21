@@ -4,6 +4,14 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **`needs` is checked on every route.** `--local`, a recipe that may not
+  run elsewhere, and a caller with no machines used to run whatever the
+  recipe needed; they now refuse (125) a need this machine lacks, naming it.
+  A place has what it detects (OS, architecture, and both), its Ferry's
+  capabilities, and on a machine its declared `has`; a remote run is
+  checked again on what the place reports before anything is sent, which
+  replaces the old architecture-only check. Refusals that held a parser's
+  line breaks are now one line.
 - **A run inside a run on the same place is refused.** A `ferry run` started
   from a recipe or hook (it carries the run's `FERRY_ID`) toward that run's
   own place used to wait on the locks its own run held, until its wait ran

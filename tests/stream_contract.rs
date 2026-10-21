@@ -3906,6 +3906,11 @@ fn git_and_toml_refusals_say_what_they_mean() {
             .starts_with(&format!("ferry.toml at {at}: TOML parse error")),
         "{record}"
     );
+    // One line, as every `ferry: ` line is: TOML's own line breaks joined.
+    assert!(
+        !record["reason"].as_str().unwrap().contains('\n'),
+        "{record}"
+    );
 }
 
 #[test]
@@ -4164,4 +4169,57 @@ fn a_run_inside_a_run_on_another_place_goes_ahead() {
         "{said}"
     );
     assert!(!said.contains("nested run"), "{said}");
+}
+
+// --- needs ⊆ has on every route (SPEC §3; ferry-ryl) ---
+
+#[test]
+fn needs_are_checked_on_the_local_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    git(d, &["init"]);
+    git(d, &["config", "user.name", "Ferry Test"]);
+    git(d, &["config", "user.email", "ferry@example.invalid"]);
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    fs::write(
+        d.join("ferry.toml"),
+        format!(
+            "version = 2\n[recipe.gpu]\ncommand = ['true']\nneeds = ['gpu']\n[recipe.here]\ncommand = ['echo', 'here']\nneeds = ['{os}', '{arch}', '{os}-{arch}', 'status', 'exclusive']\n"
+        ),
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-qm", "fixture"]);
+    // No machines, then --local: the same refusal, naming what is missing.
+    for args in [
+        &["run", "gpu", "--json"][..],
+        &["run", "gpu", "--local", "--json"],
+    ] {
+        let out = bounded_output(ferry(d).args(args));
+        let record = receipt(&out);
+        assert_eq!(out.status.code(), Some(125), "{args:?}: {record}");
+        let reason = record["reason"].as_str().unwrap();
+        // What it detects, in order (a sorted set).
+        let facts = std::collections::BTreeSet::from([
+            os.to_owned(),
+            arch.to_owned(),
+            format!("{os}-{arch}"),
+        ]);
+        let facts = facts.into_iter().collect::<Vec<_>>().join(", ");
+        assert!(
+            reason.starts_with(&format!(
+                "local does not have gpu (it has {facts}, and its Ferry's capabilities)"
+            )),
+            "{args:?}: {record}"
+        );
+    }
+    // What it detects and what this Ferry can do; exclusive aside.
+    let out = bounded_output(ferry(d).args(["run", "here", "--local"]));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "here\n");
 }

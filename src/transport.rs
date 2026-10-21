@@ -528,14 +528,14 @@ pub fn ship(
             if info.protocol != receipt::PROTOCOL {
                 return refused(record, "host protocol mismatch".into());
             }
-            if request.recipe.requires.iter().any(|requirement| {
-                (requirement.starts_with("linux-") || requirement.starts_with("macos-"))
-                    && *requirement != info.os_arch
-            }) {
-                return refused(
-                    record,
-                    "reported host architecture does not meet requirements".into(),
-                );
+            // needs ⊆ has (SPEC §3), now from the place itself: declared
+            // `has`, what it detects, and its Ferry's capabilities.
+            let (os, arch) = info.os_arch.split_once('-').unwrap_or((&info.os_arch, ""));
+            let mut facts = machine.features.clone();
+            facts.extend(config::detected(os, arch));
+            let place = format!("machine {}", record.machine);
+            if let Err(why) = config::lacks(&request.recipe, &place, &facts, &info.capabilities) {
+                return refused(record, why);
             }
             init_store(ssh(&machine.ssh)?.arg(format!(
                 "mkdir -p {store} && git init -q --bare {store}",
@@ -715,7 +715,9 @@ pub fn run_on(
         record.state = Some("final".into());
         record.outcome = Outcome::Refused;
         record.exit_code = 125;
-        record.reason = Some(format!("place refused before acceptance: {why}"));
+        record.reason = Some(receipt::one_line(&format!(
+            "place refused before acceptance: {why}"
+        )));
         return Ok(());
     }
     record.deadline_ms = reply["deadline_ms"].as_u64().map(u128::from);

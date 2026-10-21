@@ -254,6 +254,17 @@ pub fn note(reason: &mut Option<String>, text: String) {
     });
 }
 
+/// A message on one line, as every `ferry: ` line is (SPEC §4): a parser's
+/// multi-line error (TOML's names the line, then the table) joined by
+/// spaces.
+pub fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

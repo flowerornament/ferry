@@ -6025,13 +6025,14 @@ fn a_version_two_file_with_a_version_one_key_names_the_new_key() {
 
 /// SPEC §12 item 24: a version 2 ferry.toml with a version 1 adapter, and
 /// the reverse, run with the same merged contract as both at version 1. The
-/// adapter carries every renamed part (recipe needs, the environment,
+/// adapter carries every renamed part (recipe needs, here a capability
+/// every place has, since --local checks needs too; the environment,
 /// `keep_between_runs`, `[provider] needs`, `also_send`) and a JSON `null`,
 /// which version 1 always read as absent.
 #[test]
 fn a_mixed_version_adapter_merges_the_same_contract() {
-    let v1_json = r#"{"version":1,"recipe":{"pass":{"command":["sh","-c","echo forwarded-$APP_ALLOWED"],"requires":["linux"],"routable":false}},"environment":{"forwards":["APP_ALLOWED"],"watches":["APP_"],"local":[]},"preserve":["_build"],"provider":{"requires":["admission"]},"ship":[{"ref":"refs/heads/extra","from":"HEAD"}],"companion_refs":null}"#;
-    let v2_json = r#"{"version":2,"recipe":{"pass":{"command":["sh","-c","echo forwarded-$APP_ALLOWED"],"needs":["linux"],"may_run_elsewhere":false}},"environment":{"send":["APP_ALLOWED"],"refuse_other_vars_starting_with":["APP_"],"keep_local":[]},"keep_between_runs":["_build"],"provider":{"needs":["admission"]},"also_send":[{"ref":"refs/heads/extra","from":"HEAD"}],"mirror":null}"#;
+    let v1_json = r#"{"version":1,"recipe":{"pass":{"command":["sh","-c","echo forwarded-$APP_ALLOWED"],"requires":["admission"],"routable":false}},"environment":{"forwards":["APP_ALLOWED"],"watches":["APP_"],"local":[]},"preserve":["_build"],"provider":{"requires":["admission"]},"ship":[{"ref":"refs/heads/extra","from":"HEAD"}],"companion_refs":null}"#;
+    let v2_json = r#"{"version":2,"recipe":{"pass":{"command":["sh","-c","echo forwarded-$APP_ALLOWED"],"needs":["admission"],"may_run_elsewhere":false}},"environment":{"send":["APP_ALLOWED"],"refuse_other_vars_starting_with":["APP_"],"keep_local":[]},"keep_between_runs":["_build"],"provider":{"needs":["admission"]},"also_send":[{"ref":"refs/heads/extra","from":"HEAD"}],"mirror":null}"#;
     let mut contracts = vec![];
     for (version, json) in [(1, v1_json), (2, v1_json), (1, v2_json), (2, v2_json)] {
         let dir = fixture();
@@ -6077,7 +6078,7 @@ fn a_mixed_version_adapter_merges_the_same_contract() {
         (
             serde_json::json!({"APP_ALLOWED": "selected"}),
             serde_json::json!(["_build"]),
-            serde_json::json!(["linux"]),
+            serde_json::json!(["admission"]),
             serde_json::json!(["admission"]),
             vec![serde_json::json!("refs/heads/extra")],
         )
@@ -6335,4 +6336,71 @@ fn a_policy_lowered_while_a_run_waits_refuses_it_at_admission() {
         "{record}"
     );
     assert_eq!(record["admission"]["policy"], "not-configured", "{record}");
+}
+
+/// SPEC §3 (ferry-ryl): on a remote route, `needs ⊆ has` where `has` is
+/// the declared `has`, what the place reports it detects, and its Ferry's
+/// capabilities. A capability needs no declaration; a platform the
+/// caller's `machines.toml` claims but the place does not report is
+/// refused, naming what is missing; a need nothing could supply is refused
+/// before the place is asked.
+#[test]
+fn needs_are_checked_against_what_the_place_reports() {
+    let dir = fixture();
+    let (here, other) = if cfg!(target_os = "macos") {
+        ("macos", "linux")
+    } else {
+        ("linux", "macos")
+    };
+    with_project(
+        dir.path(),
+        &format!(
+            "version = 2\n[recipe.cap]\ncommand = ['true']\nneeds = ['status']\nmay_run_elsewhere = true\n[recipe.other]\ncommand = ['true']\nneeds = ['{other}']\nmay_run_elsewhere = true\n[recipe.gpu]\ncommand = ['true']\nneeds = ['gpu']\nmay_run_elsewhere = true\n"
+        ),
+    );
+    let run_on = |recipe: &str, platform: Option<&str>| {
+        let mut command = remote_command(
+            dir.path(),
+            ".local/bin/ferry",
+            &["run", recipe, "--on", "test-host", "--json"],
+        );
+        if let Some(platform) = platform {
+            with_machines(
+                dir.path(),
+                &format!(
+                    "version = 2\n[machine.test-host]\nssh = 'test-host'\nbinary = '.local/bin/ferry'\nplatform = '{platform}'\nhas = []\n"
+                ),
+            );
+        }
+        let out = command.output().unwrap();
+        (out.status.code(), receipt(&out))
+    };
+    // A Ferry capability: no declaration needed; the place confirms it.
+    let (code, record) = run_on("cap", None);
+    assert_eq!(code, Some(0), "{record}");
+    // The caller's file says the other OS; the place reports its own.
+    let claimed = if other == "linux" {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        "aarch64-apple-darwin"
+    };
+    let (code, record) = run_on("other", Some(claimed));
+    assert_eq!(code, Some(125), "{record}");
+    let reason = record["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("machine test-host does not have {other} (it has "))
+            && reason.contains(here),
+        "{record}"
+    );
+    // Nothing could supply it: refused before the place is asked.
+    let (code, record) = run_on("gpu", Some(claimed));
+    assert_eq!(code, Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("machine test-host does not have gpu (it has "),
+        "{record}"
+    );
+    assert!(record["host_source_rev"].is_null(), "{record}");
 }

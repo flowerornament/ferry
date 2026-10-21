@@ -102,9 +102,11 @@ ferry run test --on bench -- --nocapture       # arguments after --
 ferry record <id>                # what happened
 ```
 
-With no machines configured, runs are local. A machine that lacks a required
-feature refuses rather than running. `--local` runs on this machine without
-checking `needs`. Version 1 files (`requires`, `routable`, `[host.<name>]`,
+With no machines configured, runs are local. Every route checks `needs`: a
+place that lacks one refuses (125), naming what is missing, rather than
+running. This machine has what it detects (`macos`, `aarch64`,
+`macos-aarch64`, say) and Ferry's capabilities, so `--local` refuses a
+recipe that needs `linux` on a Mac. Version 1 files (`requires`, `routable`, `[host.<name>]`,
 `triple`, `features`) are still read for one release; see
 [docs/REFERENCE.md](docs/REFERENCE.md#version-2-names). If another tool also
 reads your `machines.toml`, keep it at version 1 until that tool reads
