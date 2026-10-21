@@ -1112,6 +1112,33 @@ pub fn retire(
     })
 }
 
+/// Refuses a run asked for from inside run `outer` (this process's
+/// `FERRY_ID`) when `outer` is live on this same place (SPEC §4, §12.10):
+/// its state root holds `outer`'s reservation and no final record (`record`
+/// exits 3). Run ids are unique, so that is the place itself saying so,
+/// whatever the machine is called. Any other answer (not here, final, or no
+/// answer) is not a nesting.
+pub fn not_inside(place: &Place, name: &str) -> Result<()> {
+    let Some(outer) = std::env::var("FERRY_ID")
+        .ok()
+        .filter(|id| config::identifier(id).is_ok())
+    else {
+        return Ok(());
+    };
+    let outer = outer.as_str();
+    let live = place
+        .verb(&["record", outer])
+        .and_then(|mut verb| answered(&mut verb))
+        .is_ok_and(|(status, _, _)| status.code() == Some(3));
+    if live {
+        return Err(format!(
+            "nested run on the same place: this runs inside run {outer}, which is running on {name}, and would wait on the locks it holds; run it from outside that run, or --on another machine"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Replays a final run's output from the start, as `follow` does for a
 /// live one, while the place still keeps it.
 pub fn replay(place: &Place, record: &Receipt) -> Result<()> {

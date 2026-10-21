@@ -307,6 +307,8 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         .into_iter()
         .map(|(object, repo, _)| (repo, object.commit))
         .collect();
+    // Inside a run, on that run's own place: it would wait on its locks.
+    transport::not_inside(&place, &record.machine)?;
     // Until the place is asked to run it, nothing ran: any failure here is
     // a refusal (125), and a killed caller leaves no receipt claiming a run.
     transport::ship(root, &place, &request, &objects, record)?;

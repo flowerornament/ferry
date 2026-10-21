@@ -432,6 +432,18 @@ Each file declares `version = 2` and uses names a new user can read
 
 ## How a run is kept honest
 
+### Nesting
+
+A run started from inside a run (its process carries that run's
+`FERRY_ID`) on that run's own place is refused (125) before anything is
+sent: it would wait on the locks its own run holds. Before shipping, the
+caller asks the chosen place for the outer run's record. Only that state
+root can answer "reserved, not final" (`record` exits 3) for that id, so it
+is the place itself saying it is the same place, whatever the machine is
+called. A run to another place, or one started by a process the outer run
+left behind after it ended, goes ahead. A process that dropped `FERRY_ID`
+is not seen as nested.
+
 ### Transport
 
 - **Exact objects only.** The caller pushes only the exact commit (and any

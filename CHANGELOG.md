@@ -4,6 +4,12 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **A run inside a run on the same place is refused.** A `ferry run` started
+  from a recipe or hook (it carries the run's `FERRY_ID`) toward that run's
+  own place used to wait on the locks its own run held, until its wait ran
+  out, or to start beside it; it is now refused at once (125), naming the
+  outer run. A run to another place still goes ahead.
+
 ## v0.1.6 - 2026-10-21
 
 - **Small readability fixes.** A busy seat gives its holder's age in seconds

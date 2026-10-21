@@ -4085,3 +4085,78 @@ fn follow_replays_a_finished_runs_output() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// --- Nesting (SPEC §4, §12.10; ferry-xtx.2) ---
+
+/// A repository whose `nest` recipe starts `ferry run pass --local --seat
+/// inner` in `target` (default: this repository itself, whose place runs
+/// it), and prints that run's code.
+fn nesting(target: Option<&Path>) -> TempDir {
+    let dir = fixture("true", "");
+    let target = target.unwrap_or(dir.path());
+    let recipes = toml::to_string(&serde_json::json!({"recipe": {
+        "pass": {"command": ["sh", "-c", "echo committed"]},
+        "nest": {"command": ["sh", "-c", format!(
+            "cd '{}' && '{}' run pass --local --seat inner; echo inner=$?",
+            target.display(),
+            env!("CARGO_BIN_EXE_ferry")
+        )]},
+    }}))
+    .unwrap();
+    fs::write(
+        dir.path().join("ferry.toml"),
+        format!("version=1\n{recipes}"),
+    )
+    .unwrap();
+    git(dir.path(), &["commit", "-qam", "nest"]);
+    dir
+}
+
+#[test]
+fn a_run_inside_a_run_on_its_own_place_is_refused_at_once() {
+    for exclusive in [false, true] {
+        let dir = nesting(None);
+        let mut command = ferry(dir.path());
+        command.args(["run", "nest", "--local"]);
+        if exclusive {
+            command.arg("--exclusive");
+        }
+        let started = Instant::now();
+        let out = bounded_output(&mut command);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(0), "{said}");
+        assert!(said.contains("inner=125"), "exclusive={exclusive}: {said}");
+        assert!(
+            said.contains("nested run on the same place"),
+            "exclusive={exclusive}: {said}"
+        );
+        // At once: never the wait for the locks its own run holds.
+        assert!(
+            started.elapsed() < Duration::from_secs(20) + common::slack(),
+            "exclusive={exclusive}: took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[test]
+fn a_run_inside_a_run_on_another_place_goes_ahead() {
+    let other = fixture("true", "");
+    let dir = nesting(Some(other.path()));
+    let out = bounded_output(ferry(dir.path()).args(["run", "nest", "--local", "--exclusive"]));
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    assert!(
+        said.contains("committed") && said.contains("inner=0"),
+        "{said}"
+    );
+    assert!(!said.contains("nested run"), "{said}");
+}
