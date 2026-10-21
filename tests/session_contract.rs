@@ -1,227 +1,596 @@
-//! Controls for a detached run (SPEC §5, §6, §12): the caller submits,
-//! follows `output.log` by offset and stops by asking; nothing else the
-//! client does changes how a run ends. Output is the bytes the recipe
-//! wrote, through one capped writer.
+//! A run on its place (SPEC §5, §7, §11): the detached supervisor and the
+//! client, the session stop and its survivors, locks and the exclusive host,
+//! the deadline, output, collection and artifacts, and the record cycle.
+#![allow(clippy::wildcard_imports)]
 mod common;
-use common::{ferry, git, receipt};
-#[path = "../src/limits.rs"]
-#[allow(dead_code)]
-mod limits;
-use nix::{
-    sys::signal::{Signal, kill},
-    unistd::Pid,
-};
-use std::{
-    fs,
-    os::unix::{
-        fs::PermissionsExt,
-        process::{CommandExt, ExitStatusExt},
-    },
-    path::{Path, PathBuf},
-    process::{Command, ExitStatus, Output, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
-use tempfile::TempDir;
+use common::*;
 
-/// A process a control started, recorded by pid; stopped by that exact pid.
-struct Owned(PathBuf);
-impl Owned {
-    fn pid(&self) -> Option<i32> {
-        fs::read_to_string(&self.0).ok()?.trim().parse().ok()
+#[test]
+fn collection_failure_records_its_error_without_changing_recipe_verdict() {
+    let dir = fixture("true", "");
+    fs::write(dir.path().join("ferry.toml"), "version=1\n[hooks]\ncollect='missing-collect'\n[recipe.pass]\ncommand=['sh','-c','echo attempted']\n").unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "broken collection hook"]);
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(receipt(&out)["outcome"], "ran-pass");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(receipt(&out)["collection"]["exit_code"], 127);
+}
+
+#[test]
+fn collection_runs_after_recipe_failure_timeout_and_prepare_refusal() {
+    // Only the timeout case gets a tight budget: it also covers seat
+    // preparation, which a loaded build sandbox can spend a second on.
+    for (command, prepare, expected, timeout) in [
+        ("exit 7", false, "ran-fail", "60"),
+        ("sleep 10", false, "timeout", "1"),
+        ("exit 0", true, "refused", "60"),
+    ] {
+        let dir = fixture("true", "");
+        fs::write(
+            dir.path().join("collect"),
+            "#!/bin/sh\necho collected > collected\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            dir.path().join("collect"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(dir.path().join("ferry.toml"), format!("version=1\n[hooks]\ncollect='collect'\n{}[recipe.pass]\ncommand=['sh','-c','{command}']\n", if prepare { "prepare='missing-prepare'\n" } else { "" })).unwrap();
+        git(dir.path(), &["add", "ferry.toml", "collect"]);
+        git(dir.path(), &["commit", "-m", "collection contract"]);
+        let out = run(
+            dir.path(),
+            &[
+                "run",
+                "pass",
+                "--local",
+                "--timeout-seconds",
+                timeout,
+                "--json",
+            ],
+        );
+        let record = receipt(&out);
+        assert_eq!(
+            record["outcome"],
+            expected,
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(record["collection"]["exit_code"], 0);
+        let slot = only_checkout(dir.path());
+        assert_eq!(
+            fs::read_to_string(slot.join("collected")).unwrap(),
+            "collected\n"
+        );
     }
 }
-impl Drop for Owned {
-    fn drop(&mut self) {
-        if let Some(pid) = self.pid() {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+
+/// A session that ends with no result keeps its own error as the reason
+/// (SPEC §5): refused before the recipe was attempted, lost after it.
+/// Without the error file (`owner-error` injected), it says only that the
+/// owner exited.
+#[test]
+fn a_session_owners_error_is_the_records_reason() {
+    for (prepare, recipe, fail_at, outcome, code, reason) in [
+        (
+            "exit 1",
+            "true",
+            "",
+            "refused",
+            125,
+            "prepare hook failed: exit status: 1",
+        ),
+        (
+            "exit 0",
+            "/nonexistent/recipe",
+            "",
+            "lost",
+            255,
+            "No such file",
+        ),
+        (
+            "exit 1",
+            "true",
+            "owner-error",
+            "refused",
+            125,
+            "session owner exited without result",
+        ),
+    ] {
+        // Injection exists only in debug builds.
+        if !fail_at.is_empty() && !cfg!(debug_assertions) {
+            continue;
         }
+        let dir = fixture("true", "");
+        let hook = dir.path().join("prepare");
+        fs::write(&hook, format!("#!/bin/sh\n{prepare}\n")).unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let toml =
+            format!("version=1\n[hooks]\nprepare='prepare'\n[recipe.pass]\ncommand=['{recipe}']\n");
+        fs::write(dir.path().join("ferry.toml"), toml).unwrap();
+        git(dir.path(), &["add", "ferry.toml", "prepare"]);
+        git(dir.path(), &["commit", "-m", "owner error"]);
+        let out = command(dir.path())
+            .env("FERRY_FAIL_AT", fail_at)
+            .args(["run", "pass", "--local", "--json"])
+            .output()
+            .unwrap();
+        let record = receipt(&out);
+        assert_eq!(record["outcome"], outcome, "{record}");
+        assert_eq!(record["exit_code"], code, "{record}");
+        let text = record["reason"].as_str().unwrap_or_default();
+        assert!(text.contains(reason), "{record}");
     }
 }
 
-/// A repository whose `probe` recipe runs `script`, plus `pass`.
-fn fixture(script: &str, extra: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let d = dir.path();
-    git(d, &["init"]);
-    git(d, &["config", "user.name", "Ferry Test"]);
-    git(d, &["config", "user.email", "ferry@example.invalid"]);
-    let recipes = toml::to_string(&serde_json::json!({"recipe": {
-        "pass": {"command": ["sh", "-c", "echo committed"]},
-        "probe": {"command": ["sh", "-c", script]},
-    }}))
-    .unwrap();
-    fs::write(d.join("ferry.toml"), format!("version=1\n{extra}{recipes}")).unwrap();
-    git(d, &["add", "-A"]);
-    git(d, &["commit", "-m", "fixture"]);
-    dir
+/// An owner error carrying a hook's long stderr is capped in the record.
+#[test]
+fn a_long_owner_error_is_capped() {
+    let dir = fixture("true", "");
+    let hook = dir.path().join("environment");
+    let noisy = "#!/bin/sh\nhead -c 100000 /dev/zero | tr '\\0' x >&2\nexit 1\n";
+    fs::write(&hook, noisy).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let toml = "version=1\n[hooks]\nenv='environment'\n[recipe.pass]\ncommand=['true']\n";
+    fs::write(dir.path().join("ferry.toml"), toml).unwrap();
+    git(dir.path(), &["add", "ferry.toml", "environment"]);
+    git(dir.path(), &["commit", "-m", "noisy env hook"]);
+    let record = receipt(&run(dir.path(), &["run", "pass", "--local", "--json"]));
+    assert_eq!(record["outcome"], "refused", "{record}");
+    let reason = record["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("xxxx") && reason.ends_with("(truncated)"),
+        "{reason}"
+    );
+    assert!(reason.len() < 5000, "{} bytes", reason.len());
 }
 
-/// A repository with a collect hook (`collect`, a shell script) and a
-/// `probe` recipe running `command`.
-fn with_collect(collect: &str, command: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let d = dir.path();
-    git(d, &["init"]);
-    git(d, &["config", "user.name", "Ferry Test"]);
-    git(d, &["config", "user.email", "ferry@example.invalid"]);
-    fs::write(d.join("collect"), format!("#!/bin/sh\n{collect}\n")).unwrap();
-    fs::set_permissions(d.join("collect"), fs::Permissions::from_mode(0o755)).unwrap();
+/// ferry-8d6 (PRINCIPLES 2): with its supervisor killed (`SIGKILL`), the
+/// session owner itself stops the session at the run's end: the recipe, the
+/// process it started and the owner are gone soon after the timeout, not
+/// when they exit, and the record reconciles to lost.
+#[test]
+fn a_killed_supervisor_s_session_is_stopped_at_its_timeout() {
+    let dir = fixture("true", "");
+    let (id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; wait",
+        "",
+        "8",
+    );
+    let started = std::time::Instant::now();
+    let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _sleeper = OwnedMember {
+        pid: sleeper,
+        session: owner,
+    };
+    assert!(
+        alive(recipe) && alive(sleeper),
+        "the session ended before its timeout"
+    );
+    // The timeout and the owner's lag, then TERM, which both obey.
+    gone_within(
+        &[recipe, sleeper, owner],
+        started,
+        std::time::Duration::from_secs(8) + limits::OWNER_LAG + common::slack(),
+        "the session outlived its timeout without its supervisor",
+    );
+    let out = run(dir.path(), &["record", &id]);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["outcome"], "lost", "{record}");
+    drop(guard);
+}
+
+/// ferry-8d6 (murail-4a R1): a recipe that ends with its supervisor already
+/// killed leaves a process it started; the owner stops its session then,
+/// as the supervisor would have, not at the timeout and not never.
+#[test]
+fn an_unsupervised_recipes_leftover_is_stopped_at_its_end() {
+    let dir = fixture("true", "");
+    let release = dir.path().join("release");
+    let (id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while test ! -e $DIR/release; do sleep 0.1; done",
+        "",
+        "600",
+    );
+    let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _sleeper = OwnedMember {
+        pid: sleeper,
+        session: owner,
+    };
+    fs::write(&release, "end").unwrap();
+    // The owner polls its parent every 100 ms, then TERM, which both obey.
+    gone_within(
+        &[recipe, sleeper, owner],
+        std::time::Instant::now(),
+        common::slack(),
+        "the recipe's leftover outlived its end without a supervisor",
+    );
+    let out = run(dir.path(), &["record", &id]);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["outcome"], "lost", "{record}");
+    drop(guard);
+}
+
+/// ferry-8d6 (murail-4a R3): with every session listing failing
+/// (`session-list`), the owner still ends its session: it signals the
+/// running stage itself, and once the stages have returned kills its own
+/// process group, so the recipe and what it started in the background are
+/// gone after the timeout, and the owner with them.
+#[test]
+fn an_unlistable_session_still_ends_at_its_timeout() {
+    // Injection exists only in debug builds.
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("true", "");
+    let (_id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "trap \"\" TERM; sleep 600 & echo $! > $DIR/member; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
+        "session-list",
+        "6",
+    );
+    let started = std::time::Instant::now();
+    let sleeper: i32 = fs::read_to_string(dir.path().join("member"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _sleeper = OwnedMember {
+        pid: sleeper,
+        session: owner,
+    };
+    // TERM is ignored: only the KILL after the grace ends the recipe, and
+    // the owner's last act ends what it left in the background.
+    gone_within(
+        &[recipe, sleeper, owner],
+        started,
+        std::time::Duration::from_secs(6)
+            + limits::OWNER_LAG
+            + limits::STOP_GRACE
+            + limits::KILL_GRACE
+            + common::slack(),
+        "an unlistable session outlived its bound",
+    );
+    drop(guard);
+}
+
+/// ferry-8d6 (murail-4a): the residue of an unlistable session, reported. A
+/// member that moved to a process group of its own is out of the owner's
+/// reach when nothing can list the session (as for the supervisor's
+/// fallback): the recipe and the owner still end, and `ferry status` lists
+/// the member as a leftover of its run.
+#[test]
+fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
+    // Injection exists only in debug builds.
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("true", "");
+    let (id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "trap \"\" TERM; python3 -c \"import os,time; os.setpgid(0,0); open(\\\"$DIR/split.tmp\\\",\\\"w\\\").write(str(os.getpid())); os.rename(\\\"$DIR/split.tmp\\\",\\\"$DIR/split\\\"); time.sleep(600)\" & echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
+        "session-list",
+        "6",
+    );
+    let started = std::time::Instant::now();
+    let split_path = dir.path().join("split");
+    while !split_path.exists() {
+        assert!(
+            started.elapsed() < common::slack(),
+            "the split member did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let split: i32 = fs::read_to_string(&split_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _split = OwnedMember {
+        pid: split,
+        session: owner,
+    };
+    gone_within(
+        &[recipe, owner],
+        started,
+        std::time::Duration::from_secs(6)
+            + limits::OWNER_LAG
+            + limits::STOP_GRACE
+            + limits::KILL_GRACE
+            + common::slack(),
+        "an unlistable session outlived its bound",
+    );
+    assert!(
+        alive(split),
+        "the residue changed: the split member was reached"
+    );
+    let out = run(dir.path(), &["status", "--json"]);
+    let seen: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let left = &seen["leftovers"];
+    let listed = left["processes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|p| p["pid"] == split && p["run"] == id.as_str());
+    // SPEC §11: listed when its marker can be read; otherwise reported as
+    // unreadable or an error, never silently absent. On Linux this
+    // fixture's marker can be read (an ordinary same-user process; a
+    // non-dumpable one would not be), so only this pid under this run's id
+    // will do: an unrelated unreadable process must not pass for it.
+    if cfg!(target_os = "linux") {
+        assert!(listed, "status does not list the split member: {left}");
+    } else {
+        assert!(
+            listed || left["unreadable"].as_u64() > Some(0) || left["error"].is_string(),
+            "status does not report the split member: {left}"
+        );
+    }
+    drop(guard);
+}
+
+/// ferry-8d6 (herald-1b): the owner's stop keeps its TERM grace through a
+/// listing that fails (`owner-list`, once): only a session seen empty ends
+/// it early, so a member that ignores TERM is killed only after
+/// `STOP_GRACE`.
+#[test]
+fn a_failed_listing_does_not_cut_the_owners_term_grace() {
+    // Injection exists only in debug builds.
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = fixture("true", "");
+    let termed = dir.path().join("termed");
+    let (_id, owner, recipe, guard, _caller) = unsupervised(
+        dir.path(),
+        "trap \"touch $DIR/termed\" TERM; echo $$ > $DIR/recipe.tmp; mv $DIR/recipe.tmp $DIR/recipe; while :; do sleep 0.1; done",
+        "owner-list",
+        "5",
+    );
+    let started = std::time::Instant::now();
+    while !termed.exists() {
+        assert!(
+            started.elapsed()
+                < std::time::Duration::from_secs(5) + limits::OWNER_LAG + common::slack(),
+            "the owner never sent TERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let term = std::time::Instant::now();
+    gone_within(
+        &[recipe],
+        term,
+        limits::STOP_GRACE + limits::KILL_GRACE + common::slack(),
+        "the recipe outlived the owner's KILL",
+    );
+    // Polling only shortens the grace that is seen, by at most a poll.
+    assert!(
+        term.elapsed() >= limits::STOP_GRACE.saturating_sub(std::time::Duration::from_secs(1)),
+        "KILL came {:?} after TERM, before the grace",
+        term.elapsed()
+    );
+    gone_within(
+        &[owner],
+        term,
+        limits::STOP_GRACE + limits::KILL_GRACE + common::slack(),
+        "the owner stayed",
+    );
+    drop(guard);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dead_supervisor_refuses_seat_reuse_until_the_recorded_session_is_empty() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture("true", "");
+    let marker = dir.path().join("recipe-started");
+    let release = dir.path().join("recipe-release");
     fs::write(
-        d.join("ferry.toml"),
-        format!("version=1\n[hooks]\ncollect='collect'\n[recipe.probe]\ncommand=['sh','-c','{command}']\n"),
+        dir.path().join("ferry.toml"),
+        format!(
+            "version=1\n[recipe.pass]\ncommand=['sh','-c','echo $$ > {}.tmp; mv {}.tmp {}; while test ! -e {}; do sleep 0.1; done']\n",
+            marker.display(), marker.display(), marker.display(), release.display()
+        ),
     )
     .unwrap();
-    git(d, &["add", "-A"]);
-    git(d, &["commit", "-m", "fixture"]);
-    dir
-}
-
-/// Runs a caller to its end like `output()`, but bounded: a caller that
-/// never ends fails the test instead of hanging it.
-fn bounded_output(command: &mut Command) -> Output {
-    let scratch = tempfile::tempdir().unwrap();
-    let (stdout, stderr) = (scratch.path().join("out"), scratch.path().join("err"));
-    let mut caller = Caller(
-        command
-            .stdout(fs::File::create(&stdout).unwrap())
-            .stderr(fs::File::create(&stderr).unwrap())
-            .spawn()
-            .unwrap(),
-    );
-    wait_until("the caller ended", || {
-        caller.0.try_wait().unwrap().is_some()
-    });
-    Output {
-        status: caller.0.wait().unwrap(),
-        stdout: fs::read(&stdout).unwrap(),
-        stderr: fs::read(&stderr).unwrap(),
-    }
-}
-
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = common::startup_deadline();
-    while !done() {
-        assert!(Instant::now() < deadline, "never: {what}");
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// From the moment the run took its host lease (in the host record) to now,
-/// when the test sees the complete record.
-fn since_acquired(host: &serde_json::Value) -> Duration {
-    let acquired = u128::from(host["lease"]["acquired_ms"].as_u64().unwrap());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    Duration::from_millis(u64::try_from(now.saturating_sub(acquired)).unwrap())
-}
-
-/// The only stored receipt or host record in `dir`, once it is complete.
-fn only_record(dir: &Path) -> serde_json::Value {
-    let mut found = None;
-    wait_until(&format!("a complete record in {}", dir.display()), || {
-        found = fs::read_dir(dir).ok().and_then(|entries| {
-            entries
-                .flatten()
-                // A final record: not a reservation, not a temporary file.
-                .filter(|e| {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    !name.starts_with('.') && !name.ends_with(".reserved.json")
-                })
-                .filter_map(|e| fs::read(e.path()).ok())
-                .find_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                // A receipt is complete once its run is no longer under way.
-                .filter(|record| record["state"] != "submitted")
-        });
-        found.is_some()
-    });
-    found.unwrap()
-}
-
-/// The one receipt in the repository, whatever its state.
-fn only_receipt_file(dir: &Path) -> serde_json::Value {
-    let entry = fs::read_dir(dir.join(".ferry/receipts"))
-        .unwrap()
-        .flatten()
-        .find(|e| !e.file_name().to_string_lossy().starts_with('.'))
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "hard-death fixture"]);
+    let diagnostic = dir.path().join("caller-stderr");
+    let caller_output = dir.path().join("caller-stdout");
+    let child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .args(["run", "pass", "--local", "--json"])
+        .stdout(fs::File::create(&caller_output).unwrap())
+        .stderr(fs::File::create(&diagnostic).unwrap())
+        .spawn()
         .unwrap();
-    serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap()
-}
-
-/// The names in a run-records directory, sorted.
-fn record_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<_> = fs::read_dir(dir.join(".ferry/local/v1/records"))
+    let mut caller = OwnedCaller {
+        child: Some(child),
+        member: marker.clone(),
+    };
+    let deadline = common::startup_deadline();
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline
+                && caller.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "recipe did not start: {} {}",
+            fs::read_to_string(&diagnostic).unwrap_or_default(),
+            fs::read_to_string(&caller_output).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let recipe: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    let group = OwnedGroup(getsid(Some(Pid::from_raw(recipe))).unwrap().as_raw());
+    let seat_lock = fs::read_dir(dir.path().join(".ferry/local/v1/locks"))
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
-}
-
-/// A run's output log.
-fn output_log(dir: &Path, id: &str) -> Vec<u8> {
-    fs::read(dir.join(format!(".ferry/local/v1/runs/{id}/output.log"))).unwrap()
-}
-
-/// The supervisor's pid, from the caller's `submitted` event in `events`.
-fn submitted_pid(events: &Path) -> Option<i32> {
-    fs::read_to_string(events)
-        .unwrap_or_default()
+        .find(|name| name.ends_with("-default"))
+        .unwrap();
+    let seat = seat_lock.as_str();
+    // Kill the supervisor itself: the run's, named by
+    // its `submitted` event. Its run reconciles to lost.
+    let supervisor = fs::read_to_string(&caller_output)
+        .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|event| event["event"] == "submitted")
         .and_then(|event| event["pid"].as_i64())
-        .and_then(|pid| i32::try_from(pid).ok())
-}
-
-/// A process that holds a pipe and never reads it, for a stalled consumer.
-struct Stalled(std::process::Child);
-impl Stalled {
-    /// A consumer that holds the pipe unread for `secs`.
-    fn lasting(secs: u32) -> (Self, Stdio) {
-        let mut child = Command::new("sleep")
-            .arg(secs.to_string())
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let pipe = Stdio::from(child.stdin.take().unwrap());
-        (Self(child), pipe)
-    }
-    fn alive(&mut self) -> bool {
-        self.0.try_wait().unwrap().is_none()
-    }
-}
-impl Drop for Stalled {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// A caller a control spawned: stopped (SIGINT, so it asks the place to
-/// stop its run, then KILL) if the control ends early.
-struct Caller(std::process::Child);
-impl Drop for Caller {
-    fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = kill(
-                Pid::from_raw(i32::try_from(self.0.id()).unwrap()),
-                Signal::SIGINT,
-            );
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while self.0.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(100));
-            }
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        .expect("the submitted event names the supervisor");
+    kill(
+        Pid::from_raw(i32::try_from(supervisor).unwrap()),
+        Signal::SIGKILL,
+    )
+    .unwrap();
+    caller.child.as_mut().unwrap().wait().unwrap();
+    let locks = dir.path().join(".ferry/local/v1/locks");
+    let held = |name: &str| {
+        let probe = fs::File::open(locks.join(name)).unwrap();
+        match fs2::FileExt::try_lock_exclusive(&probe) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(e) => panic!("probing {name}: {e}"),
         }
+    };
+    // The session inherited the seat lock, on every platform: it stays
+    // held while the recipe lives, though its supervisor is gone. The host
+    // lease was the supervisor's alone and closed with it (SPEC §11).
+    assert!(held(seat), "the seat lock freed while the recipe lives");
+    assert!(!held("host"), "the host lease outlived its supervisor");
+    // A new run on the seat refuses at once, never starting beside it: the
+    // lock names the killed run, reconciled to lost, whose work holds it.
+    let killed = fs::read_to_string(&caller_output)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["event"] == "submitted")
+        .and_then(|event| event["id"].as_str().map(str::to_owned))
+        .unwrap();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    let reason = receipt(&out)["reason"].as_str().unwrap().to_owned();
+    assert!(
+        reason.contains(&format!("seat busy: held after run {killed} ended (lost)")),
+        "{reason}"
+    );
+    fs::write(&release, "finish").unwrap();
+    let deadline = common::startup_deadline();
+    while held(seat) {
+        assert!(Instant::now() < deadline, "the recipe kept the seat");
+        thread::sleep(Duration::from_millis(10));
     }
+    // Once the session is gone, the seat takes the next run: no marker of
+    // the dead supervisor is left to clear (slice 4b).
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    drop(group);
 }
 
-// --- Client independence (SPEC §12.4) ---
+#[test]
+fn an_exclusive_run_waits_for_in_flight_runs_and_keeps_new_ones_out() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = fixture("true", "");
+    let log = dir.path().join("lease.log");
+    // Each run logs its start, waits for its own release file, logs its end.
+    fs::write(
+        dir.path().join("ferry.toml"),
+        format!(
+            "version=1\n[recipe.hold]\ncommand=['sh','-c','echo \"$1-start\" >> {log}; while [ ! -e \"{log}.$1\" ] && [ -e {log} ]; do sleep 0.05; done; echo \"$1-end\" >> {log}','hold']\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    git(dir.path(), &["add", "ferry.toml"]);
+    git(dir.path(), &["commit", "-m", "lease"]);
+    let mut runs = HoldRuns { log, pids: vec![] };
+    let wait_for = |runs: &HoldRuns, line: &str| {
+        let deadline = common::startup_deadline();
+        while !runs.logged().lines().any(|l| l == line) {
+            assert!(Instant::now() < deadline, "never logged {line}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let first = runs.spawn(dir.path(), "first", false);
+    wait_for(&runs, "first-start");
+    let alone = runs.spawn(dir.path(), "alone", true);
+    // Observe, rather than assume, that the exclusive run now holds the gate.
+    let gate = dir.path().join(".ferry/local/v1/locks/host.gate");
+    let deadline = common::startup_deadline();
+    loop {
+        // The first run already passed the gate, so it must exist. Only a
+        // contended lock means the exclusive run holds it; any other error is
+        // a failure, never readiness.
+        let probe = fs::File::open(&gate)
+            .unwrap_or_else(|e| panic!("the first run created the host gate: {e}"));
+        match fs2::FileExt::try_lock_shared(&probe) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("probing the host gate: {e}"),
+            Ok(()) => drop(probe),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the exclusive run never took the gate"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let gated = Instant::now();
+    assert!(
+        !runs.logged().contains("alone-start"),
+        "exclusive run started beside an in-flight run"
+    );
+    let later = runs.spawn(dir.path(), "later", false);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !runs.logged().contains("later-start"),
+        "a new run started while an exclusive run waited"
+    );
+    let held_for = gated.elapsed();
+    runs.release("first");
+    wait_for(&runs, "alone-start");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !runs.logged().contains("later-start"),
+        "a new run started beside an exclusive run"
+    );
+    runs.release("alone");
+    wait_for(&runs, "later-start");
+    runs.release("later");
+    let receipts: Vec<serde_json::Value> = [first, alone, later]
+        .into_iter()
+        .map(|child| receipt(&child.wait_with_output().unwrap()))
+        .collect();
+    assert_eq!(
+        runs.logged().lines().collect::<Vec<_>>(),
+        [
+            "first-start",
+            "first-end",
+            "alone-start",
+            "alone-end",
+            "later-start",
+            "later-end"
+        ]
+    );
+    assert_lease_windows(&receipts, held_for, dir.path());
+}
 
 #[test]
 fn concurrent_readers_complete_the_same_submitted_receipt() {
@@ -503,8 +872,6 @@ fn output_bytes_that_are_not_utf8_arrive_exactly() {
     );
     assert_eq!(out.stdout, b"a\xffb\n\xfe\n");
 }
-
-// --- Stop (SPEC §12.5) ---
 
 #[test]
 fn a_signal_stops_a_run_whose_consumer_stalls() {
@@ -981,8 +1348,6 @@ fn a_callers_signal_after_the_verdict_is_named_and_keeps_it() {
     );
 }
 
-// --- Deadline and waits (SPEC §12.6, A1) ---
-
 #[test]
 fn the_deadline_ends_a_run_with_no_client() {
     if !cfg!(debug_assertions) {
@@ -1029,18 +1394,6 @@ fn the_deadline_ends_a_run_with_no_client() {
     // The session was stopped with it.
     let owners = dir.path().join(".ferry/local/v1/owners");
     assert!(!owners.exists() || fs::read_dir(&owners).unwrap().count() == 0);
-}
-
-// --- Seat busy (SPEC §12.7) ---
-
-/// The local seat lock of the default seat, once a run has created it.
-fn seat_lock(dir: &Path) -> PathBuf {
-    fs::read_dir(dir.join(".ferry/local/v1/locks"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.to_string_lossy().ends_with("-default"))
-        .unwrap()
 }
 
 /// A busy seat refuses at once (SPEC §12.7): 125, naming the run that
@@ -1262,16 +1615,6 @@ fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
     );
 }
 
-/// A recipe line that leaves a setsid python running, holding the run's
-/// inherited seat lock, and records its pid. It outlives any loaded test
-/// (600 s); the test's `Owned` guard stops it by that pid.
-fn leaving(pidfile: &Path) -> String {
-    format!(
-        "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(600)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
-        p = pidfile.display()
-    )
-}
-
 /// Runs refused together behind a leaver each see the others' reservations
 /// (critic L1): every refusal must still name the ended run whose leftover
 /// holds the lock, with the others only as "or" possibilities.
@@ -1351,59 +1694,6 @@ fn an_exclusive_runs_leaver_holds_its_seat_but_not_the_host() {
         )),
         "{record}"
     );
-}
-
-/// An exclusive lock held by a helper process, released when dropped. One
-/// held by the test process itself is shared, until exec, with every child
-/// a parallel test spawns (Linux), so its release cannot be timed: such a
-/// child can still hold it a moment after `drop`.
-struct Holder(std::process::Child);
-impl Holder {
-    fn exclusive(path: &Path) -> Self {
-        let mut child = Command::new("python3")
-            .args([
-                "-c",
-                "import fcntl,sys,time\nf=open(sys.argv[1],'a+')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(600)",
-            ])
-            .arg(path)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
-            &mut line,
-        )
-        .unwrap();
-        assert_eq!(line.trim(), "held");
-        Self(child)
-    }
-}
-impl Drop for Holder {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// The run in `runs` paused at `point` (its `<at>.paused` marker), as its
-/// id and the marker's path.
-fn paused_at(runs: &Path, at: &str) -> (String, PathBuf) {
-    let mut found = None;
-    wait_until(&format!("a run paused at {at}"), || {
-        found = fs::read_dir(runs)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .find_map(|e| {
-                let marker = e.path().join(format!("{at}.paused"));
-                marker
-                    .exists()
-                    .then(|| (e.file_name().to_string_lossy().into_owned(), marker))
-            });
-        found.is_some()
-    });
-    found.unwrap()
 }
 
 /// A run's record is final before its locks close (SPEC §5), so a named
@@ -1607,13 +1897,6 @@ fn a_host_held_by_shared_runs_says_so_alone() {
         ) && !reason.contains("exclusive run"),
         "{reason}"
     );
-}
-
-/// Whether the default seat's lock is held now, by an exclusive probe.
-fn seat_held(dir: &Path) -> bool {
-    let probe = fs::File::open(seat_lock(dir)).unwrap();
-    fs2::FileExt::try_lock_exclusive(&probe)
-        .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
 }
 
 /// A lock passes to the supervisor as it is taken, so a refusal after the
@@ -1881,41 +2164,6 @@ fn a_supervisor_panic_keeps_its_locks_until_finalization() {
     );
 }
 
-/// A run waiting for a host lock this test holds, paused at the host
-/// probe after its wait expired; returns the caller, the held lock file
-/// and the pause marker.
-fn paused_at_the_host_probe(dir: &Path) -> (Caller, Holder, PathBuf) {
-    let locks = dir.join(".ferry/local/v1/locks");
-    fs::create_dir_all(&locks).unwrap();
-    let host = Holder::exclusive(&locks.join("host"));
-    let caller = Caller(
-        ferry(dir)
-            .env("FERRY_FAIL_AT", "host-probe")
-            .args(["run", "probe", "--local", "--json", "--wait-seconds", "1"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let (_, paused) = paused_at(&dir.join(".ferry/local/v1/runs"), "probe");
-    (caller, host, paused)
-}
-
-/// The receipt a paused caller ends with, once released.
-fn released(mut caller: Caller, paused: &Path) -> (Option<i32>, serde_json::Value) {
-    fs::write(paused.with_extension("go"), "").unwrap();
-    let mut stdout = caller.0.stdout.take().unwrap();
-    let mut out = Vec::new();
-    std::io::Read::read_to_end(&mut stdout, &mut out).unwrap();
-    let code = caller.0.wait().unwrap().code();
-    let record = receipt(&Output {
-        status: ExitStatus::from_raw(0),
-        stdout: out,
-        stderr: vec![],
-    });
-    (code, record)
-}
-
 /// A host lock freed just as the wait ended is not "held by shared runs":
 /// a shared probe succeeds on a free lock too (murail-4a's P1). The
 /// exclusive probe proves it free, and the refusal says retry.
@@ -2137,8 +2385,6 @@ fn a_host_lease_wait_past_its_bound_refuses_naming_the_holder() {
     });
 }
 
-// --- Output: one capped writer (SPEC §11) ---
-
 #[test]
 fn output_past_the_cap_is_dropped_and_the_run_goes_on() {
     if !cfg!(debug_assertions) {
@@ -2256,8 +2502,6 @@ fn the_collect_hook_sees_the_runs_own_id_and_request() {
     assert_eq!(runs, [std::ffi::OsString::from(id)]);
 }
 
-// --- Failures inside the run keep the verdict ---
-
 #[test]
 fn a_panic_inside_the_run_still_reaches_custody_release() {
     if !cfg!(debug_assertions) {
@@ -2320,24 +2564,6 @@ fn injected_collection_and_artifact_failures_keep_the_verdict() {
     assert!(record["artifacts"].is_null(), "{record}");
     let id = record["id"].as_str().unwrap();
     assert!(!d.join(".ferry/runs").join(id).exists(), "{record}");
-}
-
-/// A recipe with artifacts in a fresh repository: `extra` adds top-level
-/// ferry.toml lines; the recipe `probe` runs `script` and declares `artifacts`.
-fn artifact_fixture(script: &str, artifacts: &str, extra: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let d = dir.path();
-    git(d, &["init"]);
-    git(d, &["config", "user.name", "Ferry Test"]);
-    git(d, &["config", "user.email", "ferry@example.invalid"]);
-    let toml = format!(
-        "version=1\n{extra}[recipe.probe]\ncommand=['sh','-c','{script}']\nartifacts={artifacts}\n"
-    );
-    fs::write(d.join("ferry.toml"), toml).unwrap();
-    fs::write(d.join(".gitignore"), "out.txt\nkeep/\n").unwrap();
-    git(d, &["add", "-A"]);
-    git(d, &["commit", "-m", "fixture"]);
-    dir
 }
 
 /// A run that ends before its recipe collects nothing, and says which:
@@ -2612,49 +2838,6 @@ fn locks_reach_the_recipe_but_not_the_supervisors_other_children() {
     );
 }
 
-/// A record's survivors as SPEC §7 allows them here: exact on Linux; on
-/// macOS, which withholds its platform binaries' environment from the marker
-/// pass, `unknown` (None) is always allowed, never a wrong list.
-fn survivors(record: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
-    match &record["custody"]["survivors"] {
-        serde_json::Value::Array(list) => Some(list.clone()),
-        unknown if cfg!(target_os = "macos") && unknown == "unknown" => None,
-        other => panic!("survivors {other} in {record}"),
-    }
-}
-
-/// No survivor: `[]`, or on macOS `unknown` with no session member among
-/// what the pass saw, so the session stop is still checked there.
-fn assert_no_survivors(record: &serde_json::Value) {
-    assert!(
-        survivors(record).is_none_or(|list| list.is_empty()),
-        "{record}"
-    );
-    let error = record["custody"]["error"].as_str().unwrap_or_default();
-    assert!(!error.contains("session survivors"), "{record}");
-}
-
-/// A recipe or hook line that leaves a python in its own session (`setsid`,
-/// re-parented once the line's shell exits), recording its pid. `closed`:
-/// it closes every inherited fd first, so it holds no lock; `cleared`: it
-/// starts under `env -i`, so it carries no marker.
-fn escapee(pidfile: &Path, closed: bool, cleared: bool) -> String {
-    let python = if cleared {
-        "env -i \"$(command -v python3)\""
-    } else {
-        "python3"
-    };
-    let close = if closed {
-        "os.closerange(3, 4096)\n"
-    } else {
-        ""
-    };
-    format!(
-        "{python} -c 'import os,time\nos.setsid()\n{close}open(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(600)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
-        p = pidfile.display()
-    )
-}
-
 /// The marker pass lists what left the session (SPEC §7, §12.9): a
 /// recipe's escapee is listed by pid and command, never `[]`, and holding
 /// the seat lock it keeps the seat busy, naming the run it outlived.
@@ -2730,145 +2913,6 @@ fn an_escapee_without_fds_is_listed_and_one_without_its_marker_is_not() {
         let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
         assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
     }
-}
-
-/// `ferry status` (SPEC §4, §12.18) on one place with a shared run, two
-/// waiting exclusive runs and a leftover: it names each, the gate's holder
-/// apart from the requester, and once they end it never names a stale
-/// holder. It takes no lock, so a run submitted meanwhile is not refused.
-#[test]
-#[allow(clippy::too_many_lines)]
-fn status_names_runs_the_gate_and_leftovers() {
-    let scratch = tempfile::tempdir().unwrap();
-    let (release, pidfile) = (
-        scratch.path().join("release"),
-        scratch.path().join("left.pid"),
-    );
-    // `$0` is the run's first argument: `leave` starts an escapee and ends;
-    // anything else holds until released.
-    let dir = fixture(
-        &format!(
-            "if [ \"$0\" = leave ]; then {}; else while [ ! -e {} ]; do sleep 0.1; done; fi",
-            escapee(&pidfile, true, false),
-            release.display()
-        ),
-        "",
-    );
-    let left = Owned(pidfile);
-    let run = |seat: &str, more: &[&str]| {
-        let mut args = vec!["run", "probe", "--local", "--json", "--seat", seat];
-        args.extend_from_slice(more);
-        args.extend_from_slice(&["--wait-seconds", "120"]);
-        Caller(
-            ferry(dir.path())
-                .args(&args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        )
-    };
-    let status = || {
-        let out = bounded_output(ferry(dir.path()).args(["status", "--json"]));
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
-    };
-    let gone_run = bounded_output(ferry(dir.path()).args([
-        "run", "probe", "--local", "--json", "--seat", "d", "--", "leave",
-    ]));
-    let leaver = receipt(&gone_run)["id"].as_str().unwrap().to_owned();
-    let phase = |seen: &serde_json::Value, seat: &str| {
-        seen["runs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| {
-                r["seat"]
-                    .as_str()
-                    .is_some_and(|s| s.ends_with(&format!("-{seat}")))
-            })
-            .map(|r| {
-                (
-                    r["id"].as_str().unwrap().to_owned(),
-                    r["phase"].as_str().unwrap().to_owned(),
-                )
-            })
-    };
-    let _shared = run("a", &[]);
-    wait_until("the shared run is running", || {
-        phase(&status(), "a").is_some_and(|(_, p)| p == "running")
-    });
-    // Status takes no lock: a run on an existing idle seat, submitted
-    // between its reads, is admitted.
-    let out =
-        bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json", "--seat", "e"]));
-    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
-    let reading = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let reads = std::thread::spawn({
-        let (dir, reading) = (dir.path().to_owned(), reading.clone());
-        move || {
-            while reading.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = ferry(&dir).args(["status", "--json"]).output();
-            }
-        }
-    });
-    for _ in 0..5 {
-        let out = bounded_output(
-            ferry(dir.path()).args(["run", "pass", "--local", "--json", "--seat", "e"]),
-        );
-        assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
-    }
-    reading.store(false, std::sync::atomic::Ordering::SeqCst);
-    reads.join().unwrap();
-    let _holder = run("b", &["--exclusive"]);
-    wait_until("the exclusive run took the gate", || {
-        status()["gate"]["holder"]
-            .as_str()
-            .is_some_and(|h| h != "none")
-    });
-    let _requester = run("c", &["--exclusive"]);
-    let pid = left.pid().unwrap();
-    // Every fact at once, in one read: the runs change phase and the gate
-    // its requesters as they start, so the read is retried until all hold
-    // (or the bound ends, showing the last one).
-    let holds = |seen: &serde_json::Value| {
-        let (Some((b, b_phase)), Some((c, c_phase))) = (phase(seen, "b"), phase(seen, "c")) else {
-            return false;
-        };
-        let listed = seen["leftovers"]["processes"]
-            .as_array()
-            .is_some_and(|p| p.iter().any(|p| p["pid"] == pid && p["run"] == leaver));
-        // macOS withholds some environments: then it is counted, not listed.
-        let counted =
-            cfg!(target_os = "macos") && seen["leftovers"]["unreadable"].as_u64() > Some(0);
-        (b_phase.as_str(), c_phase.as_str()) == ("waiting", "waiting")
-            && seen["gate"]["holder"] == b
-            && seen["gate"]["requesters"] == serde_json::json!([c])
-            && (listed || counted)
-            && seen["seats"]
-                .as_array()
-                .is_some_and(|s| s.iter().any(|s| s["last_run"] == leaver))
-    };
-    let deadline = common::startup_deadline();
-    loop {
-        let seen = status();
-        if holds(&seen) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "never held together: {seen}");
-        thread::sleep(Duration::from_millis(100));
-    }
-    fs::write(&release, "").unwrap();
-    wait_until("every run ended", || {
-        status()["runs"].as_array().unwrap().is_empty()
-    });
-    // `host.gate` still names the last exclusive run: never a stale holder.
-    let after = status();
-    assert_eq!(after["gate"]["holder"], "unknown", "{after}");
 }
 
 /// Every wait in the stop path is bounded (PRINCIPLES 5): a marker pass
@@ -2999,21 +3043,6 @@ fn collect_runs_after_a_stop() {
     assert!(record["stopped_by"].is_object(), "{record}");
     assert_eq!(record["collection"]["exit_code"], 0, "{record}");
     assert!(collected.exists(), "collect did not run after the stop");
-}
-
-/// Whether `pid` is gone: no such process, or a zombie (dead, not yet
-/// reaped by its new parent; `kill(pid, 0)` still succeeds on one). Bench
-/// once caught a zombie here (ferry-xtx.25: a test artifact).
-fn gone(pid: i32) -> bool {
-    if kill(Pid::from_raw(pid), None).is_err() {
-        return true;
-    }
-    let state = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .unwrap_or_default();
-    state.is_empty() || state.starts_with('Z')
 }
 
 /// A session member that ignores TERM is killed after the grace (SPEC §7,
@@ -3291,66 +3320,6 @@ fn a_survivor_holding_its_lock_is_named_and_keeps_the_seat_busy() {
     assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
 }
 
-/// Runs `ferry run pass --local` in a pty with `tostop`, its foreground,
-/// while another run holds the host lease exclusively; `interrupt` sends
-/// SIGINT to the caller after 5 s. Returns (exit code, seconds taken).
-fn under_tostop(dir: &Path, interrupt: bool) -> (i32, f64) {
-    let harness = r#"
-import os, pty, select, signal, sys, termios, time
-pid, fd = pty.fork()
-if pid == 0:
-    attrs = termios.tcgetattr(0)
-    attrs[3] |= termios.TOSTOP
-    termios.tcsetattr(0, termios.TCSANOW, attrs)
-    os.execv(sys.argv[3], sys.argv[3:])
-start = time.time()
-sent = False
-while True:
-    if sys.argv[1] == "interrupt" and not sent and time.time() - start > 5:
-        os.kill(pid, signal.SIGINT)
-        sent = True
-    # Read only what is ready, so the signal goes out on time.
-    if select.select([fd], [], [], 0.05)[0]:
-        try:
-            os.read(fd, 65536)
-        except OSError:
-            pass
-    done, status = os.waitpid(pid, os.WNOHANG)
-    if done:
-        print(os.waitstatus_to_exitcode(status), round(time.time() - start, 1))
-        sys.exit(0)
-    if time.time() - start > float(sys.argv[2]):
-        os.kill(pid, signal.SIGKILL)
-        os.waitpid(pid, 0)
-        print(-1, sys.argv[2])
-        sys.exit(0)
-    time.sleep(0.05)
-"#;
-    let out = Command::new("python3")
-        .current_dir(dir)
-        .env_remove("FERRY_ID")
-        .env("XDG_CONFIG_HOME", dir.join("config"))
-        .env("XDG_STATE_HOME", dir.join("state"))
-        .arg("-c")
-        .arg(harness)
-        .arg(if interrupt { "interrupt" } else { "wait" })
-        // A hang, not a loaded machine, reaches this bound.
-        .arg(
-            (common::startup_deadline() - Instant::now())
-                .as_secs()
-                .to_string(),
-        )
-        .arg(env!("CARGO_BIN_EXE_ferry"))
-        .args(["run", "pass", "--local", "--seat", "second"])
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let mut fields = text.split_whitespace();
-    let code = fields.next().and_then(|c| c.parse().ok()).unwrap_or(-2);
-    let took = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0.0);
-    (code, took)
-}
-
 #[test]
 fn a_terminal_with_tostop_never_stops_the_run() {
     for interrupt in [false, true] {
@@ -3378,8 +3347,6 @@ fn a_terminal_with_tostop_never_stops_the_run() {
         }
     }
 }
-
-// --- The record cycle (SPEC §12.1-3, slice 1) ---
 
 #[test]
 fn a_crashed_supervisor_is_reconciled_to_lost_by_its_caller() {
@@ -3611,615 +3578,4 @@ fn a_stop_that_cannot_be_recorded_is_refused_and_the_run_goes_on() {
     let record = only_record(&dir.path().join(".ferry/receipts"));
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     drop(caller);
-}
-
-// --- What the caller says (SPEC §4, §12.27; ferry-buo, ferry-l1r, ferry-3o8) ---
-
-/// The `ferry: ` lines a caller wrote on stderr.
-fn said(out: &Output) -> Vec<String> {
-    String::from_utf8_lossy(&out.stderr)
-        .lines()
-        .filter(|line| line.starts_with("ferry: "))
-        .map(str::to_owned)
-        .collect()
-}
-
-/// A commit id cut to the 12 digits the caller prints.
-fn short(commit: &str) -> &str {
-    &commit[..12]
-}
-
-#[test]
-fn the_caller_says_where_the_run_went_and_ends_with_its_verdict() {
-    let dir = fixture("echo out; exit 17", "");
-    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local"]));
-    assert_eq!(out.status.code(), Some(17));
-    let lines = said(&out);
-    let record = only_receipt_file(dir.path());
-    let (id, commit) = (
-        record["id"].as_str().unwrap(),
-        record["commit"].as_str().unwrap(),
-    );
-    assert_eq!(
-        lines.first().map(String::as_str),
-        Some(
-            format!(
-                "ferry: {id} → local, seat default, commit {}",
-                short(commit)
-            )
-            .as_str()
-        ),
-        "{lines:?}"
-    );
-    assert_eq!(
-        lines.last().map(String::as_str),
-        Some(format!("ferry: ran-fail, exit 17, run {id}").as_str()),
-        "{lines:?}"
-    );
-    assert!(
-        !lines.iter().any(|l| l.contains("uncommitted")),
-        "{lines:?}"
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
-
-    // An uncommitted edit is named, and the commit it is not in still runs.
-    fs::write(dir.path().join("edit"), "not committed").unwrap();
-    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local"]));
-    assert_eq!(out.status.code(), Some(0));
-    assert!(
-        said(&out).contains(&format!(
-            "ferry: uncommitted changes are not in {}",
-            short(commit)
-        )),
-        "{:?}",
-        said(&out)
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "committed\n");
-
-    // With --json, stdout is events only: submitted (where), then receipt.
-    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
-    let events: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(events.len(), 2, "{events:?}");
-    assert_eq!(events[0]["event"], "submitted", "{events:?}");
-    assert_eq!(events[0]["machine"], "local", "{events:?}");
-    assert_eq!(events[0]["seat"], "default", "{events:?}");
-    assert_eq!(events[0]["commit"], commit, "{events:?}");
-    assert_eq!(events[1]["event"], "receipt", "{events:?}");
-}
-
-#[test]
-fn a_run_waiting_on_a_host_lock_says_what_holds_it_once() {
-    let scratch = tempfile::tempdir().unwrap();
-    let (holding, hold) = (scratch.path().join("holding"), scratch.path().join("hold"));
-    fs::write(&hold, "").unwrap();
-    let dir = fixture(
-        &format!(
-            "touch {}; while [ -e {} ]; do sleep 0.1; done",
-            holding.display(),
-            hold.display()
-        ),
-        "",
-    );
-    let holder = Caller(
-        ferry(dir.path())
-            .args(["run", "probe", "--local", "--exclusive", "--seat", "first"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    wait_until("the first run holds the host alone", || holding.exists());
-    let holder_id = only_receipt_file(dir.path())["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let note = format!("waiting for lock host.gate: held by run {holder_id}");
-    let (text_err, json_out) = (scratch.path().join("text"), scratch.path().join("json"));
-    let waiter = |seat: &str, json: bool, to: &Path| {
-        let mut command = ferry(dir.path());
-        command.args(["run", "pass", "--local", "--seat", seat]);
-        if json {
-            command
-                .arg("--json")
-                .stdout(fs::File::create(to).unwrap())
-                .stderr(Stdio::null());
-        } else {
-            command
-                .stdout(Stdio::null())
-                .stderr(fs::File::create(to).unwrap());
-        }
-        Caller(command.spawn().unwrap())
-    };
-    let mut text = waiter("second", false, &text_err);
-    let mut json = waiter("third", true, &json_out);
-    // From the place writing the note (its supervisor's log) to the caller
-    // saying it: within 5 s, however long the run took to start waiting.
-    let runs = dir.path().join(".ferry/local/v1/runs");
-    let written = || {
-        fs::read_dir(&runs)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                fs::read_to_string(e.path().join("supervisor.log"))
-                    .is_ok_and(|log| log.contains(&note))
-            })
-            .count()
-    };
-    // The clock starts once both waiters' places have written it.
-    wait_until("both waiters' places wrote their note", || written() == 2);
-    let noted = Instant::now();
-    let text_said = || fs::read_to_string(&text_err).unwrap_or_default();
-    let json_said = || fs::read_to_string(&json_out).unwrap_or_default();
-    while !(text_said().contains(&format!("ferry: {note}")) && json_said().contains("\"waiting\""))
-    {
-        assert!(
-            noted.elapsed() < Duration::from_secs(5) + common::slack() + Duration::from_secs(3),
-            "{} | {}",
-            text_said(),
-            json_said()
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-    // Several reads later, each caller has said it once.
-    thread::sleep(Duration::from_secs(5));
-    fs::remove_file(&hold).unwrap();
-    for caller in [&mut text, &mut json] {
-        wait_until("a waiter ended", || caller.0.try_wait().unwrap().is_some());
-    }
-    drop(holder);
-    assert_eq!(text_said().matches(&note).count(), 1, "{}", text_said());
-    let events: Vec<serde_json::Value> = json_said()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let kinds: Vec<_> = events
-        .iter()
-        .map(|e| e["event"].as_str().unwrap())
-        .collect();
-    assert_eq!(kinds, ["submitted", "waiting", "receipt"], "{events:?}");
-    assert_eq!(events[1]["note"], note.as_str(), "{events:?}");
-    assert_eq!(events[2]["receipt"]["outcome"], "ran-pass", "{events:?}");
-}
-
-#[test]
-fn a_record_read_as_the_run_ends_is_never_not_found() {
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    let scratch = tempfile::tempdir().unwrap();
-    let (started, hold) = (scratch.path().join("started"), scratch.path().join("hold"));
-    fs::write(&hold, "").unwrap();
-    let dir = fixture(
-        &format!(
-            "touch {}; while [ -e {} ]; do sleep 0.1; done",
-            started.display(),
-            hold.display()
-        ),
-        "",
-    );
-    let caller = Caller(
-        ferry(dir.path())
-            .args(["run", "probe", "--local", "--json"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    wait_until("the recipe started", || started.exists());
-    let id = only_receipt_file(dir.path())["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    // The place's record verb pauses between its two reads; the run ends
-    // (record final, reservation removed) in that gap.
-    let reader = ferry(dir.path())
-        .args(["record", &id])
-        .env("FERRY_FAIL_AT", "record-gap")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let state = dir.path().join(".ferry/local/v1");
-    let gap = state.join(format!("runs/{id}/record-gap"));
-    wait_until("the record read paused", || {
-        gap.with_extension("paused").exists()
-    });
-    fs::remove_file(&hold).unwrap();
-    wait_until("the run is final and its reservation gone", || {
-        state.join(format!("records/{id}.json")).exists()
-            && !state.join(format!("records/{id}.reserved.json")).exists()
-    });
-    fs::write(gap.with_extension("go"), "").unwrap();
-    let out = reader.wait_with_output().unwrap();
-    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(record["state"], "final", "{record}");
-    drop(caller);
-}
-
-#[test]
-fn an_unknown_run_id_is_named_not_an_os_error() {
-    let dir = fixture("true", "");
-    for verb in ["record", "follow", "stop"] {
-        let out = bounded_output(ferry(dir.path()).args([verb, "nonsense-id"]));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(125), "{verb}: {stderr}");
-        assert!(
-            stderr.contains("no run nonsense-id in this repository's receipts"),
-            "{verb}: {stderr}"
-        );
-        assert!(!stderr.contains("os error"), "{verb}: {stderr}");
-    }
-}
-
-#[test]
-fn deleted_paths_are_usage_errors_and_leave_no_receipt() {
-    let dir = fixture("true", "");
-    // `receipt` duplicated `record`: gone.
-    let out = bounded_output(ferry(dir.path()).args(["receipt", "x"]));
-    assert_eq!(out.status.code(), Some(2));
-    // --on with --local is a usage error, not a refused run.
-    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--on", "m", "--local"]));
-    assert_eq!(out.status.code(), Some(2));
-    assert!(!dir.path().join(".ferry/receipts").exists());
-}
-
-#[test]
-fn git_and_toml_refusals_say_what_they_mean() {
-    let dir = fixture("true", "");
-    let out = bounded_output(
-        ferry(dir.path()).args(["run", "pass", "--local", "--json", "--commit", "deadbeef"]),
-    );
-    let record = receipt(&out);
-    assert_eq!(out.status.code(), Some(125), "{record}");
-    assert_eq!(record["reason"], "unknown commit deadbeef", "{record}");
-    // Outside a repository.
-    let outside = tempfile::tempdir().unwrap();
-    let out = bounded_output(
-        ferry(outside.path())
-            .env("GIT_CEILING_DIRECTORIES", outside.path().parent().unwrap())
-            .args(["run", "pass", "--local"]),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(125), "{stderr}");
-    assert!(stderr.contains("not in a git or jj repository"), "{stderr}");
-    assert!(!stderr.contains("fatal"), "{stderr}");
-    // A ferry.toml that does not parse names the file and the commit.
-    fs::write(dir.path().join("ferry.toml"), "version = 1\n[recipe.pass\n").unwrap();
-    git(dir.path(), &["commit", "-qam", "broken"]);
-    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
-    let record = receipt(&out);
-    let at = short(record["commit"].as_str().unwrap()).to_owned();
-    assert!(
-        record["reason"]
-            .as_str()
-            .unwrap()
-            .starts_with(&format!("ferry.toml at {at}: TOML parse error")),
-        "{record}"
-    );
-    // One line, as every `ferry: ` line is: TOML's own line breaks joined.
-    assert!(
-        !record["reason"].as_str().unwrap().contains('\n'),
-        "{record}"
-    );
-}
-
-#[test]
-fn recipes_and_machines_are_one_line_each_in_version_two_names() {
-    let dir = tempfile::tempdir().unwrap();
-    let d = dir.path();
-    git(d, &["init"]);
-    git(d, &["config", "user.name", "Ferry Test"]);
-    git(d, &["config", "user.email", "ferry@example.invalid"]);
-    fs::write(
-        d.join("ferry.toml"),
-        "version = 2\n[recipe.check]\ncommand = ['just', 'check']\nneeds = ['linux', 'big']\nmay_run_elsewhere = true\n[recipe.fmt]\ncommand = ['cargo', 'fmt']\n[recipe.say]\ncommand = ['sh', '-c', \"echo 'hi there'; exit 17\", '']\n",
-    )
-    .unwrap();
-    git(d, &["add", "-A"]);
-    git(d, &["commit", "-qm", "fixture"]);
-    fs::create_dir_all(d.join("config/ferry")).unwrap();
-    fs::write(
-        d.join("config/ferry/machines.toml"),
-        "version = 2\n[machine.bench]\nssh = 'bench'\nplatform = 'x86_64-unknown-linux-gnu'\nhas = ['big', 'gpu']\nreserved_for = ['gpu']\n",
-    )
-    .unwrap();
-    let out = bounded_output(ferry(d).arg("recipes"));
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "check: just check; needs big, linux; may_run_elsewhere\nfmt: cargo fmt\nsay: sh -c 'echo '\\''hi there'\\''; exit 17' ''\n"
-    );
-    let out = bounded_output(ferry(d).arg("machines"));
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "bench: ssh bench, platform x86_64-unknown-linux-gnu, has big, gpu, reserved_for gpu\n"
-    );
-}
-
-#[test]
-fn a_stop_is_said_and_names_who_stopped_the_run() {
-    let scratch = tempfile::tempdir().unwrap();
-    let started = scratch.path().join("started");
-    let dir = fixture(&format!("touch {}; sleep 60", started.display()), "");
-    let err = scratch.path().join("err");
-    let mut caller = Caller(
-        ferry(dir.path())
-            .args(["run", "probe", "--local", "--timeout-seconds", "120"])
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&err).unwrap())
-            .spawn()
-            .unwrap(),
-    );
-    wait_until("the recipe started", || started.exists());
-    let id = only_receipt_file(dir.path())["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let out = bounded_output(ferry(dir.path()).args(["stop", &id]));
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
-    assert_eq!(
-        said(&out),
-        [format!(
-            "ferry: stop sent to run {id}; ferry follow {id} shows its end"
-        )]
-    );
-    wait_until("the caller ended", || {
-        caller.0.try_wait().unwrap().is_some()
-    });
-    let lines: Vec<String> = fs::read_to_string(&err)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    let n = lines.len();
-    assert!(n >= 2, "{lines:?}");
-    assert!(
-        lines[n - 2].starts_with("ferry: stopped: ferry stop (")
-            && lines[n - 2].ends_with(") with SIGTERM"),
-        "{lines:?}"
-    );
-    assert_eq!(lines[n - 1], format!("ferry: stopped, exit 143, run {id}"));
-    // A second stop is refused as a sentence with its next step.
-    let out = bounded_output(ferry(dir.path()).args(["stop", &id]));
-    assert_eq!(out.status.code(), Some(125));
-    assert_eq!(
-        said(&out),
-        [format!(
-            "ferry: run {id} is not running here; next: ferry record {id}"
-        )]
-    );
-}
-
-#[test]
-fn status_lines_carry_units_and_leave_nulls_out() {
-    let dir = fixture("true", "");
-    // Exclusive: the gate keeps naming this run after it ends.
-    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--exclusive"]));
-    assert_eq!(out.status.code(), Some(0));
-    let out = bounded_output(ferry(dir.path()).arg("status"));
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "{text}");
-    let disk = text.lines().next().unwrap();
-    assert!(
-        disk.starts_with("disk: ") && disk.contains("B free"),
-        "{text}"
-    );
-    for noise in ["null", "unreadable", "\"", "_ms", "bytes", "unknown"] {
-        assert!(!text.contains(noise), "{noise}: {text}");
-    }
-    // This caller labels its own seat with its workspace.
-    let repo = fs::canonicalize(dir.path()).unwrap();
-    assert!(
-        text.lines()
-            .any(|line| line.starts_with(&format!("seat default of {}: ", repo.display()))),
-        "{text}"
-    );
-}
-
-#[test]
-fn every_command_and_option_says_what_it_does() {
-    let dir = fixture("true", "");
-    let help = |args: &[&str]| {
-        let out = bounded_output(ferry(dir.path()).args(args).arg("-h"));
-        assert_eq!(out.status.code(), Some(0));
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    let top = help(&[]);
-    let mut pages = vec![(String::from("ferry"), top.clone())];
-    let commands: Vec<String> = top
-        .split("Commands:")
-        .nth(1)
-        .unwrap()
-        .split("\n\n")
-        .next()
-        .unwrap()
-        .lines()
-        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
-        .filter(|name| name != "help")
-        .collect();
-    assert!(commands.contains(&"run".to_owned()), "{top}");
-    for command in &commands {
-        pages.push((command.clone(), help(&[command])));
-    }
-    pages.push(("seats prune".into(), help(&["seats", "prune"])));
-    for (page, text) in &pages {
-        // Each entry: its name, then what it does, after two spaces or on
-        // the next, deeper line.
-        // Entries start 2 to 6 columns in (6: a long option alone); what
-        // they say starts further in.
-        let indent = |line: &str| line.len() - line.trim_start().len();
-        let lines: Vec<&str> = text.lines().collect();
-        for (at, line) in lines.iter().enumerate() {
-            let entry = Some(line.trim_start()).filter(|rest| {
-                (2..=6).contains(&indent(line))
-                    && (rest.starts_with(['-', '<', '[']) || rest.starts_with(char::is_alphabetic))
-            });
-            if let Some(entry) = entry {
-                // A description below is indented past every entry name,
-                // and is not itself an entry.
-                let below = lines.get(at + 1).copied().unwrap_or_default();
-                let described_below = indent(below) > 6 && !below.trim().is_empty();
-                assert!(
-                    entry.trim_end().contains("  ") || described_below,
-                    "{page}: {line:?} says nothing\n{text}"
-                );
-            }
-        }
-    }
-    let run = help(&["run"]);
-    for needed in ["default: HEAD", "124", "125", "Exit codes"] {
-        assert!(run.contains(needed), "{needed}: {run}");
-    }
-}
-
-#[test]
-fn follow_replays_a_finished_runs_output() {
-    let dir = fixture("true", "");
-    let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
-    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
-    let out = bounded_output(ferry(dir.path()).args(["follow", &id]));
-    assert_eq!(out.status.code(), Some(0));
-    assert!(
-        String::from_utf8_lossy(&out.stdout).starts_with("committed\n"),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-}
-
-// --- Nesting (SPEC §4, §12.10; ferry-xtx.2) ---
-
-/// A repository whose `nest` recipe starts `ferry run pass --local --seat
-/// inner` in `target` (default: this repository itself, whose place runs
-/// it), and prints that run's code.
-fn nesting(target: Option<&Path>) -> TempDir {
-    let dir = fixture("true", "");
-    let target = target.unwrap_or(dir.path());
-    let recipes = toml::to_string(&serde_json::json!({"recipe": {
-        "pass": {"command": ["sh", "-c", "echo committed"]},
-        "nest": {"command": ["sh", "-c", format!(
-            "cd '{}' && '{}' run pass --local --seat inner --wait-seconds 900; echo inner=$?",
-            target.display(),
-            env!("CARGO_BIN_EXE_ferry")
-        )]},
-    }}))
-    .unwrap();
-    fs::write(
-        dir.path().join("ferry.toml"),
-        format!("version=1\n{recipes}"),
-    )
-    .unwrap();
-    git(dir.path(), &["commit", "-qam", "nest"]);
-    dir
-}
-
-#[test]
-fn a_run_inside_a_run_on_its_own_place_is_refused_at_once() {
-    for exclusive in [false, true] {
-        let dir = nesting(None);
-        let mut command = ferry(dir.path());
-        command.args(["run", "nest", "--local"]);
-        if exclusive {
-            command.arg("--exclusive");
-        }
-        let started = Instant::now();
-        let out = bounded_output(&mut command);
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(out.status.code(), Some(0), "{said}");
-        assert!(said.contains("inner=125"), "exclusive={exclusive}: {said}");
-        assert!(
-            said.contains("nested run on the same place"),
-            "exclusive={exclusive}: {said}"
-        );
-        // At once: never the wait (900 s) for the locks its own run holds.
-        assert!(
-            started.elapsed() < Duration::from_secs(300),
-            "exclusive={exclusive}: took {:?}",
-            started.elapsed()
-        );
-    }
-}
-
-#[test]
-fn a_run_inside_a_run_on_another_place_goes_ahead() {
-    let other = fixture("true", "");
-    let dir = nesting(Some(other.path()));
-    let out = bounded_output(ferry(dir.path()).args(["run", "nest", "--local", "--exclusive"]));
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(out.status.code(), Some(0), "{said}");
-    assert!(
-        said.contains("committed") && said.contains("inner=0"),
-        "{said}"
-    );
-    assert!(!said.contains("nested run"), "{said}");
-}
-
-// --- needs ⊆ has on every route (SPEC §3; ferry-ryl) ---
-
-#[test]
-fn needs_are_checked_on_the_local_route() {
-    let dir = tempfile::tempdir().unwrap();
-    let d = dir.path();
-    git(d, &["init"]);
-    git(d, &["config", "user.name", "Ferry Test"]);
-    git(d, &["config", "user.email", "ferry@example.invalid"]);
-    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    fs::write(
-        d.join("ferry.toml"),
-        format!(
-            "version = 2\n[recipe.gpu]\ncommand = ['true']\nneeds = ['gpu']\n[recipe.here]\ncommand = ['echo', 'here']\nneeds = ['{os}', '{arch}', '{os}-{arch}', 'status', 'exclusive']\n"
-        ),
-    )
-    .unwrap();
-    git(d, &["add", "-A"]);
-    git(d, &["commit", "-qm", "fixture"]);
-    // No machines, then --local: the same refusal, naming what is missing.
-    for args in [
-        &["run", "gpu", "--json"][..],
-        &["run", "gpu", "--local", "--json"],
-    ] {
-        let out = bounded_output(ferry(d).args(args));
-        let record = receipt(&out);
-        assert_eq!(out.status.code(), Some(125), "{args:?}: {record}");
-        let reason = record["reason"].as_str().unwrap();
-        // What it detects, in order (a sorted set).
-        let facts = std::collections::BTreeSet::from([
-            os.to_owned(),
-            arch.to_owned(),
-            format!("{os}-{arch}"),
-        ]);
-        let facts = facts.into_iter().collect::<Vec<_>>().join(", ");
-        assert!(
-            reason.starts_with(&format!(
-                "local does not have gpu (it has {facts}, and its Ferry's capabilities)"
-            )),
-            "{args:?}: {record}"
-        );
-    }
-    // What it detects and what this Ferry can do; exclusive aside.
-    let out = bounded_output(ferry(d).args(["run", "here", "--local"]));
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "here\n");
 }

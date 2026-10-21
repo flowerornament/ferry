@@ -85,3 +85,20 @@ final record, and `ferry record <id>` completes the receipt later.
   JSON it wrote, and read where they are used.
 - **Every fallible point has a fault point** (`execution::fail_at`, debug
   builds only) and a control that injects it.
+
+## Tests
+
+Unit tests sit beside the code they test. The real-CLI controls in `tests/`
+are one file per SPEC area, each a separate test binary sharing
+`tests/common` (one `fixture`, the fake ssh transport, the guards that stop
+what a control started by its pid, and the bounded waits):
+
+| File | Area |
+|---|---|
+| `route_contract.rs` | what may run and where: the exact commit, adapters and both config versions, the environment, `needs ⊆ has`, reserved machines, nesting (SPEC §3, §10) |
+| `transport_contract.rs` | caller and place: describe, capabilities and the pinned binary, shipping, the push watchdog, reply bounds, submit and its refusals (§6) |
+| `session_contract.rs` | a run on its place: the supervisor and client, the session stop and survivors, locks and the exclusive host, the deadline, output, collection and artifacts, the record cycle (§5, §7, §11) |
+| `seats_contract.rs` | prune and retire, one-run seats, the seat cap, the seat book, run history, admission (§9) |
+| `status_contract.rs` | `ferry status` (§4) |
+| `cli_contract.rs` | what the caller prints, help, and the record-reading commands (§4) |
+| `marker_unreadable.rs` | the marker pass when a process cannot be read (§7) |
