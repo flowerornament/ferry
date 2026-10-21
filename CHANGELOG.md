@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.6 - 2026-10-21
+
 - **Small readability fixes.** A busy seat gives its holder's age in seconds
   under two minutes ("submitted 40 s ago", not "0 min ago"), and
   `ferry recipes` shell-quotes each argument, so
