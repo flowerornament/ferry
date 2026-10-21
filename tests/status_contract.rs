@@ -125,14 +125,87 @@ fn status_names_runs_the_gate_and_leftovers() {
                 .is_some_and(|s| s.iter().any(|s| s["last_run"] == leaver))
     };
     let deadline = common::startup_deadline();
-    loop {
+    let seen = loop {
         let seen = status();
         if holds(&seen) {
-            break;
+            break seen;
         }
         assert!(Instant::now() < deadline, "never held together: {seen}");
         thread::sleep(Duration::from_millis(100));
-    }
+    };
+    // One schema on every kernel (SPEC §12.18): this golden is asserted in
+    // the Mac and the Linux cells alike, so both give the same keys.
+    let mut keys = std::collections::BTreeSet::new();
+    schema(&seen, "", &mut keys);
+    let golden: std::collections::BTreeSet<String> = [
+        "disk",
+        "disk.available",
+        "disk.floor_bytes",
+        "disk.policy",
+        "disk.refusing",
+        "disk.seat_cap_bytes",
+        "gate",
+        "gate.holder",
+        "gate.requesters",
+        "gate.requesters[]",
+        "leftovers",
+        "leftovers.processes",
+        "leftovers.processes[]",
+        "leftovers.processes[].command",
+        "leftovers.processes[].pid",
+        "leftovers.processes[].run",
+        "leftovers.processes[].start",
+        "leftovers.record_none",
+        "leftovers.record_none[]",
+        "leftovers.record_none[].command",
+        "leftovers.record_none[].pid",
+        "leftovers.record_none[].run",
+        "leftovers.record_none[].start",
+        "leftovers.unreadable",
+        "runs",
+        "runs[]",
+        "runs[].deadline_ms",
+        "runs[].exclusive",
+        "runs[].id",
+        "runs[].phase",
+        "runs[].recipe",
+        "runs[].recipe[]",
+        "runs[].seat",
+        "runs[].submitted_ms",
+        "runs[].supervisor",
+        "seats",
+        "seats[]",
+        "seats[].bytes",
+        "seats[].key",
+        "seats[].last_run",
+        "seats[].measured",
+        "seats[].outcome",
+        "seats[].workspace",
+        "seats[].workspace.repo_path",
+        "seats[].workspace.seat",
+        "tombstones",
+        "tombstones[]",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    // Every object key is always there; an array's element keys only when
+    // it has elements, and only these.
+    let required: std::collections::BTreeSet<_> = golden
+        .iter()
+        .filter(|key| !key.contains("[]"))
+        .cloned()
+        .collect();
+    assert!(
+        keys.is_subset(&golden),
+        "unknown keys {:?}: {seen}",
+        keys.difference(&golden)
+    );
+    assert!(
+        required.is_subset(&keys),
+        "missing keys {:?}: {seen}",
+        required.difference(&keys)
+    );
     fs::write(&release, "").unwrap();
     wait_until("every run ended", || {
         status()["runs"].as_array().unwrap().is_empty()
@@ -166,4 +239,28 @@ fn status_lines_carry_units_and_leave_nulls_out() {
             .any(|line| line.starts_with(&format!("seat default of {}: ", repo.display()))),
         "{text}"
     );
+}
+
+/// Every key path in `value`, arrays as `[]`, objects as `.`.
+fn schema(value: &serde_json::Value, at: &str, keys: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map {
+                let path = if at.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{at}.{key}")
+                };
+                keys.insert(path.clone());
+                schema(inner, &path, keys);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                keys.insert(format!("{at}[]"));
+                schema(item, &format!("{at}[]"), keys);
+            }
+        }
+        _ => {}
+    }
 }

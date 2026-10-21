@@ -1355,7 +1355,17 @@ fn the_deadline_ends_a_run_with_no_client() {
     }
     let scratch = tempfile::tempdir().unwrap();
     let started = scratch.path().join("started");
-    let dir = fixture(&format!("touch {}; sleep 600", started.display()), "");
+    let sleeper = scratch.path().join("sleeper");
+    // The recipe and a process it started: both are the session.
+    let dir = fixture(
+        &format!(
+            "sleep 600 & echo $! > {s}; echo $$ > {r}.tmp; mv {r}.tmp {r}; wait",
+            s = sleeper.display(),
+            r = started.display()
+        ),
+        "",
+    );
+    let _sleeper = Owned(sleeper.clone());
     // The deadline, 30 s after submit (long enough to start under load),
     // ends it; the timeout, 600 s, never could within this test.
     let mut caller = ferry(dir.path())
@@ -1391,9 +1401,20 @@ fn the_deadline_ends_a_run_with_no_client() {
         30_000,
         "{host}"
     );
-    // The session was stopped with it.
+    // The session was stopped with it: the recipe and what it started.
     let owners = dir.path().join(".ferry/local/v1/owners");
     assert!(!owners.exists() || fs::read_dir(&owners).unwrap().count() == 0);
+    let pid = |path: &Path| {
+        fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap()
+    };
+    let (recipe, sleeping) = (pid(&started), pid(&sleeper));
+    wait_until("the session's processes are gone", || {
+        gone(recipe) && gone(sleeping)
+    });
 }
 
 /// A busy seat refuses at once (SPEC §12.7): 125, naming the run that
@@ -2871,20 +2892,38 @@ fn a_recipes_escapee_is_listed_by_its_marker() {
     );
 }
 
-/// The collect hook's escapee carries the run's own id (SPEC §12.9).
+/// The collect hook's escapee (SPEC §12.9), keeping its fds as the
+/// recipe's does: it carries the run's own id, is listed by pid, start and
+/// command, and holds the seat, so the next run is refused naming the run
+/// it outlived.
 #[test]
 fn a_collect_hooks_escapee_is_listed_by_its_marker() {
     let scratch = tempfile::tempdir().unwrap();
     let pidfile = scratch.path().join("escapee.pid");
-    let dir = with_collect(&escapee(&pidfile, true, false), "echo ran");
+    let dir = with_collect(&escapee(&pidfile, false, false), "echo ran");
     let escaped = Owned(pidfile);
     let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
-    let record = receipt(&out);
-    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let first = receipt(&out);
+    assert_eq!(first["outcome"], "ran-pass", "{first}");
     let pid = escaped.pid().unwrap();
-    if let Some(list) = survivors(&record) {
-        assert!(list.iter().any(|s| s["pid"] == pid), "{record}");
+    if let Some(list) = survivors(&first) {
+        assert!(
+            list.iter().any(|s| s["pid"] == pid
+                && s["start"].is_number()
+                && s["command"].as_str().is_some_and(|c| c.contains("python"))),
+            "{first}"
+        );
     }
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"].as_str().unwrap().contains(&format!(
+            "held after run {} ended",
+            first["id"].as_str().unwrap()
+        )),
+        "{record}"
+    );
 }
 
 /// An escapee that closed its fds (SPEC §12.16) is listed, and holds
@@ -2901,10 +2940,8 @@ fn an_escapee_without_fds_is_listed_and_one_without_its_marker_is_not() {
         let record = receipt(&out);
         assert_eq!(record["outcome"], "ran-pass", "{record}");
         let pid = escaped.pid().unwrap();
-        // `kill(pid, 0)`, not `gone`: `gone` spawns `ps`, which the Darwin
-        // Nix build cannot, and would then call a live process gone.
         assert!(
-            kill(Pid::from_raw(pid), None).is_ok(),
+            !gone(pid),
             "the escapee (cleared {cleared}) ended early: {record}"
         );
         if let Some(list) = survivors(&record) {
@@ -2912,6 +2949,18 @@ fn an_escapee_without_fds_is_listed_and_one_without_its_marker_is_not() {
         }
         let out = bounded_output(ferry(dir.path()).args(["run", "pass", "--local", "--json"]));
         assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+        // `status` lists it as a leftover until it is stopped (SPEC §12.16).
+        let listed = || {
+            let out = bounded_output(ferry(dir.path()).args(["status", "--json"]));
+            let seen: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            seen["leftovers"]["processes"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|p| p["pid"] == pid))
+        };
+        assert_eq!(listed(), !cleared, "cleared {cleared}");
+        kill(Pid::from_raw(pid), Signal::SIGKILL).unwrap();
+        wait_until("the escapee is gone", || gone(pid));
+        assert!(!listed(), "cleared {cleared}: listed after it was stopped");
     }
 }
 
@@ -2992,6 +3041,42 @@ fn a_marker_pass_that_cannot_see_everything_is_unknown() {
             "{points}: {record}"
         );
     }
+}
+
+/// SPEC §12.16a, macOS: a platform binary the recipe started, left running
+/// out of its session with the run's marker, cannot be read (macOS
+/// withholds its environment): the pass is `unknown`, never `[]`, the
+/// error says why, and the run's outcome is unchanged.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_platform_binary_the_recipe_left_makes_the_pass_unknown() {
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("sleep.pid");
+    // setsid, then exec /bin/sleep: the same pid, now a platform binary
+    // carrying the marker.
+    let dir = fixture(
+        &format!(
+            "python3 -c 'import os\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\nos.execv(\"/bin/sleep\", [\"sleep\", \"600\"])' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+            p = pidfile.display()
+        ),
+        "",
+    );
+    let left = Owned(pidfile);
+    let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
+    let record = receipt(&out);
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(
+        kill(Pid::from_raw(left.pid().unwrap()), None).is_ok(),
+        "the platform binary ended early: {record}"
+    );
+    assert_eq!(record["custody"]["survivors"], "unknown", "{record}");
+    let error = record["custody"]["error"].as_str().unwrap_or_default();
+    let withheld = error
+        .split("its environment is withheld: ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse::<u32>().ok());
+    assert!(withheld >= Some(1), "{record}");
 }
 
 /// A stop ends the recipe, and collect still runs after it under the same
@@ -3578,4 +3663,79 @@ fn a_stop_that_cannot_be_recorded_is_refused_and_the_run_goes_on() {
     let record = only_record(&dir.path().join(".ferry/receipts"));
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     drop(caller);
+}
+
+/// SPEC §12.12: fault injection at every fallible point keeps 1–3. Each
+/// point Ferry declares (every `inject("…")` and `fail_at("…")` in its
+/// source, so a new one is swept too) fails a `--once` local run in turn:
+/// one run (one run folder at most), and if the place reserved it,
+/// exactly one final record once it is read, with a known outcome.
+#[test]
+fn every_fault_point_keeps_one_run_and_one_final_record() {
+    if !debug_only() {
+        return;
+    }
+    let mut points = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
+        let text = fs::read_to_string(entry.unwrap().path()).unwrap();
+        for call in ["inject(\"", "fail_at(\""] {
+            for (at, _) in text.match_indices(call) {
+                let rest = &text[at + call.len()..];
+                if let Some(end) = rest.find('"') {
+                    points.insert(rest[..end].to_owned());
+                }
+            }
+        }
+    }
+    // Its own bounded control: a hang here costs the marker bound each time.
+    points.remove("marker-hang");
+    assert!(points.len() > 30, "{points:?}");
+    for point in &points {
+        eprintln!("sweep: {point}");
+        let dir = fixture("echo ran", "");
+        // A point that makes the place look gone (a dropped follow, a
+        // failed record read) is given up on in seconds, not minutes.
+        let out = bounded_output(
+            ferry(dir.path())
+                .env("FERRY_FAIL_AT", point)
+                .env("FERRY_UNREACHABLE_MS", "3000")
+                .args(["run", "probe", "--local", "--json", "--once"]),
+        );
+        let record = receipt(&out);
+        let id = record["id"].as_str().unwrap();
+        let state = dir.path().join(".ferry/local/v1");
+        let runs = fs::read_dir(state.join("runs")).map_or(0, Iterator::count);
+        assert!(runs <= 1, "{point}: {runs} run folders: {record}");
+        if !state.join(format!("records/{id}.reserved.json")).exists()
+            && !state.join(format!("records/{id}.json")).exists()
+        {
+            // Refused before the place reserved anything: nothing ran.
+            assert_eq!(record["outcome"], "refused", "{point}: {record}");
+            continue;
+        }
+        // Read until final: a live run ends, a dead one is reconciled.
+        let mut last = String::new();
+        wait_until(&format!("{point}: a final record"), || {
+            let out = ferry(dir.path()).args(["record", id]).output().unwrap();
+            last = String::from_utf8_lossy(&out.stdout).into_owned();
+            out.status.code() != Some(3)
+        });
+        let finals: Vec<_> = fs::read_dir(state.join("records"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(id) && !name.contains("reserved"))
+            .collect();
+        assert_eq!(finals, [format!("{id}.json")], "{point}: {last}");
+        let host: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.join(format!("records/{id}.json"))).unwrap())
+                .unwrap();
+        assert!(
+            [
+                "ran-pass", "ran-fail", "refused", "lost", "timeout", "stopped"
+            ]
+            .contains(&host["outcome"].as_str().unwrap_or_default()),
+            "{point}: {host}"
+        );
+    }
 }

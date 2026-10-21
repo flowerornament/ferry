@@ -259,6 +259,9 @@ fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
         let gone = workspace(dir.path(), "gone");
         assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
         let key = key_of(dir.path(), &gone);
+        let place = dir.path().join("host/.local/state/ferry/v1");
+        // Warm state the retired seat carries into its tombstone.
+        fs::write(place.join("seats").join(&key).join("warm"), "").unwrap();
         fs::remove_dir_all(&gone).unwrap();
         let out = remote_command(dir.path(), ".local/bin/ferry", &["seats", "prune"])
             .env("FERRY_FAIL_AT", point)
@@ -273,7 +276,6 @@ fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
                 .any(|line| line["retired_ms"].is_u64()),
             "{point}: a failed retire left a tombstone"
         );
-        let place = dir.path().join("host/.local/state/ferry/v1");
         let tombstones = || {
             fs::read_dir(place.join("seats"))
                 .unwrap()
@@ -302,6 +304,17 @@ fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
                 .any(|seat| seat["key"].as_str().unwrap().starts_with('.')),
             "a tombstone counted as a seat: {seen}"
         );
+        // The next run on that seat (the same workspace path, so the same
+        // key) passes cold: a new seat, nothing of the tombstone's.
+        let again = workspace(dir.path(), "gone");
+        assert_eq!(remote_pass(dir.path(), &again).status.code(), Some(0));
+        assert!(place.join("seats").join(&key).is_dir(), "{point}");
+        assert!(
+            !place.join("seats").join(&key).join("warm").exists(),
+            "{point}: warm"
+        );
+        assert_eq!(tombstones().len(), 1, "{point}");
+        fs::remove_dir_all(&again).unwrap();
         let (code, said) = prune(dir.path(), ".local/bin/ferry");
         assert_eq!(code, Some(0), "{point}: {said}");
         assert!(said.contains("retired"), "{said}");
@@ -316,15 +329,53 @@ fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
 /// each; records and run folders stay. Item 21: a book that predates a run
 /// on the seat (the place's `used` is newer) is refused `used`.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn seats_prune_idle_retires_only_what_is_idle_on_both_clocks() {
     let dir = fixture("true", "");
     let names = ["idle", "recent", "reused", "ageless", "busy"];
     let mut keys = BTreeMap::new();
+    let mut idle_run = (PathBuf::new(), String::new());
     for name in names {
         let repo = workspace(dir.path(), name);
-        assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+        let out = remote_pass(dir.path(), &repo);
+        assert_eq!(out.status.code(), Some(0));
+        if name == "idle" {
+            idle_run = (
+                repo.clone(),
+                receipt(&out)["id"].as_str().unwrap().to_owned(),
+            );
+        }
         keys.insert(name, key_of(dir.path(), &repo));
     }
+    // Another caller's seat on the same place, idle on the place's clock:
+    // its book is not this caller's, so this prune never considers it.
+    let foreign = workspace(dir.path(), "foreign");
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .current_dir(&foreign)
+    .env("XDG_STATE_HOME", dir.path().join("foreign-state"))
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
+    let foreign_key = fs::read_to_string(dir.path().join("foreign-state/ferry/seats.jsonl"))
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let line: serde_json::Value = serde_json::from_str(line).ok()?;
+            line["key"].as_str().map(str::to_owned)
+        })
+        .unwrap();
+    let used = dir
+        .path()
+        .join("host/.local/state/ferry/v1/seats")
+        .join(&foreign_key)
+        .join("used");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&used).unwrap()).unwrap();
+    value["ms"] = serde_json::json!(now_ms() - 2 * DAY_MS);
+    fs::write(&used, value.to_string()).unwrap();
     age(dir.path(), &keys["idle"], 2 * DAY_MS, false);
     age(dir.path(), &keys["reused"], 2 * DAY_MS, true);
     age(dir.path(), &keys["busy"], 2 * DAY_MS, false);
@@ -379,7 +430,31 @@ fn seats_prune_idle_retires_only_what_is_idle_on_both_clocks() {
             .iter()
             .any(|line| line["key"] == keys["idle"].as_str() && line["retired_ms"].is_u64())
     );
+    // Never another caller's seat, however idle.
+    assert!(
+        seat_dir(&place, &foreign_key).join("checkout").exists(),
+        "{said}"
+    );
+    // The retired seat's run stays readable: its receipt, record and output.
+    let (repo, id) = &idle_run;
+    let out = remote_command(dir.path(), ".local/bin/ferry", &["record", id])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["state"], "final", "{record}");
+    assert!(place.join(format!("runs/{id}/output.log")).exists());
     drop(held);
+}
+
+fn seat_dir(place: &Path, key: &str) -> PathBuf {
+    place.join("seats").join(key)
 }
 
 /// SPEC §9: no retire, by hand or by itself, deletes while an exclusive run
@@ -448,6 +523,14 @@ fn a_once_run_retires_its_seat_after_its_final_record() {
         record,
         "the record changed after final"
     );
+    // Exactly one final record, and no reservation left beside it.
+    let records: Vec<String> = fs::read_dir(place.join("records"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&id))
+        .collect();
+    assert_eq!(records, [format!("{id}.json")], "{records:?}");
     if !debug_only() {
         return;
     }
@@ -683,6 +766,113 @@ fn a_run_prunes_its_places_idle_seats_by_itself() {
     drop(lock);
     let out = remote_pass(dir.path(), dir.path());
     assert!(String::from_utf8_lossy(&out.stderr).contains("ferry: pruned test-host: retired 1"));
+}
+
+/// SPEC §12 item 23, the rest: without the key nothing is retired; with an
+/// exclusive run holding the place, the automatic prune retires nothing;
+/// with the place unreachable at the run's end, the run keeps its own code
+/// and `--json`, and nothing is retired.
+#[test]
+fn an_automatic_prune_retires_nothing_without_its_key_beside_an_exclusive_run_or_unreached() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (started, release) = (
+        scratch.path().join("started"),
+        scratch.path().join("release"),
+    );
+    // `probe <name>` (routable) says it started and holds until released.
+    let dir = fixture("true", "");
+    with_project(
+        dir.path(),
+        &format!(
+            "version = 1\n[recipe.pass]\ncommand = ['true']\nroutable = true\n[recipe.probe]\ncommand = ['sh', '-c', 'touch {s}.$0; while [ ! -e {r}.$0 ]; do sleep 0.1; done']\nroutable = true\n",
+            s = started.display(),
+            r = release.display()
+        ),
+    );
+    let old = workspace(dir.path(), "old");
+    assert_eq!(remote_pass(dir.path(), &old).status.code(), Some(0));
+    let old_key = key_of(dir.path(), &old);
+    let seat = dir
+        .path()
+        .join("host/.local/state/ferry/v1/seats")
+        .join(&old_key);
+    let unclaimed = || {
+        let _ = fs::remove_file(dir.path().join("state/ferry/pruned.json"));
+        age(dir.path(), &old_key, 2 * DAY_MS, false);
+    };
+    // Without the key: an old seat stays.
+    unclaimed();
+    let out = remote_pass(dir.path(), dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("pruned"));
+    assert!(seat.exists(), "retired without the key");
+    fs::write(
+        dir.path().join("machines-top.toml"),
+        "delete_unused_checkouts_after_days = 1
+",
+    )
+    .unwrap();
+    let hold = |name: &str, exclusive: bool| {
+        let mut args = vec![
+            "run",
+            "probe",
+            "--on",
+            "test-host",
+            "--json",
+            "--seat",
+            name,
+        ];
+        if exclusive {
+            args.push("--exclusive");
+        }
+        args.extend(["--", name]);
+        let child = remote_command(dir.path(), ".local/bin/ferry", &args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_until("the holding run started", || {
+            started.with_extension(name).exists()
+        });
+        child
+    };
+    // An exclusive run holds the place: the prune after a run is refused.
+    let holder = hold("holder", true);
+    unclaimed();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &[
+            "run",
+            "pass",
+            "--on",
+            "test-host",
+            "--json",
+            "--wait-seconds",
+            "1",
+        ],
+    )
+    .output()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // One summary line: the exclusive refusal is kept, not retired.
+    assert!(
+        stderr.contains("ferry: pruned test-host: retired 0 ") && stderr.contains("kept 1"),
+        "{stderr}"
+    );
+    assert!(seat.exists(), "retired beside an exclusive run: {stderr}");
+    fs::write(release.with_extension("holder"), "").unwrap();
+    assert!(holder.wait_with_output().unwrap().status.success());
+    // Unreachable at the run's end: its own code and --json, nothing retired.
+    unclaimed();
+    let caller = hold("late", false);
+    fs::write(dir.path().join("host/info-fails"), "").unwrap();
+    fs::write(release.with_extension("late"), "").unwrap();
+    let out = caller.wait_with_output().unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    assert!(seat.exists(), "retired an unreachable place's seat");
 }
 
 /// SPEC §12 item 23: two runs ending together prune their place once: the
@@ -1811,7 +2001,10 @@ fn run_history_older_than_its_days_is_deleted_after_the_record_is_final() {
     let id = receipt(&out)["id"].as_str().unwrap().to_owned();
     let (passes, deleted) = settled(dir.path(), &root, &id);
     let logged = format!("{passes:?}");
-    assert_eq!(deleted, 3, "{logged}");
+    // SPEC §12.22's four runs delete 2 (old-final, and old-lost once
+    // reconciled); this fixture adds a fifth, old-both, for the clause on a
+    // final record with a stale reservation beside it: 2 + 1.
+    assert_eq!(deleted, 2 + 1, "{logged}");
     for gone in [&old, &lost, &both] {
         assert!(!gone.exists(), "{logged}: {}", gone.display());
     }

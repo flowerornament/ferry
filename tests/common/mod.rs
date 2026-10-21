@@ -115,6 +115,16 @@ pub fn debug_only() -> bool {
     false
 }
 
+/// A control that cannot run here says why; in a cell that claims every
+/// control (`FERRY_TEST_STRICT=1`) that is a failure, not a pass.
+pub fn skip(why: &str) {
+    assert!(
+        std::env::var_os("FERRY_TEST_STRICT").is_none(),
+        "skipped in a cell that claims this control: {why}"
+    );
+    eprintln!("skipped: {why}");
+}
+
 /// A repository with `pass` and `fail` (both may run elsewhere) and a
 /// `probe` recipe running `script`; `extra` comes before the recipes.
 pub fn fixture(script: &str, extra: &str) -> TempDir {
@@ -429,6 +439,8 @@ pub fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     // A file `unreachable` on the host fails every follow, as a dead link;
     // a file `fail-record-once` fails the next `place record` of a final
     // record, once (a read while the run waits is narration, not the verdict);
+    // A file `info-fails` on the host fails every host-info (exit 255), a
+    // place that stopped answering;
     // FERRY_TEST_UNPIN: host-info answers without `pinned`, as a place
     // from before it;
     // FERRY_TEST_SLOW_INFO names a file: while it exists, host-info first
@@ -448,7 +460,7 @@ pub fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     // first prints a progress byte every 0.2 s for that long, then pushes;
     // FERRY_TEST_HANG_INIT names a file: the store setup writes its pid
     // there and hangs.
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_FAIL_PUSH\" ]; then echo \"fatal: the place refused the push\" >&2; exit 1; fi; if [ -n \"$FERRY_TEST_PUSH_LEAVER\" ]; then sleep 120 & echo $! > \"$FERRY_TEST_PUSH_LEAVER\"; fi; if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi; if [ -n \"$FERRY_TEST_HANG_PUSH\" ]; then echo $$ > \"$FERRY_TEST_HANG_PUSH\"; case \" $* \" in *LogLevel=ERROR*) ;; *) (n=0; while [ $n -lt 240 ]; do echo \"debug1: an ssh diagnostic\" >&2; sleep 0.5; n=$((n + 1)); done) & ;; esac; exec sleep 120; fi; if [ -n \"$FERRY_TEST_THROTTLE_PUSH\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; t=$(mktemp); { while :; do dd bs=32768 count=1 of=\"$t\" 2>/dev/null; [ -s \"$t\" ] || break; cat \"$t\"; sleep 0.1; done; rm -f \"$t\"; } | sh -c \"$last\"; exit $?; fi; if [ -n \"$FERRY_TEST_TRICKLE_PUSH\" ]; then n=0; while [ $n -lt $((FERRY_TEST_TRICKLE_PUSH * 5)) ]; do printf . >&2; sleep 0.2; n=$((n + 1)); done; fi;; *git-upload-pack*) if [ -n \"$FERRY_TEST_HANG_LSREMOTE\" ]; then echo $$ > \"$FERRY_TEST_HANG_LSREMOTE\"; exec sleep 120; fi;; *\"git init\"*) if [ -n \"$FERRY_TEST_HANG_INIT\" ]; then echo $$ > \"$FERRY_TEST_HANG_INIT\"; exec sleep 30; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ] && [ -e \"$FERRY_TEST_HOST/.local/state/ferry/v1/records/$(printf %s \"${last##* }\" | tr -d \"'\").json\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_UNPIN\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; sh -c \"$last\" | sed 's/\"pinned\",//; s/,\"pinned\"//'; exit 0; fi; if [ -n \"$FERRY_TEST_SLOW_INFO\" ] && [ -e \"$FERRY_TEST_SLOW_INFO\" ]; then sleep \"$(cat \"$FERRY_TEST_SLOW_INFO\")\"; fi; if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi; if [ -n \"$FERRY_TEST_HOLD_PIPE\" ]; then sleep 600 & echo $! > \"$FERRY_TEST_HOLD_PIPE\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_FAIL_PUSH\" ]; then echo \"fatal: the place refused the push\" >&2; exit 1; fi; if [ -n \"$FERRY_TEST_PUSH_LEAVER\" ]; then sleep 120 & echo $! > \"$FERRY_TEST_PUSH_LEAVER\"; fi; if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi; if [ -n \"$FERRY_TEST_HANG_PUSH\" ]; then echo $$ > \"$FERRY_TEST_HANG_PUSH\"; case \" $* \" in *LogLevel=ERROR*) ;; *) (n=0; while [ $n -lt 240 ]; do echo \"debug1: an ssh diagnostic\" >&2; sleep 0.5; n=$((n + 1)); done) & ;; esac; exec sleep 120; fi; if [ -n \"$FERRY_TEST_THROTTLE_PUSH\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; t=$(mktemp); { while :; do dd bs=32768 count=1 of=\"$t\" 2>/dev/null; [ -s \"$t\" ] || break; cat \"$t\"; sleep 0.1; done; rm -f \"$t\"; } | sh -c \"$last\"; exit $?; fi; if [ -n \"$FERRY_TEST_TRICKLE_PUSH\" ]; then n=0; while [ $n -lt $((FERRY_TEST_TRICKLE_PUSH * 5)) ]; do printf . >&2; sleep 0.2; n=$((n + 1)); done; fi;; *git-upload-pack*) if [ -n \"$FERRY_TEST_HANG_LSREMOTE\" ]; then echo $$ > \"$FERRY_TEST_HANG_LSREMOTE\"; exec sleep 120; fi;; *\"git init\"*) if [ -n \"$FERRY_TEST_HANG_INIT\" ]; then echo $$ > \"$FERRY_TEST_HANG_INIT\"; exec sleep 30; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ] && [ -e \"$FERRY_TEST_HOST/.local/state/ferry/v1/records/$(printf %s \"${last##* }\" | tr -d \"'\").json\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -e \"$FERRY_TEST_HOST/info-fails\" ]; then exit 255; fi; if [ -n \"$FERRY_TEST_UNPIN\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; sh -c \"$last\" | sed 's/\"pinned\",//; s/,\"pinned\"//'; exit 0; fi; if [ -n \"$FERRY_TEST_SLOW_INFO\" ] && [ -e \"$FERRY_TEST_SLOW_INFO\" ]; then sleep \"$(cat \"$FERRY_TEST_SLOW_INFO\")\"; fi; if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi; if [ -n \"$FERRY_TEST_HOLD_PIPE\" ]; then sleep 600 & echo $! > \"$FERRY_TEST_HOLD_PIPE\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();

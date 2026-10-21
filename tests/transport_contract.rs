@@ -1544,7 +1544,7 @@ fn a_binary_flipped_between_describe_and_submit_is_refused_then_runs() {
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
     if !another_build(&dir.path().join("flipped")) {
-        eprintln!("skipped: no codesign here");
+        skip("no codesign here to make another build");
         return;
     }
     let flipped = sha256(&fs::read(dir.path().join("flipped")).unwrap());
