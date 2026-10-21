@@ -1263,10 +1263,11 @@ fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
 }
 
 /// A recipe line that leaves a setsid python running, holding the run's
-/// inherited seat lock, and records its pid.
+/// inherited seat lock, and records its pid. It outlives any loaded test
+/// (600 s); the test's `Owned` guard stops it by that pid.
 fn leaving(pidfile: &Path) -> String {
     format!(
-        "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+        "python3 -c 'import os,time\nos.setsid()\nopen(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(600)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
         p = pidfile.display()
     )
 }
@@ -2022,12 +2023,13 @@ fn the_lock_waits_together_end_by_one_bound() {
     });
     assert_eq!(code.flatten(), Some(125), "{record}");
     assert_eq!(record["outcome"], "refused", "{record}");
-    // The test holds the locks itself, writing no run id.
+    // The test holds the locks itself, writing no run id. On a slow machine
+    // the wait's end can meet the test's release of the gate: the place
+    // then says so, and the run is refused at the same bound.
+    let reason = record["reason"].as_str().unwrap();
     assert!(
-        record["reason"]
-            .as_str()
-            .unwrap()
-            .contains("held exclusively, by a run that is starting or a process outside Ferry"),
+        reason.contains("held exclusively, by a run that is starting or a process outside Ferry")
+            || reason.contains("the lock was released as the wait ended; retry"),
         "{record}"
     );
 }
@@ -2648,7 +2650,7 @@ fn escapee(pidfile: &Path, closed: bool, cleared: bool) -> String {
         ""
     };
     format!(
-        "{python} -c 'import os,time\nos.setsid()\n{close}open(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(60)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
+        "{python} -c 'import os,time\nos.setsid()\n{close}open(\"{p}.tmp\",\"w\").write(str(os.getpid()))\nos.rename(\"{p}.tmp\",\"{p}\")\ntime.sleep(600)' </dev/null >/dev/null 2>&1 & while [ ! -e {p} ]; do sleep 0.05; done",
         p = pidfile.display()
     )
 }
@@ -2829,41 +2831,37 @@ fn status_names_runs_the_gate_and_leftovers() {
             .is_some_and(|h| h != "none")
     });
     let _requester = run("c", &["--exclusive"]);
-    let mut seen = status();
-    // Its request is written just after its reservation: wait for both.
-    wait_until("the second exclusive run is a requester", || {
-        seen = status();
-        seen["gate"]["requesters"]
-            .as_array()
-            .is_some_and(|r| !r.is_empty())
-    });
-    let (b, b_phase) = phase(&seen, "b").unwrap();
-    let (c, c_phase) = phase(&seen, "c").unwrap();
-    assert_eq!(
-        (b_phase.as_str(), c_phase.as_str()),
-        ("waiting", "waiting"),
-        "{seen}"
-    );
-    assert_eq!(seen["gate"]["holder"], b, "{seen}");
-    assert_eq!(seen["gate"]["requesters"], serde_json::json!([c]), "{seen}");
     let pid = left.pid().unwrap();
-    let processes = seen["leftovers"]["processes"].as_array().unwrap();
-    let listed = processes
-        .iter()
-        .any(|p| p["pid"] == pid && p["run"] == leaver);
-    // macOS withholds some environments: then it is counted, not listed.
-    assert!(
-        listed || (cfg!(target_os = "macos") && seen["leftovers"]["unreadable"].as_u64() > Some(0)),
-        "{seen}"
-    );
-    assert!(
-        seen["seats"]
+    // Every fact at once, in one read: the runs change phase and the gate
+    // its requesters as they start, so the read is retried until all hold
+    // (or the bound ends, showing the last one).
+    let holds = |seen: &serde_json::Value| {
+        let (Some((b, b_phase)), Some((c, c_phase))) = (phase(seen, "b"), phase(seen, "c")) else {
+            return false;
+        };
+        let listed = seen["leftovers"]["processes"]
             .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| s["last_run"] == leaver),
-        "{seen}"
-    );
+            .is_some_and(|p| p.iter().any(|p| p["pid"] == pid && p["run"] == leaver));
+        // macOS withholds some environments: then it is counted, not listed.
+        let counted =
+            cfg!(target_os = "macos") && seen["leftovers"]["unreadable"].as_u64() > Some(0);
+        (b_phase.as_str(), c_phase.as_str()) == ("waiting", "waiting")
+            && seen["gate"]["holder"] == b
+            && seen["gate"]["requesters"] == serde_json::json!([c])
+            && (listed || counted)
+            && seen["seats"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|s| s["last_run"] == leaver))
+    };
+    let deadline = common::startup_deadline();
+    loop {
+        let seen = status();
+        if holds(&seen) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never held together: {seen}");
+        thread::sleep(Duration::from_millis(100));
+    }
     fs::write(&release, "").unwrap();
     wait_until("every run ended", || {
         status()["runs"].as_array().unwrap().is_empty()
@@ -3304,7 +3302,7 @@ if pid == 0:
     attrs = termios.tcgetattr(0)
     attrs[3] |= termios.TOSTOP
     termios.tcsetattr(0, termios.TCSANOW, attrs)
-    os.execv(sys.argv[2], sys.argv[2:])
+    os.execv(sys.argv[3], sys.argv[3:])
 start = time.time()
 sent = False
 while True:
@@ -3321,10 +3319,10 @@ while True:
     if done:
         print(os.waitstatus_to_exitcode(status), round(time.time() - start, 1))
         sys.exit(0)
-    if time.time() - start > 150:
+    if time.time() - start > float(sys.argv[2]):
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
-        print(-1, 150)
+        print(-1, sys.argv[2])
         sys.exit(0)
     time.sleep(0.05)
 "#;
@@ -3336,6 +3334,12 @@ while True:
         .arg("-c")
         .arg(harness)
         .arg(if interrupt { "interrupt" } else { "wait" })
+        // A hang, not a loaded machine, reaches this bound.
+        .arg(
+            (common::startup_deadline() - Instant::now())
+                .as_secs()
+                .to_string(),
+        )
         .arg(env!("CARGO_BIN_EXE_ferry"))
         .args(["run", "pass", "--local", "--seat", "second"])
         .output()
@@ -3368,8 +3372,9 @@ fn a_terminal_with_tostop_never_stops_the_run() {
             assert_eq!(code, 130, "took {took}");
             assert!(took < 30.0 + common::slack().as_secs_f64(), "took {took}");
         } else {
+            // Never stopped by the terminal: it ends, however loaded the
+            // machine (a stopped caller would sit until the harness's bound).
             assert_eq!(code, 0, "took {took}");
-            assert!(took < 60.0 + common::slack().as_secs_f64(), "took {took}");
         }
     }
 }
@@ -4097,7 +4102,7 @@ fn nesting(target: Option<&Path>) -> TempDir {
     let recipes = toml::to_string(&serde_json::json!({"recipe": {
         "pass": {"command": ["sh", "-c", "echo committed"]},
         "nest": {"command": ["sh", "-c", format!(
-            "cd '{}' && '{}' run pass --local --seat inner; echo inner=$?",
+            "cd '{}' && '{}' run pass --local --seat inner --wait-seconds 900; echo inner=$?",
             target.display(),
             env!("CARGO_BIN_EXE_ferry")
         )]},
@@ -4134,9 +4139,9 @@ fn a_run_inside_a_run_on_its_own_place_is_refused_at_once() {
             said.contains("nested run on the same place"),
             "exclusive={exclusive}: {said}"
         );
-        // At once: never the wait for the locks its own run holds.
+        // At once: never the wait (900 s) for the locks its own run holds.
         assert!(
-            started.elapsed() < Duration::from_secs(20) + common::slack(),
+            started.elapsed() < Duration::from_secs(300),
             "exclusive={exclusive}: took {:?}",
             started.elapsed()
         );

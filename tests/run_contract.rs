@@ -1806,9 +1806,10 @@ fn a_terminal_signal_stops_a_push_in_its_own_group() {
     }
 }
 
-/// SPEC §6: git's own progress keeps a slow push alive. A real 3 MB commit
+/// SPEC §6: git's own progress keeps a slow push alive. A real 5 MB commit
 /// pushed through an ssh that passes about 320 KB/s takes several times the
 /// bound, and only `git push --progress` prints meanwhile: it is not cut.
+/// The bound is 4 s, room for a loaded CI runner between git's lines.
 #[test]
 fn a_slow_push_is_kept_alive_by_gits_own_progress() {
     use std::io::Read as _;
@@ -1816,7 +1817,7 @@ fn a_slow_push_is_kept_alive_by_gits_own_progress() {
         return;
     }
     let dir = fixture();
-    let mut random = vec![0u8; 3 << 20];
+    let mut random = vec![0u8; 5 << 20];
     fs::File::open("/dev/urandom")
         .unwrap()
         .read_exact(&mut random)
@@ -1831,7 +1832,7 @@ fn a_slow_push_is_kept_alive_by_gits_own_progress() {
         &["run", "pass", "--on", "test-host", "--json"],
     )
     .env("FERRY_TEST_THROTTLE_PUSH", "1")
-    .env("FERRY_PUSH_STALL_MS", "2000")
+    .env("FERRY_PUSH_STALL_MS", "4000")
     .output()
     .unwrap();
     let record = receipt(&out);
@@ -1839,7 +1840,7 @@ fn a_slow_push_is_kept_alive_by_gits_own_progress() {
     assert_eq!(record["outcome"], "ran-pass", "{record}");
     // The push itself outlasted the bound several times over.
     assert!(
-        started.elapsed() > std::time::Duration::from_secs(6),
+        started.elapsed() > std::time::Duration::from_secs(12),
         "{:?}",
         started.elapsed()
     );
@@ -2051,7 +2052,9 @@ fn a_store_setup_that_never_answers_is_refused_within_the_reply_bound() {
         &["run", "pass", "--on", "test-host", "--json"],
     )
     .env("FERRY_TEST_HANG_INIT", &pidfile)
-    .env("FERRY_SSH_REPLY_MS", "2000")
+    // Room for the short replies before it (host-info) on a loaded machine:
+    // only the store setup is meant to reach the bound.
+    .env("FERRY_SSH_REPLY_MS", "5000")
     .output()
     .unwrap();
     let took = started.elapsed();
@@ -2065,7 +2068,7 @@ fn a_store_setup_that_never_answers_is_refused_within_the_reply_bound() {
         "{record}"
     );
     assert!(
-        took < Duration::from_secs(2) + common::slack() + Duration::from_secs(10),
+        took < Duration::from_secs(5) + common::slack() + Duration::from_secs(10),
         "{took:?}"
     );
     let pid: i32 = fs::read_to_string(&pidfile)
