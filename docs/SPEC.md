@@ -70,6 +70,22 @@ Not shipped yet: `--timeout <dur>` and `--wait <dur>` (today
   ferry stop <id>" and exit 255.
 - **Losing the connection:** reconnect and resume from the offset, until the
   deadline. When that fails, exit 255 with the next step `ferry record <id>`.
+- **What it prints.** The recipe's output goes to stdout unchanged (stderr
+  with `--json`). Ferry's own lines go to stderr, each starting `ferry: `,
+  so a reader always knows where the run is:
+  - at submit: `<id> → <place>, seat <seat>, commit <short>`, naming the
+    place even when Ferry chose it;
+  - when the commit came from a git checkout with uncommitted changes:
+    `uncommitted changes are not in <short>`;
+  - while the run has no output yet, each new wait note from the place,
+    once (`waiting for lock <name>: held by run <id>`);
+  - at the end: `<outcome>, exit <code>, run <id>`, preceded by the
+    reason when the record has one, so the last line is always the
+    verdict.
+
+  With `--json`, the same facts are events on stdout, one JSON object a
+  line: `submitted` (`id`, `pid`, `machine`, `seat`, `commit`), `waiting`
+  (`note`), then `receipt`. A reader ignores an event it does not know.
 
 **Exit codes** (the record's `outcome`):
 
@@ -129,7 +145,7 @@ in records, run directories and the marker.
 
 - unknown recipe or place;
 - unmet requirement;
-- unknown or dirty commit;
+- unknown or conflicted commit;
 - seat busy (`run <id>`, its age, then `ferry follow`/`stop`);
 - host wait expired (naming the holder);
 - below the disk floor;
@@ -172,7 +188,7 @@ leaves none, and the reason says so).
 | `follow` | `id`, `offset` | output bytes from that offset; ends when the record is final |
 | `retire` | seat `key`; optionally `idle_ms` or `once_id` (neither for a workspace-gone prune: no `used` check) | per seat: `{retired, bytes}` (under a shared host lease and the seat lock, try only), `{refused: exclusive}`, `{refused: busy}`, `{refused: used}` (used since), `{unknown, why}` or `{failed, why}` |
 | `stop` | `id`, `who`, `why` | `{accepted}` or `{refused}` |
-| `record` | `id` | the final or reserved record |
+| `record` | `id` | the final or reserved record; for a run not yet final, also `waiting`: the place's latest wait note, if any |
 
 - **Capabilities:** a new caller uses this protocol only if the place
   advertises `detach`. Otherwise it refuses with 125, naming the place's
@@ -814,3 +830,12 @@ receipt is seeing this rule, not a bug.
     the first is refused, never sent to `bench`. A `reserved_for`
     name missing from that machine's `has` refuses the run as a bad
     `machines.toml`.
+27. **The caller narrates:** a run sent without `--on` prints, before any
+    output, `ferry: <id> → <place>, seat <seat>, commit <short>` on stderr.
+    A run waiting on a host lock held by another run prints the wait
+    note naming that run within 5 s of the place writing it, and prints it
+    once. The last line is `ferry: <outcome>, exit <code>, run <id>`. A git
+    checkout with an uncommitted edit prints the uncommitted note and runs
+    the commit it names. With `--json`, stdout carries `submitted` (with
+    `machine`, `seat` and `commit`), the `waiting` event and `receipt`, and
+    no other line.
