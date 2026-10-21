@@ -2,6 +2,8 @@ check:
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo test --locked --no-fail-fast
+    python3 scripts/test_release.py
+    bash scripts/test-home-manager-module.sh
 
 build:
     nix build --no-link --print-out-paths .

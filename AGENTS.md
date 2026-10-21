@@ -10,9 +10,10 @@ maintainers and their coding agents work; an outside contributor needs only
 ## Check
 
 `just check` runs rustfmt, strict Clippy (`-D warnings`, pedantic) and every
-test: unit tests and real-CLI contract tests (`tests/`). Run it inside
-`nix develop`, which provides the toolchain and the tools the tests use
-(git, jj, python3, and procps and util-linux on Linux).
+test: unit tests, real-CLI contract tests (`tests/`), and the release and
+Home Manager script tests (`scripts/`), the same gate GitHub CI runs. Run it
+inside `nix develop`, which provides the toolchain and the tools the tests
+use (git, jj, python3, and procps and util-linux on Linux).
 
 Changes to transport or custody need real execution controls, not only unit
 tests: exact commits, refusal versus recipe exit, seat isolation, the

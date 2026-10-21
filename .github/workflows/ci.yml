@@ -10,8 +10,9 @@ permissions:
 
 jobs:
   # The same gate as a local `just check`, in the flake's dev shell: rustfmt,
-  # strict Clippy, unit tests and the real-CLI contract tests (which need git,
-  # jj and python3, and procps and util-linux on Linux).
+  # strict Clippy, unit tests, the real-CLI contract tests (which need git,
+  # jj and python3, and procps and util-linux on Linux), and the release and
+  # Home Manager script tests.
   check:
     strategy:
       fail-fast: false
@@ -47,9 +48,3 @@ jobs:
           "$out/bin/ferry" --version
           "$out/bin/ferry" --help >/dev/null
           nix run --accept-flake-config . -- --version
-
-      - name: Home Manager module smoke test
-        run: bash scripts/test-home-manager-module.sh
-
-      - name: Release script tests
-        run: python3 scripts/test_release.py

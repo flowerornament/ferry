@@ -7,8 +7,11 @@ on:
 permissions:
   contents: read
 
+# One queued build per branch: a newer push replaces a queued one, saving
+# runner minutes. A release commit's build has a group of its own, so the
+# next push can never cancel it (v0.1.5's was, at 408eb0c1).
 concurrency:
-  group: nix-cache-${{ github.ref }}
+  group: nix-cache-${{ startsWith(github.event.head_commit.message, 'release:') && github.sha || github.ref }}
   cancel-in-progress: false
 
 jobs:
