@@ -184,7 +184,7 @@ leaves none, and the reason says so).
 | Verb | In | Out |
 |---|---|---|
 | `describe` | — | `{protocol, source_rev, exe, capabilities, boot_id, os, arch}` |
-| `submit` | request JSON (`id`, `token`, `commit`, `seat`, `recipe`, `args`, `env`, `hooks`, `deadline`) | `{id}` or `{refused, why, next}` |
+| `submit` | request JSON (`id`, `token`, `commit`, `seat`, `recipe`, `args`, `env`, `hooks`, `deadline`; `binary_sha256` to a place advertising `pinned`) | `{id}` or `{refused, why, next}` |
 | `follow` | `id`, `offset` | output bytes from that offset; ends when the record is final |
 | `retire` | seat `key`; optionally `idle_ms` or `once_id` (neither for a workspace-gone prune: no `used` check) | per seat: `{retired, bytes}` (under a shared host lease and the seat lock, try only), `{refused: exclusive}`, `{refused: busy}`, `{refused: used}` (used since), `{unknown, why}` or `{failed, why}` |
 | `stop` | `id`, `who`, `why` | `{accepted}` or `{refused}` |
@@ -196,6 +196,20 @@ leaves none, and the reason says so).
   There is no legacy `host-run` shim: a caller is never installed before
   its places (decided 2026-10-10 on ferry-ljc.3; it supersedes the shim in
   ferry-minimal §7).
+- **Pinned binary:** the caller checks a place's capabilities and protocol
+  against what `describe` reported, so the binary that runs the work must
+  be that one. To a place advertising `pinned`, the request carries
+  `binary_sha256` from `describe`; the place compares it with its own
+  executable's digest and, if they differ (an install or rollback between
+  the two), refuses before reserving anything: 125, "the place's ferry
+  changed since it was asked; run again". The place checks the digest of
+  the file it runs, and starts its supervisor and the run's session from
+  that same file, so a later flip cannot redirect them. A rerun asks again
+  and meets one binary. Once both binaries advertise `pinned`, no run is
+  checked by one binary and executed by another. Across the release that
+  introduces it, the old guarantee holds (the record names the binary that
+  ran); a rollback to a binary without `pinned` refuses the request as
+  unreadable (125) before reserving.
 - **Version skew:** old and new binaries never share a state root: the
   current root is a new path (`…/ferry/v1`) that earlier binaries never
   read. A new
@@ -839,3 +853,8 @@ receipt is seeing this rule, not a bug.
     the commit it names. With `--json`, stdout carries `submitted` (with
     `machine`, `seat` and `commit`), the `waiting` event and `receipt`, and
     no other line.
+28. **Pinned binary:** through a fixture that replaces the place's binary
+    after `describe` answers and before `submit`, the run is refused (125,
+    naming the change) with no reservation and no record on the place, and
+    a rerun passes on the new binary, its receipt naming that binary. A
+    request with `binary_sha256` to a place without `pinned` is never sent.
