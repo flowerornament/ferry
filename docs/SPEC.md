@@ -33,7 +33,7 @@ run, and a seat's caches are capped (§9).
 
 | Concept | State | Rule | Why |
 |---|---|---|---|
-| **Recipe** | `name → {argv, needs, exclusive, timeout, wait, artifacts, keep_between_runs}` read from the commit | runs only where `needs ⊆ has`, on every route | the repository decides what may run |
+| **Recipe** | `name → {argv, needs, may_run_elsewhere, artifacts}` read from the commit; `needs = ["exclusive"]` (or `--exclusive`) asks for the host alone | runs only where `needs ⊆ has` (`exclusive` aside), on every route | the repository decides what may run |
 | **Place** | `local` or an ssh destination; `has` = declared (`machines.toml`) ∪ detected ∪ the binary's capabilities; `host.toml` | describes itself through the binary that will run the work | the facts come from the doer |
 | **Seat** | `(caller, repo path, name) → checkout + cache` | reset to the commit each run; `keep_between_runs` dirs kept | warm and exact, never shared |
 | **Lock** | flock: `seat.<key>`, `host`, `host.gate` | held means busy; the work inherits the seat's fd only, the supervisor alone holds `host` and `host.gate`; release by `close()` | the kernel is the only judge, and a leftover can hold no more than its own seat |
