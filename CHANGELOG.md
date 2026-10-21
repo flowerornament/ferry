@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.5 - 2026-10-21
+
 - **The caller says what is happening.** A run prints where it went
   (`ferry: <id> → bench, seat default, commit <short>`), that uncommitted
   changes are not in the commit run, what a quiet run waits for and who
