@@ -332,7 +332,8 @@ pub fn machine_line(name: &str, machine: &Machine) -> String {
 /// A recipe in version 2's names, on one line (`ferry recipes`).
 pub fn recipe_line(name: &str, recipe: &Recipe) -> String {
     use std::fmt::Write;
-    let mut line = format!("{name}: {}", recipe.command.join(" "));
+    let words: Vec<String> = recipe.command.iter().map(|word| shell_word(word)).collect();
+    let mut line = format!("{name}: {}", words.join(" "));
     if !recipe.requires.is_empty() {
         let _ = write!(line, "; needs {}", joined(&recipe.requires));
     }
@@ -340,6 +341,17 @@ pub fn recipe_line(name: &str, recipe: &Recipe) -> String {
         line.push_str("; may_run_elsewhere");
     }
     line
+}
+
+/// An argument as a shell reads it back: bare when it has nothing a shell
+/// treats specially, else in single quotes.
+fn shell_word(word: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-./=:,@%+".contains(c);
+    if !word.is_empty() && word.chars().all(plain) {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 fn joined(set: &BTreeSet<String>) -> String {

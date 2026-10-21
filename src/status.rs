@@ -339,7 +339,7 @@ fn size(bytes: &Value) -> String {
 }
 
 /// A span in the largest whole unit that fits: `40 s`, `12 min`, `3 h`.
-fn age(ms: u128) -> String {
+pub(crate) fn age(ms: u128) -> String {
     let seconds = ms / 1000;
     match seconds {
         0..120 => format!("{seconds} s"),

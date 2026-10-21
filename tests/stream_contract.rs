@@ -1090,6 +1090,17 @@ fn a_busy_seat_refuses_at_once_naming_the_run() {
     assert!(
         reason.contains(&format!("seat busy: run {holder_id}, submitted"))
             && reason.contains(&format!("ferry follow {holder_id}")),
+        "{record}"
+    );
+    // A holder younger than two minutes is aged in seconds, never "0 min".
+    let age = reason
+        .split(", submitted ")
+        .nth(1)
+        .and_then(|rest| rest.split(" ago").next())
+        .unwrap_or_default();
+    assert!(
+        age.strip_suffix(" s")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
         "{reason}"
     );
     fs::write(&release, "").unwrap();
@@ -3901,7 +3912,7 @@ fn recipes_and_machines_are_one_line_each_in_version_two_names() {
     git(d, &["config", "user.email", "ferry@example.invalid"]);
     fs::write(
         d.join("ferry.toml"),
-        "version = 2\n[recipe.check]\ncommand = ['just', 'check']\nneeds = ['linux', 'big']\nmay_run_elsewhere = true\n[recipe.fmt]\ncommand = ['cargo', 'fmt']\n",
+        "version = 2\n[recipe.check]\ncommand = ['just', 'check']\nneeds = ['linux', 'big']\nmay_run_elsewhere = true\n[recipe.fmt]\ncommand = ['cargo', 'fmt']\n[recipe.say]\ncommand = ['sh', '-c', \"echo 'hi there'; exit 17\", '']\n",
     )
     .unwrap();
     git(d, &["add", "-A"]);
@@ -3915,7 +3926,7 @@ fn recipes_and_machines_are_one_line_each_in_version_two_names() {
     let out = bounded_output(ferry(d).arg("recipes"));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "check: just check; needs big, linux; may_run_elsewhere\nfmt: cargo fmt\n"
+        "check: just check; needs big, linux; may_run_elsewhere\nfmt: cargo fmt\nsay: sh -c 'echo '\\''hi there'\\''; exit 17' ''\n"
     );
     let out = bounded_output(ferry(d).arg("machines"));
     assert_eq!(

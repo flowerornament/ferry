@@ -317,9 +317,9 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     let mut live = reservations(root, Some(seat));
     live.retain(|r| r.id != own);
     if let Some(run) = live.iter().find(|r| r.id == named) {
-        let minutes = crate::receipt::now_ms().saturating_sub(run.submitted_ms) / 60_000;
+        let age = crate::status::age(crate::receipt::now_ms().saturating_sub(run.submitted_ms));
         return format!(
-            "seat busy: run {named}, submitted {minutes} min ago; ferry follow {named} or ferry stop {named}"
+            "seat busy: run {named}, submitted {age} ago; ferry follow {named} or ferry stop {named}"
         );
     }
     let starting = live

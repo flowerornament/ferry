@@ -4,6 +4,11 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **Small readability fixes.** A busy seat gives its holder's age in seconds
+  under two minutes ("submitted 40 s ago", not "0 min ago"), and
+  `ferry recipes` shell-quotes each argument, so
+  `sh -c 'echo hi; exit 17'` reads as it runs.
+
 ## v0.1.5 - 2026-10-21
 
 - **The caller says what is happening.** A run prints where it went
