@@ -74,7 +74,14 @@ pub fn root() -> Result<PathBuf> {
     if let Ok(bytes) = output(Command::new("jj").args(["root"])) {
         return Ok(PathBuf::from(text(bytes)?));
     }
-    let top = output(Command::new("git").args(["rev-parse", "--show-toplevel"]))?;
+    let top = output(Command::new("git").args(["rev-parse", "--show-toplevel"])).map_err(|e| {
+        // git ran and said no: anything else (git missing) is said as is.
+        if e.to_string().starts_with("command failed: ") {
+            "not in a git or jj repository".into()
+        } else {
+            e
+        }
+    })?;
     Ok(PathBuf::from(text(top)?))
 }
 pub fn git_dir(root: &Path) -> Result<PathBuf> {
@@ -97,7 +104,15 @@ pub fn commit(root: &Path, revision: Option<&str>) -> Result<String> {
             rev,
             "-T",
             "commit_id ++ \" \" ++ conflict ++ \"\\n\"",
-        ]))?;
+        ]))
+        .map_err(|e| {
+            let said = e.to_string();
+            let said = said.trim_start_matches("command failed: ");
+            format!(
+                "jj could not resolve {rev}: {}",
+                said.lines().next().unwrap_or("")
+            )
+        })?;
         let text = String::from_utf8(bytes)?;
         let lines: Vec<_> = text.lines().collect();
         if lines.len() != 1 || !lines[0].ends_with(" false") {
@@ -105,16 +120,43 @@ pub fn commit(root: &Path, revision: Option<&str>) -> Result<String> {
         }
         lines[0].split_whitespace().next().unwrap_or("").to_owned()
     } else {
-        let revision = format!("{}^{{commit}}", revision.unwrap_or("HEAD"));
-        text(git(
-            root,
-            &["rev-parse", "--verify", "--end-of-options", &revision],
-        )?)?
+        let named = revision.unwrap_or("HEAD");
+        let revision = format!("{named}^{{commit}}");
+        text(
+            git(
+                root,
+                &["rev-parse", "--verify", "--end-of-options", &revision],
+            )
+            .map_err(|_| format!("unknown commit {named}"))?,
+        )?
     };
     if !is_commit(&value) {
         return Err("invalid commit identity".into());
     }
     Ok(value)
+}
+/// Whether a git checkout at `sha` has changes the run will not see: a
+/// tracked edit or an untracked file, outside Ferry's own `.ferry`. A jj
+/// working copy is itself a commit.
+pub fn uncommitted(root: &Path, sha: &str) -> bool {
+    if root.join(".jj").exists() {
+        return false;
+    }
+    let head = git(root, &["rev-parse", "--verify", "HEAD^{commit}"]).ok();
+    head.and_then(|head| text(head).ok()).as_deref() == Some(sha)
+        && git(
+            root,
+            // No index refresh: never takes index.lock from a committing editor.
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--",
+                ".",
+                ":(exclude).ferry",
+            ],
+        )
+        .is_ok_and(|out| !out.is_empty())
 }
 pub fn committed_file(root: &Path, sha: &str, path: &str) -> Result<Vec<u8>> {
     relative_path(path)?;
@@ -199,13 +241,12 @@ fn project(text: &str) -> Result<Config, Box<dyn std::error::Error>> {
     match crate::names::version(&value, 0) {
         1 => Ok(toml::from_str(text)?),
         2 => {
-            crate::names::project(&mut value).map_err(|e| format!("ferry.toml: {e}"))?;
+            crate::names::project(&mut value)?;
             value.try_into().map_err(|e: toml::de::Error| {
-                let said = crate::names::spoken(&e.to_string(), crate::names::File::Project);
-                format!("ferry.toml: {said}").into()
+                crate::names::spoken(&e.to_string(), crate::names::File::Project).into()
             })
         }
-        _ => Err("unsupported ferry.toml version".into()),
+        _ => Err("unsupported version".into()),
     }
 }
 
@@ -234,11 +275,18 @@ pub fn declaration(
     sha: &str,
     evidence: &mut DeclarationEvidence,
 ) -> Result<Declaration, Box<dyn std::error::Error>> {
-    let mut config = project(&String::from_utf8(committed_file(
-        root,
-        sha,
-        "ferry.toml",
-    )?)?)?;
+    // Every refusal of the file names it and the commit it was read at.
+    let at = &sha[..12.min(sha.len())];
+    let text = committed_file(root, sha, "ferry.toml").map_err(|e| {
+        let said = e.to_string();
+        if said.contains("does not exist in") || said.contains("exists on disk, but not in") {
+            format!("no ferry.toml at {at}")
+        } else {
+            format!("reading ferry.toml at {at}: {said}")
+        }
+    })?;
+    let mut config =
+        project(&String::from_utf8(text)?).map_err(|e| format!("ferry.toml at {at}: {e}"))?;
     crate::config::retired([&config.companion_refs, &config.mirror])?;
     config.hooks.check()?;
     let recipes = if let Some(catalog) = &config.catalog {

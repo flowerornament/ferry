@@ -297,11 +297,13 @@ pub fn catalog_recipes(
         .collect()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Machine {
     pub ssh: String,
     pub triple: String,
+    /// Accepted in version 1, never read (routing never did).
+    #[allow(dead_code)]
     pub cores: Option<u32>,
     #[serde(default)]
     pub features: BTreeSet<String>,
@@ -312,6 +314,41 @@ pub struct Machine {
     #[serde(default)]
     pub reserved_for: BTreeSet<String>,
 }
+/// A machine in version 2's names, on one line (`ferry machines`).
+pub fn machine_line(name: &str, machine: &Machine) -> String {
+    use std::fmt::Write;
+    let mut line = format!("{name}: ssh {}, platform {}", machine.ssh, machine.triple);
+    for (key, set) in [
+        ("has", &machine.features),
+        ("reserved_for", &machine.reserved_for),
+    ] {
+        if !set.is_empty() {
+            let _ = write!(line, ", {key} {}", joined(set));
+        }
+    }
+    line
+}
+
+/// A recipe in version 2's names, on one line (`ferry recipes`).
+pub fn recipe_line(name: &str, recipe: &Recipe) -> String {
+    use std::fmt::Write;
+    let mut line = format!("{name}: {}", recipe.command.join(" "));
+    if !recipe.requires.is_empty() {
+        let _ = write!(line, "; needs {}", joined(&recipe.requires));
+    }
+    if recipe.routable {
+        line.push_str("; may_run_elsewhere");
+    }
+    line
+}
+
+fn joined(set: &BTreeSet<String>) -> String {
+    set.iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn default_binary() -> String {
     ".local/bin/ferry".into()
 }
@@ -447,9 +484,6 @@ pub fn route<'a>(
     on: Option<&'a str>,
     local: bool,
 ) -> Result<Route<'a>, String> {
-    if local && on.is_some() {
-        return Err("--local conflicts with --on".into());
-    }
     if local {
         return Ok(Route::Local);
     }

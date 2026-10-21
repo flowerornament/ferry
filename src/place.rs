@@ -119,6 +119,27 @@ fn reply(value: &serde_json::Value) {
     execution::emit(value.to_string().as_bytes());
 }
 
+/// A stopped run's reason from its stop: `stopped: <why> (<who>) with
+/// <signal>`, in place of "supervisor received <signal>"; any detail after
+/// that is kept.
+fn stopped_reason(by: Option<&serde_json::Value>, reason: String) -> String {
+    let Some((why, who)) = by.and_then(|by| Some((by["why"].as_str()?, by["who"].as_str()?)))
+    else {
+        return reason;
+    };
+    let other = by.is_some_and(|by| by["other"] == true);
+    let other = if other { ", another caller's run" } else { "" };
+    let Some(received) = reason.strip_prefix("supervisor received ") else {
+        return reason;
+    };
+    let (signal, rest) = received
+        .split_once("; ")
+        .map_or((received, String::new()), |(signal, rest)| {
+            (signal, format!("; {rest}"))
+        });
+    format!("stopped: {why} ({who}{other}) with {signal}{rest}")
+}
+
 /// Names this place's revision, so an older caller knows what to install.
 fn same_ferry() -> String {
     let rev = receipt::source_rev();
@@ -371,6 +392,8 @@ pub fn supervise(root: &Path, id: &str) -> Result<i32> {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     }
+    // A stop names who sent it, not the signal its supervisor received.
+    let reason = reason.map(|reason| stopped_reason(result.stopped_by.as_ref(), reason));
     if let Some(reason) = reason {
         result.reason = Some(match result.reason.take() {
             Some(notes) => format!("{reason}; {notes}"),
@@ -932,13 +955,44 @@ pub fn print_record(root: &Path, id: &str) -> Result<i32> {
         execution::emit(&bytes);
         return Ok(0);
     }
+    execution::pause_at("record-gap", &record::run_dir(root, id).join("record-gap"));
     match fs::read(record::reserved_path(root, id)) {
         Ok(bytes) => {
-            execution::emit(&bytes);
+            let mut reserved: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if let Some(note) = waiting(&record::run_dir(root, id)) {
+                reserved["waiting"] = note.into();
+            }
+            execution::emit(reserved.to_string().as_bytes());
             Ok(3)
         }
-        Err(_) => Ok(not_found()),
+        Err(_) => {
+            // Final between the two reads: finalize writes the record, then
+            // removes the reservation.
+            match record::reconcile(root, id)? {
+                Some(bytes) => {
+                    execution::emit(&bytes);
+                    Ok(0)
+                }
+                None => Ok(not_found()),
+            }
+        }
     }
+}
+
+/// The run's latest wait note, from its supervisor's log, without `ferry: `,
+/// while it still waits: once it writes its output log, its locks are held.
+fn waiting(dir: &Path) -> Option<String> {
+    if dir.join("output.log").exists() {
+        return None;
+    }
+    let log = fs::read_to_string(dir.join("supervisor.log")).ok()?;
+    log.lines()
+        .rev()
+        .find_map(|line| {
+            line.strip_prefix("ferry: ")
+                .filter(|note| note.starts_with("waiting for lock "))
+        })
+        .map(str::to_owned)
 }
 
 /// Says a run is not found here (exit 4), naming how long this host keeps

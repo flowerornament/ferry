@@ -4,6 +4,7 @@
 //! stopped by its exact pid, by the operator.
 use crate::{config, custody, execution::Request, record, transport};
 use serde_json::{Value, json};
+use std::fmt::Write;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 use std::{
     fs,
@@ -196,12 +197,19 @@ pub fn show(on: Option<&str>, hosts: &config::Machines, json: bool) -> Result<i3
     };
     let mut seen = transport::status(&place)?;
     let book = crate::seats::latest()?;
+    // A local place's seats are this workspace's, never booked (SPEC §9):
+    // a key is labelled when it is this workspace's key for its seat name.
+    let root = on.is_none().then(crate::repository::root).transpose()?;
     for seat in seen["seats"].as_array_mut().into_iter().flatten() {
-        let name = on.unwrap_or("local").to_owned();
-        if let Some(line) = seat["key"]
-            .as_str()
-            .and_then(|key| book.get(&(name, key.to_owned())))
-        {
+        let Some(key) = seat["key"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(root) = &root {
+            let name = key.split_once('-').map_or("", |(_, name)| name);
+            if transport::seat_key(root, name).is_ok_and(|own| own == key) {
+                seat["workspace"] = json!({"seat": name, "repo_path": root.display().to_string()});
+            }
+        } else if let Some(line) = on.and_then(|on| book.get(&(on.to_owned(), key))) {
             seat["workspace"] = json!({"seat": line.seat, "repo_path": line.repo_path});
         }
     }
@@ -209,66 +217,135 @@ pub fn show(on: Option<&str>, hosts: &config::Machines, json: bool) -> Result<i3
         println!("{}", serde_json::to_string_pretty(&seen)?);
         return Ok(0);
     }
+    say(&seen);
+    Ok(0)
+}
+
+/// Status as lines a person reads: sizes and ages, unknowns left out.
+fn say(seen: &Value) {
     let disk = &seen["disk"];
-    println!(
-        "disk: {} available, floor {}, seat cap {}{}",
-        disk["available"],
-        disk["floor_bytes"],
-        disk["seat_cap_bytes"],
-        disk["refusing"]
-            .as_str()
-            .map(|why| format!(" (refusing: {why})"))
-            .unwrap_or_default()
-    );
+    let mut line = format!("disk: {} free", size(&disk["available"]));
+    for (name, key) in [("floor", "floor_bytes"), ("seat cap", "seat_cap_bytes")] {
+        if !disk[key].is_null() {
+            let _ = write!(line, ", {name} {}", size(&disk[key]));
+        }
+    }
+    if let Some(why) = disk["refusing"].as_str() {
+        let _ = write!(line, " (refusing: {why})");
+    }
+    println!("{line}");
     let gate = &seen["gate"];
-    println!(
-        "gate: holder {}, requesters {}",
-        text(&gate["holder"]),
-        gate["requesters"]
-    );
+    // `unknown`: the gate names a run that is no longer live (it is never
+    // cleared), which says nothing about who holds it now.
+    if gate["holder"] != "none" && gate["holder"] != "unknown" {
+        println!("exclusive: held by run {}", text(&gate["holder"]));
+    }
+    for requester in gate["requesters"].as_array().into_iter().flatten() {
+        println!("exclusive: run {} waits for it", text(requester));
+    }
+    let now = crate::receipt::now_ms();
     for run in seen["runs"].as_array().into_iter().flatten() {
-        println!(
-            "run {} {} seat {} {}{} deadline_ms {}",
+        let command = run["recipe"]
+            .as_array()
+            .map(|words| words.iter().map(text).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        let mut line = format!(
+            "run {} {}: {command}",
             text(&run["id"]),
-            text(&run["phase"]),
-            text(&run["seat"]),
-            run["recipe"],
-            if run["exclusive"] == true {
-                " exclusive"
-            } else {
-                ""
-            },
-            run["deadline_ms"]
+            text(&run["phase"])
         );
+        if run["exclusive"] == true {
+            line += " (exclusive)";
+        }
+        if let Some(at) = run["submitted_ms"].as_u64() {
+            let _ = write!(
+                line,
+                ", submitted {} ago",
+                age(now.saturating_sub(u128::from(at)))
+            );
+        }
+        if let Some(at) = run["deadline_ms"].as_u64() {
+            let _ = write!(
+                line,
+                ", deadline in {}",
+                age(u128::from(at).saturating_sub(now))
+            );
+        }
+        println!("{line}");
     }
     for seat in seen["seats"].as_array().into_iter().flatten() {
-        let name = seat["workspace"]["repo_path"].as_str().map_or_else(
-            || seat["key"].to_string(),
-            |repo| format!("{} {repo}", seat["workspace"]["seat"]),
-        );
-        println!(
-            "seat {name}: {} bytes, last run {} {}",
-            seat["bytes"], seat["last_run"], seat["outcome"]
-        );
+        let name = match seat["workspace"]["repo_path"].as_str() {
+            Some(repo) => format!("{} of {repo}", text(&seat["workspace"]["seat"])),
+            None => text(&seat["key"]),
+        };
+        let mut line = format!("seat {name}");
+        if !seat["bytes"].is_null() {
+            let _ = write!(line, ": {}", size(&seat["bytes"]));
+        }
+        if let Some(last) = seat["last_run"].as_str() {
+            let _ = write!(line, ", last run {last}");
+            if let Some(outcome) = seat["outcome"].as_str() {
+                let _ = write!(line, " {outcome}");
+            }
+        }
+        println!("{line}");
     }
     for tombstone in seen["tombstones"].as_array().into_iter().flatten() {
         println!(
-            "tombstone {tombstone}: a retired seat whose delete failed; the next prune deletes it"
+            "tombstone {}: a retired seat whose delete failed; the next prune deletes it",
+            text(tombstone)
         );
     }
     let left = &seen["leftovers"];
+    if let Some(error) = left["error"].as_str() {
+        println!("leftovers: not read ({error})");
+    }
     for process in left["processes"].as_array().into_iter().flatten() {
         println!(
             "leftover pid {} of run {}: {}",
-            process["pid"], process["run"], process["command"]
+            process["pid"],
+            text(&process["run"]),
+            text(&process["command"])
         );
     }
-    println!(
-        "marked with no record here: {}; unreadable processes: {}",
-        left["record_none"].as_array().map_or(0, Vec::len),
-        left["unreadable"]
-    );
-    Ok(0)
+    let unknown = left["record_none"].as_array().map_or(0, Vec::len);
+    if unknown > 0 {
+        println!(
+            "{unknown} processes are marked with a run this place does not know (--json lists them)"
+        );
+    }
+}
+
+/// Bytes as a size a reader takes in at once: `12.3 GiB`; `unknown` for
+/// none (a measurement past its budget).
+// A size to one decimal: f64's precision is more than enough.
+#[allow(clippy::cast_precision_loss)]
+fn size(bytes: &Value) -> String {
+    let Some(bytes) = bytes.as_u64() else {
+        return "unknown".into();
+    };
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < units.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", units[unit])
+    }
+}
+
+/// A span in the largest whole unit that fits: `40 s`, `12 min`, `3 h`.
+fn age(ms: u128) -> String {
+    let seconds = ms / 1000;
+    match seconds {
+        0..120 => format!("{seconds} s"),
+        120..7200 => format!("{} min", seconds / 60),
+        _ => format!("{} h", seconds / 3600),
+    }
 }
 
 /// A JSON value as plain text: a string without its quotes.

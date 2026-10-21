@@ -14,7 +14,7 @@ Open a GitHub issue with:
 
 - the command you ran and the `ferry --version` on each end (the receipt
   names both binaries: `caller_source_rev`, `host_source_rev`);
-- the receipt (`ferry receipt <id>`, or `ferry record <id>`), with anything
+- the receipt (`ferry record <id>`), with anything
   private removed;
 - what you expected, and what happened instead.
 

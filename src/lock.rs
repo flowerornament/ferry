@@ -97,16 +97,18 @@ pub(crate) fn acquire_as(
                         &crate::record::run_dir(root, &request.id).join("probe"),
                     );
                     return Err(format!(
-                        "waited {:?} for lock {name}, the end of the run's wait: {}",
-                        started.elapsed(),
+                        "waited {:.1} s for lock {name}, the end of the run's wait: {}",
+                        started.elapsed().as_secs_f64(),
                         crate::record::host_holder(root, path, named.trim())
                     )
                     .into());
                 }
                 if !said && started.elapsed() >= Duration::from_secs(3) {
                     said = true;
+                    // The caller reads this note back with `record` (SPEC §6).
                     crate::execution::warn(&format!(
-                        "ferry: waiting for lock {name}: another run holds it"
+                        "ferry: waiting for lock {name}: {}",
+                        crate::record::holding(path, &request.id)
                     ));
                 }
                 thread::sleep(Duration::from_millis(50));

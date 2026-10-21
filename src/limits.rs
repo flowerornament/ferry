@@ -70,3 +70,7 @@ pub const PUSH_STALL: Duration = Duration::from_secs(60);
 
 /// How long a caller keeps trying a place that does not answer.
 pub const UNREACHABLE: Duration = Duration::from_mins(5);
+
+/// How often a caller reads a quiet run's wait note (SPEC §4): with the
+/// note written at 3 s of waiting, it is said within 5 s of being written.
+pub const NARRATION: Duration = Duration::from_secs(2);

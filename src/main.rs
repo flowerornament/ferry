@@ -37,12 +37,13 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Run a recipe at a commit, here or on a machine that has what it needs.
+    #[command(after_help = RUN_HELP)]
     Run(Run),
+    /// This repository's recipes at the current commit, one line each.
     Recipes,
+    /// The machines in ~/.config/ferry/machines.toml, one line each.
     Machines,
-    Receipt {
-        id: String,
-    },
     /// This caller's seats on its places.
     Seats {
         #[command(subcommand)]
@@ -51,26 +52,34 @@ enum Action {
     /// What a place sees now: disk, live runs, the gate, seats, leftovers.
     /// Read-only: it takes no lock and stops nothing.
     Status {
-        /// The place (default: this repository's local place).
+        /// The machine, by its name in machines.toml (default: this
+        /// repository's local place).
         #[arg(long)]
         on: Option<String>,
+        /// Print one JSON document instead of lines.
         #[arg(long)]
         json: bool,
     },
-    /// Follow a run's output from any terminal until it ends.
+    /// Show a run's output from the start, from any terminal, until it ends.
     Follow {
+        /// The run id, as `ferry run` printed it.
         id: String,
     },
     /// Stop a run: your own, or another caller's with --other --reason.
     Stop {
+        /// The run id, as `ferry run` printed it.
         id: String,
+        /// The run is another caller's: say so, with --reason.
         #[arg(long, requires = "reason")]
         other: bool,
+        /// Why you stop another caller's run; its receipt records it.
         #[arg(long, requires = "other")]
         reason: Option<String>,
     },
-    /// Print a run's receipt, completing it from the place once it is final.
+    /// Print a run's receipt as JSON, completing it from the place once it
+    /// is final (exit 3 while it is not).
     Record {
+        /// The run id, as `ferry run` printed it.
         id: String,
     },
     /// The place side of a run.
@@ -102,6 +111,8 @@ enum SeatsAction {
     /// Retire this caller's seats whose workspace is gone, and with
     /// `--idle <dur>` those it has not used for that long (SPEC §9).
     Prune {
+        /// Only this machine's seats, by its name in machines.toml (default:
+        /// every machine's).
         #[arg(long)]
         on: Option<String>,
         /// Also retire seats unused for this long (`1d`, `12h`, `0s`).
@@ -150,18 +161,27 @@ enum PlaceVerb {
 // Each bool is one command-line flag, which clap reads as a bool.
 #[allow(clippy::struct_excessive_bools)]
 struct Run {
+    /// The recipe's name (`ferry recipes` lists them).
     #[arg(allow_hyphen_values = true)]
     recipe: String,
-    #[arg(long)]
+    /// Run on this machine, by its name in machines.toml.
+    #[arg(long, conflicts_with = "local")]
     on: Option<String>,
+    /// Run here, in this repository's own place.
     #[arg(long)]
     local: bool,
+    /// The commit or revision to run (default: HEAD in git, so uncommitted
+    /// changes are not run; @ in jj, which holds them).
     #[arg(long)]
     commit: Option<String>,
+    /// Which of this workspace's seats (checkouts) on the place to use.
     #[arg(long, default_value = "default", allow_hyphen_values = true)]
     seat: String,
+    /// Print events as JSON lines on stdout; the recipe's output goes to
+    /// stderr.
     #[arg(long)]
     json: bool,
+    /// Stop the recipe after this many seconds (exit 124).
     #[arg(long)]
     timeout_seconds: Option<u64>,
     /// How long the run may wait for its locks, all together: every wait
@@ -178,6 +198,15 @@ struct Run {
     #[arg(last = true)]
     args: Vec<String>,
 }
+/// What `ferry run --help` adds after its options.
+const RUN_HELP: &str = "\
+Without --on or --local, a recipe that may run elsewhere goes to the first
+machine that has what it needs; any other recipe runs here.
+
+Exit codes: the recipe's own code when it ran; 124 it timed out; 125 Ferry
+refused it and nothing ran; 128+n stopped by signal n; 255 lost (the run may
+go on: ferry record <id>).";
+
 fn machines() -> Result<config::Machines> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -195,6 +224,12 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     config::identifier(&options.seat)?;
     let sha = repository::commit(root, options.commit.as_deref())?;
     record.commit = Some(sha.clone());
+    if repository::uncommitted(root, &sha) {
+        execution::warn(&format!(
+            "ferry: uncommitted changes are not in {}",
+            &sha[..12]
+        ));
+    }
     let mut evidence = repository::DeclarationEvidence::default();
     let declared = repository::declaration(root, &sha, &mut evidence);
     record.adapter_sha256 = evidence.adapter_sha256;
@@ -311,10 +346,17 @@ fn attach(id: &str, follow: bool) -> Result<i32> {
     let root = repository::root()?;
     let hosts = machines()?;
     let mut record = receipt::load(&root, id)?;
+    // A final run's output is replayed while its place still keeps it.
+    if follow && record.state.as_deref() == Some("final") {
+        let place = place_of(&root, &record, &hosts)?;
+        if let Err(error) = transport::replay(&place, &record) {
+            execution::warn(&format!("ferry: {error}"));
+        }
+    }
     if record.state.as_deref() == Some("submitted") {
         let place = place_of(&root, &record, &hosts)?;
         if follow {
-            transport::finish(&root, &place, &mut record, false);
+            transport::finish(&root, &place, &mut record, false, None);
             receipt::save(&root, &record)?;
         } else {
             match transport::complete(&root, &place, &mut record) {
@@ -343,12 +385,25 @@ fn stop(id: &str, reason: Option<&str>) -> Result<i32> {
         reason.is_some(),
         15,
     ) {
-        Ok(reply) => {
-            execution::emit(reply.as_bytes());
+        Ok(_) => {
+            execution::warn(&format!(
+                "ferry: stop sent to run {id}; ferry follow {id} shows its end"
+            ));
             Ok(0)
         }
         Err(error) => {
-            execution::warn(&format!("ferry: {error}"));
+            // A place refusal is `{refused, why, next}`: said as a sentence.
+            let said = serde_json::from_str::<serde_json::Value>(&error.to_string())
+                .ok()
+                .and_then(|reply| {
+                    let why = reply["why"].as_str()?.to_owned();
+                    Some(match reply["next"].as_str() {
+                        Some(next) => format!("{why}; next: {next}"),
+                        None => why,
+                    })
+                })
+                .unwrap_or_else(|| error.to_string());
+            execution::warn(&format!("ferry: {said}"));
             Ok(125)
         }
     }
@@ -402,10 +457,15 @@ fn run(options: &Run) -> Result<i32> {
                 .as_bytes(),
         );
     } else {
+        // The reason, then the verdict: the last line is always the verdict.
+        if let Some(reason) = record.reason.as_deref().filter(|r| !r.is_empty()) {
+            execution::warn(&format!("ferry: {reason}"));
+        }
+        let outcome = serde_json::to_value(record.outcome)?;
         execution::warn(&format!(
-            "ferry: {:?}: {} (receipt {})",
-            record.outcome,
-            record.reason.as_deref().unwrap_or(""),
+            "ferry: {}, exit {}, run {}",
+            outcome.as_str().unwrap_or_default(),
+            record.exit_code,
             record.id
         ));
     }
@@ -449,35 +509,22 @@ fn execute(cli: Cli) -> Result<i32> {
             idle.as_deref().map(config::parse_duration).transpose()?,
         ),
         Action::Machines => {
-            println!("{}", serde_json::to_string_pretty(&machines()?.host)?);
+            for (name, machine) in &machines()?.host {
+                println!("{}", config::machine_line(name, machine));
+            }
             Ok(0)
         }
         Action::Recipes => {
             let root = repository::root()?;
             let sha = repository::commit(&root, None)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &repository::declaration(
-                        &root,
-                        &sha,
-                        &mut repository::DeclarationEvidence::default()
-                    )?
-                    .recipes
-                )?
-            );
-            Ok(0)
-        }
-        Action::Receipt { id } => {
-            config::identifier(&id)?;
-            print!(
-                "{}",
-                fs::read_to_string(
-                    repository::root()?
-                        .join(".ferry/receipts")
-                        .join(format!("{id}.json"))
-                )?
-            );
+            let declared = repository::declaration(
+                &root,
+                &sha,
+                &mut repository::DeclarationEvidence::default(),
+            )?;
+            for (name, recipe) in &declared.recipes {
+                println!("{}", config::recipe_line(name, recipe));
+            }
             Ok(0)
         }
         Action::Status { on, json } => status::show(on.as_deref(), &machines()?, json),

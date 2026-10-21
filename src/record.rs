@@ -349,6 +349,28 @@ pub fn busy(root: &Path, seat: &str, own: &str, named: &str) -> String {
     }
 }
 
+/// Who seems to hold a host lock a run is waiting for, for its wait note:
+/// the run the lock file names while that run is live, else the other live
+/// runs. A narration, never a gate input: the lock may change hands at once.
+pub fn holding(lock: &Path, own: &str) -> String {
+    let root = lock.parent().and_then(Path::parent).unwrap_or(lock);
+    let live: Vec<String> = live(root)
+        .into_iter()
+        .map(|r| r.id)
+        .filter(|id| id != own)
+        .collect();
+    let named = fs::read_to_string(lock).unwrap_or_default();
+    let named = named.trim();
+    if live.iter().any(|id| id == named) {
+        return format!("held by run {named}");
+    }
+    match live.as_slice() {
+        [] => "held by a run that is starting, or a process outside Ferry".into(),
+        [one] => format!("held by run {one}"),
+        many => format!("held by runs {}", many.join(", ")),
+    }
+}
+
 /// Who holds a host lock that a wait gave up on, by what the protocol
 /// proves (SPEC §5: a run's record is final before its locks close). A
 /// shared probe that succeeds proves only shared runs hold it. Otherwise
@@ -396,7 +418,9 @@ pub fn host_holder(root: &Path, lock: &Path, named: &str) -> String {
             )
         }
         Ok(None) if reserved_path(root, named).exists() => {
-            format!("held by exclusive run {named}; ferry follow {named} or ferry stop {named}")
+            format!(
+                "held by exclusive run {named}; ferry follow {named}, or ferry stop {named} (another caller's run: --other --reason '<why>')"
+            )
         }
         _ => format!(
             "held exclusively; its lock file names run {named}, which this place does not know"

@@ -217,7 +217,13 @@ pub fn submit(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::
 /// A stored receipt.
 pub fn load(root: &Path, id: &str) -> Result<Receipt, Box<dyn std::error::Error>> {
     crate::config::identifier(id)?;
-    Ok(serde_json::from_slice(&fs::read(path(root, id))?)?)
+    let bytes = fs::read(path(root, id)).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "no run {id} in this repository's receipts; ferry status lists the runs on a place"
+        ),
+        _ => format!("reading the receipt of run {id}: {e}"),
+    })?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Stores a receipt, complete or not at all (SPEC §8). A submitted receipt

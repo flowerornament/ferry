@@ -4,6 +4,28 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **The caller says what is happening.** A run prints where it went
+  (`ferry: <id> → bench, seat default, commit <short>`), that uncommitted
+  changes are not in the commit run, what a quiet run waits for and who
+  holds it, and ends with `ferry: <outcome>, exit <code>, run <id>` after its
+  reason. `--json` adds a `waiting` event and `machine`, `seat` and `commit`
+  to `submitted`; every other JSON shape and every exit code is unchanged.
+- **Plainer refusals.** An unknown run id, commit or repository, and a
+  `ferry.toml` that does not parse, say so (the file and its commit named)
+  instead of an OS or git error. A stopped run's reason names who stopped
+  it. `ferry stop` answers in a sentence. A wait that ran out says seconds
+  and how to stop another caller's run.
+- **Easier to read.** `ferry recipes` and `ferry machines` print one line per
+  entry in version 2's names; `ferry status` prints sizes and ages and
+  leaves unknowns out, and labels this workspace's local seats. Every
+  command and option has help; `ferry run --help` gives the default commit
+  and the exit codes. `ferry follow` on a finished run replays its output.
+- **Removed:** `ferry receipt` (use `ferry record`, which completes the
+  receipt and says when the run is not final). `--on` with `--local` is now
+  a usage error (exit 2) instead of a refused run with a receipt.
+- **Fixed:** the place's `record` could answer "not found" for a run that
+  became final between its two reads.
+
 ## v0.1.4 - 2026-10-20
 
 - **Config files read in plain words.** `ferry.toml`, `machines.toml` and

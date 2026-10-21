@@ -644,16 +644,40 @@ bytes into the log: no lines, no transcoding, nothing waits on a reader.
 - **The caller** writes the bytes exactly as logged, to stdout (to stderr with
   `--json`). A closed stdout or stderr is data: the run goes on.
 
+**What the caller says** (SPEC §4), on stderr, each line starting `ferry: `:
+- at submit, `<id> → <place>, seat <seat>, commit <short>`, naming the place
+  even when Ferry chose it;
+- for a git checkout whose HEAD is the commit run and which has uncommitted
+  changes (outside `.ferry`), `uncommitted changes are not in <short>`; a jj
+  working copy is itself a commit, so it has none;
+- while the run has no output yet, each new wait note of its place, once.
+  The supervisor writes `waiting for lock <name>: held by run <id>` after 3 s
+  on a host lock; the caller reads it every 2 s with the place's `record`
+  verb, which adds the latest note as `waiting` while the run still waits
+  (it has no output log yet). It reads only until the run's wait budget
+  ends, and it is narration: a read that fails is skipped, and a stalled
+  read never holds the caller;
+- at the end, the reason when there is one, then `<outcome>, exit <code>,
+  run <id>`: the last line is always the verdict.
+
+`ferry stop` says `stop sent to run <id>` or the place's refusal and its
+next step. A stopped run's reason names the stop: `stopped: <why> (<who>) with
+<signal>`, with `, another caller's run` after `<who>` for `--other`.
+
 **The verdict is decided once,** by the first terminal fact (above), on the
 place, and kept in its final record.
 
-**`--json`** emits version-one NDJSON events: `submitted` (with the
-supervisor's pid), then `receipt`.
+**`--json`** emits version-one NDJSON events on stdout and nothing else:
+`submitted` (`id`, the supervisor's `pid`, `machine`, `seat`, `commit`),
+`waiting` (`note`) for each wait note said, then `receipt`. A reader ignores
+an event it does not know.
 
 ## `ferry status`
 
 **`status`** reads the place's state root and process table once. It takes
-no lock and changes nothing, so it never makes a seat look busy.
+no lock and changes nothing, so it never makes a seat look busy. It prints
+one line per fact, sizes in KiB, MiB or GiB and times as ages, leaving out
+what is unknown; `--json` gives every field below.
 - **disk:** available bytes, the floor and the seat cap from `host.toml`, and
   why admission would refuse now, if it would.
 - **runs:** each live run (reserved, not final, its supervisor alive) with its
@@ -666,11 +690,13 @@ no lock and changes nothing, so it never makes a seat look busy.
 - **seats:** each seat with the run its lock file last named, that run's
   outcome, the cap's last measurement, and its size from one walk bounded at
   5 s in all (`null` past it). Seats this caller knows from its seat book carry
-  their workspace; other callers' show their key.
+  their workspace, as does each local seat of this workspace; other callers'
+  show their key.
 - **leftovers:** processes carrying the `FERRY_ID` of a run that is no longer
   live here, by pid, start, run and `argv[0]`. Those whose run this place does
   not know (another state root) are counted apart under `record_none`, and
-  unreadable processes are counted. Stop a leftover by its exact pid.
+  unreadable processes (another user's) are counted in `--json`. Stop a
+  leftover by its exact pid.
 
 Internal verbs: `ferry place`, `host-info` and `execute-session` are internal: the caller
 runs them on the machine. A caller older than its place is not served (SPEC

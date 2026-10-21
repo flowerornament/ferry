@@ -99,7 +99,7 @@ ferry machines                   # what you configured
 ferry run test --on bench        # remote, at your current commit (git HEAD, or jj @-)
 ferry run test --local           # this machine, in a clean checkout of the commit
 ferry run test --on bench -- --nocapture       # arguments after --
-ferry receipt <id>               # what happened
+ferry record <id>                # what happened
 ```
 
 With no machines configured, runs are local. A machine that lacks a required
@@ -129,14 +129,15 @@ version 2.
 ferry run <recipe> [--on <machine> | --local] [--exclusive] [--seat <name>]
           [--once] [--commit <rev>] [--timeout-seconds <n>] [--wait-seconds <n>]
           [--json] [-- <args>…]           (--once: the seat lives for this run only)
-ferry follow <id>                   re-attach: the run's output, then its receipt
+ferry follow <id>                   the run's output from the start, then its
+                                    receipt (a finished run's too, while its
+                                    place keeps its history)
 ferry stop <id> [--other --reason '<why>']
                                     stop your run (another caller's needs a reason)
 ferry record <id>                   the receipt, completed once the run is final
                                     (exit 3 while it has no verdict yet)
-ferry recipes                       the recipes at this commit
-ferry machines                      the configured machines
-ferry receipt <id>                  print a receipt
+ferry recipes                       the recipes at this commit, one line each
+ferry machines                      the configured machines, one line each
 ferry seats prune [--on <machine>] [--idle <dur>]
                                     retire this caller's seats whose workspace
                                     is gone, and with --idle (1d, 12h, 0s)
@@ -149,6 +150,12 @@ ferry status [--on <machine>] [--json]
 
 `ferry status` is read-only: it takes no lock and changes nothing. Its
 fields are in [docs/REFERENCE.md](docs/REFERENCE.md#ferry-status).
+
+While a run goes, Ferry's own lines are on stderr, each starting `ferry: `:
+where the run went (`<id> → bench, seat default, commit 3237fb87ba2b`),
+uncommitted changes the commit leaves out, what a quiet run waits for
+(`waiting for lock host.gate: held by run <id>`), and last its verdict
+(`ran-fail, exit 17, run <id>`), after its reason if it has one.
 
 ### Outcomes and exit codes
 
@@ -166,7 +173,7 @@ so a program decides by the `--json` receipt: `state` first, then
 | `ran-pass` | 0 | The recipe ran and exited 0. |
 | `ran-fail` | the recipe's code | The recipe ran and failed. |
 | `timeout` | 124 | `--timeout-seconds` (or the run's absolute deadline) elapsed; the recipe's session was ended. |
-| `refused` | 125 | Nothing ran: unknown recipe or machine, unmet requirement, dirty or unknown commit, busy seat, host policy, or a host that refused before acceptance. |
+| `refused` | 125 | Nothing ran: unknown recipe or machine, unmet requirement, unknown or conflicted commit, busy seat, host policy, or a host that refused before acceptance. |
 | `stopped` | 128+signal | `ferry stop`, a signal to the caller, or one to the supervisor came before the recipe's result: 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP. `stopped_by` names who and why. |
 | `lost` | 255 | The run ended without a verdict of its own: its supervisor is gone (reconciled), or something failed after the recipe started. |
 

@@ -723,14 +723,33 @@ pub fn run_on(
     if let Err(error) = crate::seats::record(&request.seat, &record.machine, root, &record.seat) {
         note(&mut record.reason, format!("seat book: {error}"));
     }
+    // Where the run went, before any of its output (SPEC §4).
     if json {
         execution::emit(
-            serde_json::json!({"protocol": receipt::PROTOCOL, "event": "submitted", "id": request.id, "pid": reply["pid"]})
-                .to_string()
-                .as_bytes(),
+            serde_json::json!({
+                "protocol": receipt::PROTOCOL, "event": "submitted", "id": request.id,
+                "pid": reply["pid"], "machine": record.machine, "seat": record.seat,
+                "commit": request.commit,
+            })
+            .to_string()
+            .as_bytes(),
         );
+    } else {
+        execution::warn(&format!(
+            "ferry: {} → {}, seat {}, commit {}",
+            request.id,
+            record.machine,
+            record.seat,
+            &request.commit[..12.min(request.commit.len())]
+        ));
     }
-    finish(root, place, record, json);
+    finish(
+        root,
+        place,
+        record,
+        json,
+        Some(Instant::now() + request.wait()),
+    );
     Ok(())
 }
 
@@ -747,11 +766,30 @@ enum Followed {
 /// Follows a run to its end, then completes the receipt from the place's
 /// final record. If the run's end cannot be seen, the receipt stays
 /// submitted: the run may go on, and `ferry record <id>` finishes it later.
-pub fn finish(root: &Path, place: &Place, record: &mut Receipt, json: bool) {
+/// `waits_end`, when the run's locks may still be waited for: until then,
+/// a quiet run's wait notes are said (SPEC §4).
+pub fn finish(
+    root: &Path,
+    place: &Place,
+    record: &mut Receipt,
+    json: bool,
+    waits_end: Option<Instant>,
+) {
     let id = record.id.clone();
     // After the place accepted the run, only its final record decides: any
     // other failure leaves the receipt submitted (SPEC §4, §8).
-    let followed = follow(root, place, record, json);
+    let offset = std::sync::Arc::new(AtomicU64::new(0));
+    let done = std::sync::Arc::new(std::sync::Mutex::new(false));
+    // Never joined: a stalled read must not hold the caller past the run.
+    if let Some(until) = waits_end {
+        let (place, id, offset, done) = (owned(place), id.clone(), offset.clone(), done.clone());
+        thread::spawn(move || narrate(&place, &id, &offset, &done, until, json));
+    }
+    let followed = follow(root, place, record, json, &offset);
+    // Under the lock a note is said, so none comes after this.
+    *done
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
     let left = match followed {
         Ok(Followed::Final) => match complete(root, place, record) {
             Ok(()) => return,
@@ -800,8 +838,90 @@ fn leave(child: &mut std::process::Child, how: Followed) -> Followed {
 /// thread, so a stalled stdout never keeps this loop from a signal. The
 /// first signal asks the place to stop the run; from then on the run's
 /// record, not its output, decides when this ends. A second signal leaves.
-fn follow(root: &Path, place: &Place, record: &Receipt, json: bool) -> Result<Followed> {
-    let offset = std::sync::Arc::new(AtomicU64::new(0));
+/// Says why a run waits while it has no output yet (SPEC §4): every 2 s it
+/// reads the place's record for its latest wait note, and says each new
+/// one once. It is narration only: an answer it cannot read is skipped.
+fn narrate(
+    place: &Place,
+    id: &str,
+    output: &AtomicU64,
+    done: &std::sync::Mutex<bool>,
+    until: Instant,
+    json: bool,
+) {
+    let ended = || {
+        *done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let quiet = || output.load(Ordering::SeqCst) == 0 && !ended() && Instant::now() < until;
+    let mut said = String::new();
+    while quiet() {
+        let next = Instant::now() + narration();
+        while quiet() && Instant::now() < next {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !quiet() {
+            return;
+        }
+        let Ok((status, out, _)) = place
+            .verb(&["record", id])
+            .and_then(|mut verb| answered(&mut verb))
+        else {
+            continue;
+        };
+        // Final, or gone: nothing more to say. Any other answer is skipped.
+        if matches!(status.code(), Some(0 | 4)) {
+            return;
+        }
+        let note = serde_json::from_slice::<serde_json::Value>(&out)
+            .ok()
+            .and_then(|record| record["waiting"].as_str().map(str::to_owned));
+        let Some(note) = note.filter(|note| *note != said) else {
+            continue;
+        };
+        // Checked and said under the lock `finish` sets when it is done.
+        let done = done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*done && output.load(Ordering::SeqCst) == 0 {
+            if json {
+                execution::emit(
+                    serde_json::json!({"protocol": receipt::PROTOCOL, "event": "waiting", "note": note})
+                        .to_string()
+                        .as_bytes(),
+                );
+            } else {
+                execution::warn(&format!("ferry: {note}"));
+            }
+            said = note;
+        }
+    }
+}
+
+/// A place the narrating thread owns, outliving `finish`: a run's machine
+/// is copied once and kept until the caller exits.
+fn owned(place: &Place) -> Place<'static> {
+    match place {
+        Place::Local(state) => Place::Local(state.clone()),
+        Place::Remote(machine) => Place::Remote(Box::leak(Box::new((*machine).clone()))),
+    }
+}
+
+/// How often a quiet run's wait note is read; debug builds read
+/// `FERRY_NARRATION_MS`.
+fn narration() -> Duration {
+    execution::debug_bound("FERRY_NARRATION_MS")
+        .map_or(crate::limits::NARRATION, Duration::from_millis)
+}
+
+fn follow(
+    root: &Path,
+    place: &Place,
+    record: &Receipt,
+    json: bool,
+    offset: &std::sync::Arc<AtomicU64>,
+) -> Result<Followed> {
     let mut contact = std::time::Instant::now();
     let mut backoff = Duration::from_secs(1);
     let mut stopping: Option<(i32, std::sync::Arc<AtomicBool>)> = None;
@@ -990,6 +1110,26 @@ pub fn retire(
         )
         .into()
     })
+}
+
+/// Replays a final run's output from the start, as `follow` does for a
+/// live one, while the place still keeps it.
+pub fn replay(place: &Place, record: &Receipt) -> Result<()> {
+    let out = place
+        .verb(&["follow", &record.id, "0"])?
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "run {}'s output is no longer on {} ({})",
+        record.id,
+        record.machine,
+        failed(&out)
+    )
+    .into())
 }
 
 /// Asks a place what it sees now (SPEC §4). A place without `status` is
