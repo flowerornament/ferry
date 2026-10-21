@@ -48,3 +48,8 @@ jobs:
           "$out/bin/ferry" --version
           "$out/bin/ferry" --help >/dev/null
           nix run --accept-flake-config . -- --version
+
+      # The Linux Nix check (SPEC §12.13): the package's tests in a debug
+      # build, where every control's fault points exist; a skip fails.
+      - name: Linux Nix check (debug tests)
+        run: nix build --accept-flake-config --no-link -L .#checks.x86_64-linux.debug

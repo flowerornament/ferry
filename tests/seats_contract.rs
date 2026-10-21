@@ -156,7 +156,7 @@ fn seats_prune_never_names_another_callers_seat() {
 /// revives the seat, and prune spares it (SPEC §9, slice 5).
 #[test]
 fn a_seat_being_retired_is_busy_and_the_book_keeps_concurrent_appends() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -251,7 +251,7 @@ fn seats_prune_refuses_a_place_without_retire_naming_its_revision() {
 /// key is gone, `status` lists the tombstone, and the next prune deletes it.
 #[test]
 fn a_failed_retire_is_reported_and_a_later_prune_finishes_it() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     for point in ["retire-delete", "retire-record"] {
@@ -448,7 +448,7 @@ fn a_once_run_retires_its_seat_after_its_final_record() {
         record,
         "the record changed after final"
     );
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -555,7 +555,7 @@ fn a_once_seat_held_by_a_survivor_stays_until_it_exits() {
 /// seat finds that run's `used` and is refused: the later run keeps it.
 #[test]
 fn a_delayed_once_retire_never_deletes_a_reused_seat() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -689,7 +689,7 @@ fn a_run_prunes_its_places_idle_seats_by_itself() {
 /// hour is claimed under the lock before pruning.
 #[test]
 fn two_runs_ending_together_prune_once() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -832,7 +832,7 @@ fn a_place_without_seat_lifetime_is_refused_idle_and_once() {
 /// unreachable (255); the place goes on with the retire.
 #[test]
 fn a_slow_retire_is_waited_for_only_up_to_the_reply_bound() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -950,7 +950,7 @@ fn the_retirement_record_is_never_written_through_a_link() {
 /// is left; the retire's record keeps its bytes.
 #[test]
 fn a_failed_sweep_keeps_the_key_for_the_next_prune() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1031,7 +1031,7 @@ fn a_key_retired_again_replaces_its_retirement_record() {
 /// take this run's seat.
 #[test]
 fn a_run_that_cannot_write_its_used_record_is_refused() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1092,7 +1092,7 @@ fn a_retire_deletes_only_its_own_keys_tombstones() {
 /// stays, and the summary says nothing was retired.
 #[test]
 fn a_prune_past_its_budget_starts_no_retire_after_a_slow_host_info() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1194,7 +1194,7 @@ fn delete_unused_checkouts_after_days_is_whole_days_from_one() {
 /// A failed append to the seat book is a note; the run is not the book's.
 #[test]
 fn a_failed_seat_book_append_is_a_note() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1266,7 +1266,7 @@ fn a_seat_over_its_cap_starts_cold_with_pruned() {
 /// A failed wipe is a note, and the run goes on with what is there.
 #[test]
 fn a_failed_cap_wipe_is_a_note_and_the_run_goes_on() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1537,7 +1537,7 @@ fn consumer_prune_must_not_treat_permission_denied_as_workspace_gone() {
 /// checks, so the swap is deterministic (ferry-xtx.23; the critic's race).
 #[test]
 fn a_link_swapped_in_during_a_wipe_is_never_followed() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1692,7 +1692,7 @@ fn a_file_at_a_wipe_path_is_deleted() {
 /// delete, and the link's target survives (ferry-xtx.24 (b)).
 #[test]
 fn a_seat_swapped_for_a_link_after_the_walk_is_not_deleted_through() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1985,7 +1985,7 @@ fn an_old_run_with_a_live_survivor_is_kept() {
 /// skipped and deletes nothing.
 #[test]
 fn the_history_pass_never_runs_beside_an_exclusive_run() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -2093,7 +2093,7 @@ fn the_history_pass_never_runs_beside_an_exclusive_run() {
 /// next, with its own, deletes every old run.
 #[test]
 fn a_history_pass_past_its_budget_leaves_the_rest_for_the_next_run() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -2145,7 +2145,7 @@ fn a_history_pass_past_its_budget_leaves_the_rest_for_the_next_run() {
 /// deletes the record and counts the run.
 #[test]
 fn a_run_whose_record_failed_to_delete_is_deleted_by_the_next_pass() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -2271,14 +2271,14 @@ fn a_history_pass_reads_no_young_run_and_reaches_the_old_ones() {
     with_host_policy(dir.path(), HISTORY_DAY);
     let mut first = command(dir.path());
     first.args(["run", "pass", "--local", "--json"]);
-    if cfg!(debug_assertions) {
+    if debug_only() {
         first.env("FERRY_HISTORY_MAX_ENTRIES", "2");
     }
     let out = first.output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", receipt(&out));
     let id = receipt(&out)["id"].as_str().unwrap().to_owned();
     let line = history_logged(&root, &id);
-    if cfg!(debug_assertions) {
+    if debug_only() {
         // Two entries: the old run (read) and the temporary file (a stat);
         // then the pass stops, every retirement record unread.
         assert!(line.contains("deleted 1 runs and 1 other"), "{line}");
@@ -2357,7 +2357,7 @@ fn a_deleted_runs_record_names_how_long_the_host_keeps_history() {
 #[test]
 fn a_late_retirement_never_hides_a_recreated_seat() {
     use std::time::{Duration, Instant};
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");

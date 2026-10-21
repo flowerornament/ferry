@@ -20,8 +20,13 @@ tests: exact commits, refusal versus recipe exit, seat isolation, the
 session stop at the run's end or deadline, and the run surviving client
 loss. Linux-only code is never compiled on a Mac: run the same check on a
 Linux machine (`ferry run check --on <linux-host> --commit <rev>` does
-exactly that) and in a Darwin Nix build
-(`nix build --no-link -L "git+file://$PWD?rev=<rev>"`).
+exactly that) and in the Darwin Nix check
+(`nix build --no-link -L "git+file://$PWD?rev=<rev>#checks.aarch64-darwin.debug"`),
+which runs the tests in a debug build: the shipped package's own tests run
+in release, where every control that needs fault points skips. Every cell
+that claims the controls sets `FERRY_TEST_STRICT=1` (`just check` and the
+`debug` check do), so a control that would skip fails instead. CI's `nix`
+job runs the Linux Nix check.
 
 ## Structure
 
@@ -105,7 +110,7 @@ freeze description states:
 4. its fallible points, each with an injection test (`FERRY_FAIL_AT`);
 5. the record fields it adds;
 6. the capability name of any host behaviour it changes;
-7. which environment cells passed: the Mac `just check`, a Darwin Nix build,
+7. which environment cells passed: the Mac `just check`, the Darwin Nix check,
    and the check on a Linux host.
 
 It also says what it deletes. Ferry grows only when the deletion-first

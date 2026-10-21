@@ -100,6 +100,21 @@ fn scale() -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Whether this control (or clause) can run here: fault points and debug
+/// bounds exist only in a debug build. In a release build it is skipped,
+/// unless the cell claims every control (`FERRY_TEST_STRICT=1`): then a skip
+/// is a failure, never a pass that ran nothing.
+pub fn debug_only() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    assert!(
+        std::env::var_os("FERRY_TEST_STRICT").is_none(),
+        "this control needs a debug build, and FERRY_TEST_STRICT says this cell claims it"
+    );
+    false
+}
+
 /// A repository with `pass` and `fail` (both may run elsewhere) and a
 /// `probe` recipe running `script`; `extra` comes before the recipes.
 pub fn fixture(script: &str, extra: &str) -> TempDir {
@@ -1343,17 +1358,31 @@ pub fn escapee(pidfile: &Path, closed: bool, cleared: bool) -> String {
 
 /// Whether `pid` is gone: no such process, or a zombie (dead, not yet
 /// reaped by its new parent; `kill(pid, 0)` still succeeds on one). Bench
-/// once caught a zombie here (ferry-xtx.25: a test artifact).
+/// once caught a zombie here (ferry-xtx.25: a test artifact). Read as the
+/// product reads it (`record::exited`), never through `ps`, which the
+/// Darwin Nix sandbox cannot run: a state it cannot read is not gone.
 pub fn gone(pid: i32) -> bool {
-    if kill(Pid::from_raw(pid), None).is_err() {
-        return true;
+    kill(Pid::from_raw(pid), None).is_err() || zombie(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn zombie(pid: i32) -> bool {
+    // SZOMB in <sys/proc.h>; the kernel's lookup skips zombies (ESRCH).
+    match libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid, 0) {
+        Ok(info) => info.pbi_status == 5,
+        Err(error) => error.contains(&format!("errno = {},", nix::errno::Errno::ESRCH as i32)),
     }
-    let state = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .unwrap_or_default();
-    state.is_empty() || state.starts_with('Z')
+}
+
+#[cfg(not(target_os = "macos"))]
+fn zombie(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|text| {
+            let (_, fields) = text.rsplit_once(')')?;
+            fields.trim_start().chars().next()
+        })
+        .is_some_and(|state| matches!(state, 'Z' | 'X'))
 }
 
 /// Runs `ferry run pass --local` in a pty with `tostop`, its foreground,

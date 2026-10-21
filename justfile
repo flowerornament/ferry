@@ -1,7 +1,7 @@
 check:
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
-    cargo test --locked --no-fail-fast
+    FERRY_TEST_STRICT=1 cargo test --locked --no-fail-fast
     python3 scripts/test_release.py
     bash scripts/test-home-manager-module.sh
 

@@ -1,4 +1,4 @@
-{ lib, rustPlatform, git, jujutsu, openssh, inetutils, procps, util-linux, stdenv, makeWrapper, python3, sourceRev ? null }:
+{ lib, rustPlatform, git, jujutsu, openssh, inetutils, procps, util-linux, stdenv, makeWrapper, python3, sourceRev ? null, checkType ? "release" }:
 let
   version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 in rustPlatform.buildRustPackage {
@@ -9,7 +9,12 @@ in rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./rust-toolchain.toml ./src ./tests ];
   };
   cargoLock.lockFile = ./Cargo.lock;
-  env = lib.optionalAttrs (sourceRev != null) { FERRY_SOURCE_REV = sourceRev; };
+  # The shipped package's tests run in release, where the controls that
+  # need fault points skip. `checkType = "debug"` (the flake's `debug`
+  # check) runs them all, and claims them: a skip there fails.
+  inherit checkType;
+  env = lib.optionalAttrs (sourceRev != null) { FERRY_SOURCE_REV = sourceRev; }
+    // lib.optionalAttrs (checkType == "debug") { FERRY_TEST_STRICT = "1"; };
   nativeBuildInputs = [ makeWrapper ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ rustPlatform.bindgenHook ];
   nativeCheckInputs = [ git jujutsu python3 inetutils ] ++ lib.optionals stdenv.hostPlatform.isLinux [ procps util-linux ];
   doCheck = true;

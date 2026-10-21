@@ -191,7 +191,7 @@ fn a_ref_no_longer_shipped_is_removed_from_the_seat() {
     assert!(!left.status.success(), "the old ref is still in the seat");
     // A list that cannot be read refuses: going on could keep a stale ref.
     // (Injection exists only in debug builds.)
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let out = command(dir.path())
@@ -276,7 +276,7 @@ fn a_signal_before_dispatch_still_writes_a_receipt() {
 #[test]
 fn a_stalled_place_before_submit_is_refused_within_its_bound() {
     use std::time::{Duration, Instant};
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -322,7 +322,7 @@ fn a_stalled_place_before_submit_is_refused_within_its_bound() {
 #[test]
 fn a_push_that_stalls_is_refused_within_its_progress_bound() {
     use std::time::{Duration, Instant};
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -374,7 +374,7 @@ fn a_push_that_stalls_is_refused_within_its_progress_bound() {
 /// bound is not cut, and its run passes.
 #[test]
 fn a_push_that_keeps_progressing_is_never_cut() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -400,7 +400,7 @@ fn a_push_that_keeps_progressing_is_never_cut() {
 fn a_terminal_signal_stops_a_push_in_its_own_group() {
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -461,7 +461,7 @@ fn a_terminal_signal_stops_a_push_in_its_own_group() {
 #[test]
 fn a_slow_push_is_kept_alive_by_gits_own_progress() {
     use std::io::Read as _;
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -599,7 +599,7 @@ fn a_push_leaves_nothing_of_its_group_behind() {
 /// hold on 738fd0a4).
 #[test]
 fn a_push_whose_state_cannot_be_read_is_not_killed() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -624,7 +624,7 @@ fn a_push_whose_state_cannot_be_read_is_not_killed() {
 #[test]
 fn an_unreadable_state_still_leaves_nothing_of_the_group() {
     use std::time::{Duration, Instant};
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -688,7 +688,7 @@ fn a_failed_push_names_its_fatal_line() {
 #[test]
 fn a_store_setup_that_never_answers_is_refused_within_the_reply_bound() {
     use std::time::{Duration, Instant};
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -736,7 +736,7 @@ fn a_store_setup_that_never_answers_is_refused_within_the_reply_bound() {
 #[test]
 fn an_ssh_whose_pipes_outlive_it_is_refused_within_its_bound() {
     use std::time::{Duration, Instant};
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1153,7 +1153,7 @@ fn a_failure_reading_the_final_record_leaves_the_receipt_submitted() {
 /// "refused" (C1).
 #[test]
 fn a_local_failure_reading_the_final_record_leaves_the_receipt_submitted() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -1202,7 +1202,7 @@ fn a_failed_stop_names_the_places_error() {
 
 #[test]
 fn an_unreachable_place_leaves_the_receipt_submitted_until_ferry_record() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");

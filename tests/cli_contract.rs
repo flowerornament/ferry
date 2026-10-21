@@ -162,7 +162,7 @@ fn a_run_waiting_on_a_host_lock_says_what_holds_it_once() {
 
 #[test]
 fn a_record_read_as_the_run_ends_is_never_not_found() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();

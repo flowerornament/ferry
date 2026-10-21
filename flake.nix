@@ -15,22 +15,27 @@
       eachSystem = nixpkgs.lib.genAttrs systems;
       pkgsFor = system: import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
       rustFor = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-      package = system:
+      package = system: args:
         let
           pkgs = pkgsFor system;
           rust = rustFor pkgs;
           rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
-        in pkgs.callPackage ./package.nix {
+        in pkgs.callPackage ./package.nix ({
           inherit rustPlatform;
           # Compiled in so receipts join each executable to its source.
           sourceRev = self.rev or self.dirtyRev or null;
-        };
+        } // args);
     in {
-      packages = eachSystem (system: { default = package system; });
+      packages = eachSystem (system: { default = package system { }; });
       apps = eachSystem (system: {
         default = { type = "app"; program = "${self.packages.${system}.default}/bin/ferry"; };
       });
-      checks = eachSystem (system: { package = self.packages.${system}.default; });
+      # `debug` is the Nix cell (SPEC §12.13): the same build, its tests in a
+      # debug build, where every control's fault points exist and run.
+      checks = eachSystem (system: {
+        package = self.packages.${system}.default;
+        debug = package system { checkType = "debug"; };
+      });
       # programs.ferry: the package, and the skill symlinked where agents look.
       homeManagerModules.default = import ./nix/home-manager.nix {
         inherit self;

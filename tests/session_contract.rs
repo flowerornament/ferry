@@ -100,7 +100,7 @@ fn a_session_owners_error_is_the_records_reason() {
         ),
     ] {
         // Injection exists only in debug builds.
-        if !fail_at.is_empty() && !cfg!(debug_assertions) {
+        if !fail_at.is_empty() && !debug_only() {
             continue;
         }
         let dir = fixture("true", "");
@@ -231,7 +231,7 @@ fn an_unsupervised_recipes_leftover_is_stopped_at_its_end() {
 #[test]
 fn an_unlistable_session_still_ends_at_its_timeout() {
     // Injection exists only in debug builds.
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -274,7 +274,7 @@ fn an_unlistable_session_still_ends_at_its_timeout() {
 #[test]
 fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
     // Injection exists only in debug builds.
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -347,7 +347,7 @@ fn an_unlistable_sessions_split_group_member_is_a_reported_leftover() {
 #[test]
 fn a_failed_listing_does_not_cut_the_owners_term_grace() {
     // Injection exists only in debug builds.
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("true", "");
@@ -759,7 +759,7 @@ fn a_killed_callers_place_follow_ends_and_the_run_goes_on() {
 
 #[test]
 fn a_dropped_follow_reconnects_and_receives_every_byte() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     // More than one 64 KiB chunk, written in two bursts.
@@ -930,7 +930,7 @@ fn a_caller_whose_stop_fails_or_that_is_signalled_twice_leaves_the_receipt_submi
     // SPEC §4 and A3: while the run may go on, no verdict is claimed; the
     // caller exits 255 naming the next step, and `ferry record` later
     // finalizes the receipt from the place's record.
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     for (fail_at, script, signals, next, outcome, exit) in [
@@ -1142,7 +1142,7 @@ fn a_signal_after_a_lost_verdict_keeps_the_places_code() {
 /// the collect hook runs.
 #[test]
 fn a_stop_during_prepare_spawns_nothing() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -1350,7 +1350,7 @@ fn a_callers_signal_after_the_verdict_is_named_and_keeps_it() {
 
 #[test]
 fn the_deadline_ends_a_run_with_no_client() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -1466,7 +1466,7 @@ fn a_busy_seat_refuses_at_once_naming_the_run() {
 /// names both: the finished run, and the one starting (murail-4a, herald-1b).
 #[test]
 fn a_run_refused_while_the_holder_starts_names_both_possible_holders() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -1557,7 +1557,7 @@ fn a_lock_held_after_its_run_keeps_the_seat_busy() {
 #[test]
 fn a_starting_contender_is_not_named_as_a_finished_runs_lock_holder() {
     // The pause before the seat is a debug-build point.
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -1701,7 +1701,7 @@ fn an_exclusive_runs_leaver_holds_its_seat_but_not_the_host() {
 /// 2324dd77): paused just before finalizing, it still holds it.
 #[test]
 fn a_run_holds_its_seat_until_its_record_is_final() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -1733,7 +1733,7 @@ fn a_run_holds_its_seat_until_its_record_is_final() {
 /// before finalizing still holds the host, and a shared waiter names it.
 #[test]
 fn an_exclusive_run_holds_the_host_until_its_record_is_final() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -1776,7 +1776,7 @@ fn an_exclusive_run_holds_the_host_until_its_record_is_final() {
 /// is admitted.
 #[test]
 fn a_dead_exclusive_runs_leaver_does_not_hold_the_host() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -1904,7 +1904,7 @@ fn a_host_held_by_shared_runs_says_so_alone() {
 /// reproduction, 08211dcd): here, a cleanup-pending marker refuses.
 #[test]
 fn a_prepare_refusal_keeps_its_acquired_seat_until_finalization() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -1937,7 +1937,7 @@ fn a_prepare_refusal_keeps_its_acquired_seat_until_finalization() {
 /// stays held until the refused record is final.
 #[test]
 fn a_host_wait_refusal_keeps_its_seat_until_finalization() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -1972,7 +1972,7 @@ fn a_host_wait_refusal_keeps_its_seat_until_finalization() {
 #[test]
 fn a_partly_taken_host_lease_keeps_its_gate_until_finalization() {
     use fs2::FileExt;
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2015,7 +2015,7 @@ fn a_partly_taken_host_lease_keeps_its_gate_until_finalization() {
 /// paused after the failed finalize, it still holds its seat.
 #[test]
 fn a_failed_finalize_keeps_the_locks_until_the_supervisor_exits() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2044,7 +2044,7 @@ fn a_failed_finalize_keeps_the_locks_until_the_supervisor_exits() {
 /// only what that proves, never "held by shared runs" alone.
 #[test]
 fn an_exclusive_holder_released_between_probes_is_not_claimed_as_shared() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2078,7 +2078,7 @@ fn an_exclusive_holder_released_between_probes_is_not_claimed_as_shared() {
 /// the seat in that window, and its refusal names the old run truthfully.
 #[test]
 fn a_successor_cannot_take_a_seat_whose_finalize_failed() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2126,7 +2126,7 @@ fn a_successor_cannot_take_a_seat_whose_finalize_failed() {
 /// record is final first, then the locks close.
 #[test]
 fn a_supervisor_panic_keeps_its_locks_until_finalization() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2169,7 +2169,7 @@ fn a_supervisor_panic_keeps_its_locks_until_finalization() {
 /// exclusive probe proves it free, and the refusal says retry.
 #[test]
 fn a_host_lock_freed_as_the_wait_ends_says_so() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2188,7 +2188,7 @@ fn a_host_lock_freed_as_the_wait_ends_says_so() {
 /// error is not evidence of one.
 #[test]
 fn a_host_lock_that_cannot_be_probed_names_no_holder() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2387,7 +2387,7 @@ fn a_host_lease_wait_past_its_bound_refuses_naming_the_holder() {
 
 #[test]
 fn output_past_the_cap_is_dropped_and_the_run_goes_on() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("seq 1 100000; echo end", "");
@@ -2406,7 +2406,7 @@ fn output_past_the_cap_is_dropped_and_the_run_goes_on() {
 
 #[test]
 fn a_failed_output_write_is_counted_and_the_run_goes_on() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo hidden", "");
@@ -2504,7 +2504,7 @@ fn the_collect_hook_sees_the_runs_own_id_and_request() {
 
 #[test]
 fn a_panic_inside_the_run_still_reaches_custody_release() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo never", "");
@@ -2529,7 +2529,7 @@ fn a_panic_inside_the_run_still_reaches_custody_release() {
 
 #[test]
 fn injected_collection_and_artifact_failures_keep_the_verdict() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -2592,7 +2592,7 @@ fn uncollected_artifacts_and_an_older_place_are_never_fetched() {
         };
         assert_eq!(got, expected, "{record}");
     }
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     // Completed again from a submitted receipt, its own records edited to
@@ -2728,7 +2728,7 @@ fn artifacts_are_bound_per_file_with_a_status_apart_from_the_verdict() {
         failed["error"].as_str().unwrap().contains("preserved"),
         "{record}"
     );
-    if cfg!(debug_assertions) {
+    if debug_only() {
         let dir = artifact_fixture("echo built > out.txt", "['out.txt']", "");
         let out = ferry(dir.path())
             .env("FERRY_FAIL_AT", "artifact-transfer")
@@ -2751,7 +2751,7 @@ fn artifacts_are_bound_per_file_with_a_status_apart_from_the_verdict() {
 
 #[test]
 fn a_failed_teardown_after_the_verdict_is_a_note() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo done", "");
@@ -2920,7 +2920,7 @@ fn an_escapee_without_fds_is_listed_and_one_without_its_marker_is_not() {
 /// at `MARKER_BOUND`, and the record is final with the survivors `unknown`.
 #[test]
 fn a_hanging_marker_pass_is_abandoned_at_its_bound() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -2951,7 +2951,7 @@ fn a_hanging_marker_pass_is_abandoned_at_its_bound() {
 /// what was seen, the session's survivors included.
 #[test]
 fn a_marker_pass_that_cannot_see_everything_is_unknown() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -3087,7 +3087,7 @@ fn a_session_member_that_ignores_term_is_killed_after_the_grace() {
 /// failed.
 #[test]
 fn a_stop_that_cannot_list_its_session_still_kills_it() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -3138,7 +3138,7 @@ fn a_stop_that_cannot_list_its_session_still_kills_it() {
 /// is reaped, and the member is killed again within the grace.
 #[test]
 fn a_failed_kill_to_one_member_still_empties_the_session() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -3184,7 +3184,7 @@ fn a_failed_kill_to_one_member_still_empties_the_session() {
 /// with `start: null` and the error noted, never hidden (4b review R6).
 #[test]
 fn a_live_survivor_whose_start_cannot_be_read_is_still_reported() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -3266,7 +3266,7 @@ fn a_hanging_ps_cannot_stall_the_stop() {
 /// the run it outlived. Once it is stopped, the seat takes runs again.
 #[test]
 fn a_survivor_holding_its_lock_is_named_and_keeps_the_seat_busy() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
@@ -3399,7 +3399,7 @@ fn a_crashed_supervisor_is_reconciled_to_lost_by_its_caller() {
 
 #[test]
 fn a_record_left_unfinalized_is_reconciled_exactly_once() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -3444,7 +3444,7 @@ fn a_record_left_unfinalized_is_reconciled_exactly_once() {
 
 #[test]
 fn a_failed_reconcile_leaves_the_receipt_submitted_until_the_next_reader() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo ran", "");
@@ -3487,7 +3487,7 @@ fn a_failed_reconcile_leaves_the_receipt_submitted_until_the_next_reader() {
 
 #[test]
 fn a_submit_that_dies_after_reserving_leaves_a_lost_run_and_a_submitted_receipt() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let dir = fixture("echo never", "");
@@ -3514,7 +3514,7 @@ fn a_submit_that_dies_after_reserving_leaves_a_lost_run_and_a_submitted_receipt(
 
 #[test]
 fn a_failed_reservation_or_spawn_refuses_before_anything_runs() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     // A failed sync is met first by the reservation.
@@ -3543,7 +3543,7 @@ fn a_failed_reservation_or_spawn_refuses_before_anything_runs() {
 
 #[test]
 fn a_stop_that_cannot_be_recorded_is_refused_and_the_run_goes_on() {
-    if !cfg!(debug_assertions) {
+    if !debug_only() {
         return;
     }
     let scratch = tempfile::tempdir().unwrap();
