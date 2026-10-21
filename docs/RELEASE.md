@@ -108,13 +108,15 @@ recorded in [`design/2026-10-12-m1-joint-window.md`](design/2026-10-12-m1-joint-
 
 **Activation.** Activation is one atomic rename under `install.lock`, and
 runs already in flight finish on the binary they started with. A run whose
-`host-info` precedes the rename and whose `submit` follows it runs on the
-new binary, and its record names that binary, but its capability and
-protocol checks were made against the old one. After a forward install that
-is harmless. After a rollback, or a release that drops a capability, a run
-checked by one binary is executed by another, and a protocol change is
-refused only after the run has run. Pinned launch (`ferry-ljc.2`) closes
-that gap. Install places before their callers: a new caller refuses an old
+`host-info` precedes the rename and whose `submit` follows it is refused
+before anything is reserved (125, "the place's ferry changed since it was
+asked; run again"): the request carries the digest `host-info` reported,
+and the place compares it with the file it runs, from which it also starts
+the run's supervisor and session (SPEC §6, `pinned`). A rerun meets one
+binary. Across the install that first brings `pinned`, the old binary does
+not advertise it, so that one flip is not checked (the record still names
+the binary that ran); a rollback to a binary without `pinned` refuses the
+request as unreadable. Install places before their callers: a new caller refuses an old
 place with a typed 125 that names its revision, while an old caller may
 meet a new place it cannot read.
 
@@ -127,8 +129,8 @@ meet a new place it cannot read.
   names that binary (`binary_sha256`), so an install during a run is never
   mis-attributed. A caller refuses a place without `detach` (125, naming the
   place's `source_rev`): install places before or with their callers.
-- A run submitted across an activation is checked by the old binary and
-  executed by the new one (see **Activation**).
+- A run is never checked by one binary and executed by another, once both
+  advertise `pinned` (see **Activation**).
 - Builds from before receipts carried the source revision report it as
   unknown. A receipt without these fields says nothing about provenance.
 

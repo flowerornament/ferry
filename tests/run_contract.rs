@@ -1570,6 +1570,8 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     // A file `unreachable` on the host fails every follow, as a dead link;
     // a file `fail-record-once` fails the next `place record` of a final
     // record, once (a read while the run waits is narration, not the verdict);
+    // FERRY_TEST_UNPIN: host-info answers without `pinned`, as a place
+    // from before it;
     // FERRY_TEST_SLOW_INFO names a file: while it exists, host-info first
     // sleeps the seconds it holds, then answers;
     // FERRY_TEST_HANG_INFO names a file: host-info writes its pid there and
@@ -1587,7 +1589,7 @@ fn remote_command(dir: &Path, binary: &str, args: &[&str]) -> Command {
     // first prints a progress byte every 0.2 s for that long, then pushes;
     // FERRY_TEST_HANG_INIT names a file: the store setup writes its pid
     // there and hangs.
-    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_FAIL_PUSH\" ]; then echo \"fatal: the place refused the push\" >&2; exit 1; fi; if [ -n \"$FERRY_TEST_PUSH_LEAVER\" ]; then sleep 120 & echo $! > \"$FERRY_TEST_PUSH_LEAVER\"; fi; if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi; if [ -n \"$FERRY_TEST_HANG_PUSH\" ]; then echo $$ > \"$FERRY_TEST_HANG_PUSH\"; case \" $* \" in *LogLevel=ERROR*) ;; *) (n=0; while [ $n -lt 240 ]; do echo \"debug1: an ssh diagnostic\" >&2; sleep 0.5; n=$((n + 1)); done) & ;; esac; exec sleep 120; fi; if [ -n \"$FERRY_TEST_THROTTLE_PUSH\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; t=$(mktemp); { while :; do dd bs=32768 count=1 of=\"$t\" 2>/dev/null; [ -s \"$t\" ] || break; cat \"$t\"; sleep 0.1; done; rm -f \"$t\"; } | sh -c \"$last\"; exit $?; fi; if [ -n \"$FERRY_TEST_TRICKLE_PUSH\" ]; then n=0; while [ $n -lt $((FERRY_TEST_TRICKLE_PUSH * 5)) ]; do printf . >&2; sleep 0.2; n=$((n + 1)); done; fi;; *git-upload-pack*) if [ -n \"$FERRY_TEST_HANG_LSREMOTE\" ]; then echo $$ > \"$FERRY_TEST_HANG_LSREMOTE\"; exec sleep 120; fi;; *\"git init\"*) if [ -n \"$FERRY_TEST_HANG_INIT\" ]; then echo $$ > \"$FERRY_TEST_HANG_INIT\"; exec sleep 30; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ] && [ -e \"$FERRY_TEST_HOST/.local/state/ferry/v1/records/$(printf %s \"${last##* }\" | tr -d \"'\").json\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_SLOW_INFO\" ] && [ -e \"$FERRY_TEST_SLOW_INFO\" ]; then sleep \"$(cat \"$FERRY_TEST_SLOW_INFO\")\"; fi; if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi; if [ -n \"$FERRY_TEST_HOLD_PIPE\" ]; then sleep 600 & echo $! > \"$FERRY_TEST_HOLD_PIPE\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
+    fs::write(tools.join("ssh"), "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *git-receive-pack*) if [ -n \"$FERRY_TEST_FAIL_PUSH\" ]; then echo \"fatal: the place refused the push\" >&2; exit 1; fi; if [ -n \"$FERRY_TEST_PUSH_LEAVER\" ]; then sleep 120 & echo $! > \"$FERRY_TEST_PUSH_LEAVER\"; fi; if [ -n \"$FERRY_TEST_SLOW_PUSH\" ]; then touch \"$FERRY_TEST_SLOW_PUSH\"; sleep 3; fi; if [ -n \"$FERRY_TEST_HANG_PUSH\" ]; then echo $$ > \"$FERRY_TEST_HANG_PUSH\"; case \" $* \" in *LogLevel=ERROR*) ;; *) (n=0; while [ $n -lt 240 ]; do echo \"debug1: an ssh diagnostic\" >&2; sleep 0.5; n=$((n + 1)); done) & ;; esac; exec sleep 120; fi; if [ -n \"$FERRY_TEST_THROTTLE_PUSH\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; t=$(mktemp); { while :; do dd bs=32768 count=1 of=\"$t\" 2>/dev/null; [ -s \"$t\" ] || break; cat \"$t\"; sleep 0.1; done; rm -f \"$t\"; } | sh -c \"$last\"; exit $?; fi; if [ -n \"$FERRY_TEST_TRICKLE_PUSH\" ]; then n=0; while [ $n -lt $((FERRY_TEST_TRICKLE_PUSH * 5)) ]; do printf . >&2; sleep 0.2; n=$((n + 1)); done; fi;; *git-upload-pack*) if [ -n \"$FERRY_TEST_HANG_LSREMOTE\" ]; then echo $$ > \"$FERRY_TEST_HANG_LSREMOTE\"; exec sleep 120; fi;; *\"git init\"*) if [ -n \"$FERRY_TEST_HANG_INIT\" ]; then echo $$ > \"$FERRY_TEST_HANG_INIT\"; exec sleep 30; fi;; *\" place \"*\"follow\"*) if [ -e \"$FERRY_TEST_HOST/unreachable\" ]; then exit 255; fi;; *\" place \"*\"record\"*) if [ -e \"$FERRY_TEST_HOST/fail-record-once\" ] && [ -e \"$FERRY_TEST_HOST/.local/state/ferry/v1/records/$(printf %s \"${last##* }\" | tr -d \"'\").json\" ]; then rm -f \"$FERRY_TEST_HOST/fail-record-once\"; exit 255; fi;; *host-info*) if [ -n \"$FERRY_TEST_UNPIN\" ]; then cd \"$FERRY_TEST_HOST\" || exit 125; export HOME=\"$FERRY_TEST_HOST\"; sh -c \"$last\" | sed 's/\"pinned\",//; s/,\"pinned\"//'; exit 0; fi; if [ -n \"$FERRY_TEST_SLOW_INFO\" ] && [ -e \"$FERRY_TEST_SLOW_INFO\" ]; then sleep \"$(cat \"$FERRY_TEST_SLOW_INFO\")\"; fi; if [ -n \"$FERRY_TEST_HANG_INFO\" ]; then echo $$ > \"$FERRY_TEST_HANG_INFO\"; exec sleep 600; fi; if [ -n \"$FERRY_TEST_HOLD_PIPE\" ]; then sleep 600 & echo $! > \"$FERRY_TEST_HOLD_PIPE\"; exit 255; fi;; esac\ncd \"$FERRY_TEST_HOST\" || exit 125\nexport HOME=\"$FERRY_TEST_HOST\"\nexec sh -c \"$last\"\n").unwrap();
     fs::set_permissions(tools.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.join("config/ferry");
     fs::create_dir_all(&config).unwrap();
@@ -6403,4 +6405,190 @@ fn needs_are_checked_against_what_the_place_reports() {
         "{record}"
     );
     assert!(record["host_source_rev"].is_null(), "{record}");
+}
+
+/// A copy of this build that is another binary (another digest) and runs
+/// the same: on macOS re-signed under another identifier (an appended byte
+/// would break its signature), elsewhere one byte appended. False where
+/// macOS's `codesign` cannot run (the Darwin Nix sandbox).
+fn another_build(to: &Path) -> bool {
+    fs::copy(env!("CARGO_BIN_EXE_ferry"), to).unwrap();
+    if cfg!(target_os = "macos") {
+        let Ok(signed) = Command::new("/usr/bin/codesign")
+            .args(["-f", "-s", "-", "-i", "dev.ferry.flipped"])
+            .arg(to)
+            .output()
+        else {
+            return false;
+        };
+        assert!(signed.status.success(), "{signed:?}");
+    } else {
+        std::io::Write::write_all(
+            &mut fs::OpenOptions::new().append(true).open(to).unwrap(),
+            b"\0",
+        )
+        .unwrap();
+    }
+    assert_ne!(
+        sha256(&fs::read(to).unwrap()),
+        sha256(&fs::read(env!("CARGO_BIN_EXE_ferry")).unwrap())
+    );
+    true
+}
+
+/// SPEC §12 item 28 (ferry-ljc.2): the place's binary is replaced after
+/// `describe` answered and before `submit` (during the push). The run is
+/// refused, naming the change, with no reservation and no record on the
+/// place; a rerun passes on the new binary, and its receipt names it.
+#[test]
+fn a_binary_flipped_between_describe_and_submit_is_refused_then_runs() {
+    let dir = fixture();
+    let marker = dir.path().join("pushing");
+    let command = |slow: bool| {
+        let mut command = remote_command(
+            dir.path(),
+            ".local/bin/ferry",
+            &["run", "pass", "--on", "test-host", "--json"],
+        );
+        if slow {
+            command.env("FERRY_TEST_SLOW_PUSH", &marker);
+        }
+        command
+    };
+    // Built before the run: the flip itself is one rename, between the
+    // push's start and its end, never during submit.
+    let bin = dir.path().join("host/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    if !another_build(&dir.path().join("flipped")) {
+        eprintln!("skipped: no codesign here");
+        return;
+    }
+    let flipped = sha256(&fs::read(dir.path().join("flipped")).unwrap());
+    let caller = command(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = common::startup_deadline();
+    while !marker.exists() {
+        assert!(std::time::Instant::now() < deadline, "no push");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // describe has answered (the push follows it): flip, by rename.
+    fs::copy(dir.path().join("flipped"), bin.join(".ferry.flip")).unwrap();
+    fs::rename(bin.join(".ferry.flip"), bin.join("ferry")).unwrap();
+    let out = caller.wait_with_output().unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(125), "{record}");
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .contains("the place's ferry changed since it was asked; run again"),
+        "{record}"
+    );
+    let id = record["id"].as_str().unwrap();
+    let records = dir.path().join("host/.local/state/ferry/v1/records");
+    for name in [format!("{id}.json"), format!("{id}.reserved.json")] {
+        assert!(!records.join(&name).exists(), "{name}: {record}");
+    }
+    // A rerun asks again, meets one binary and names it. (remote_command
+    // stages this build again: put the flipped one back after it.)
+    let mut rerun = command(false);
+    fs::copy(dir.path().join("flipped"), bin.join(".ferry.flip")).unwrap();
+    fs::rename(bin.join(".ferry.flip"), bin.join("ferry")).unwrap();
+    let out = rerun.output().unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    assert_eq!(record["host_binary_sha256"], flipped.as_str(), "{record}");
+}
+
+/// SPEC §12 item 28: a request with `binary_sha256` goes only to a place
+/// advertising `pinned`; one from before it would refuse the field.
+#[test]
+fn a_place_without_pinned_is_never_sent_the_digest() {
+    let dir = fixture();
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .env("FERRY_TEST_UNPIN", "1")
+    .output()
+    .unwrap();
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    let id = record["id"].as_str().unwrap();
+    let request: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            dir.path()
+                .join(format!("host/.local/state/ferry/v1/runs/{id}/request.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(request.get("binary_sha256").is_none(), "{request}");
+    // With `pinned`, it is sent: describe's digest.
+    let out = remote_command(
+        dir.path(),
+        ".local/bin/ferry",
+        &["run", "pass", "--on", "test-host", "--json"],
+    )
+    .output()
+    .unwrap();
+    let id = receipt(&out)["id"].as_str().unwrap().to_owned();
+    let request: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            dir.path()
+                .join(format!("host/.local/state/ferry/v1/runs/{id}/request.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        request["binary_sha256"],
+        sha256(&fs::read(env!("CARGO_BIN_EXE_ferry")).unwrap()).as_str(),
+        "{request}"
+    );
+}
+
+/// The place's own check (SPEC §6): a request naming another digest is
+/// refused before anything is reserved; a local run carries the caller's
+/// own, which its place (the same file) always matches.
+#[test]
+fn a_request_for_another_binary_is_refused_before_reserving() {
+    let dir = fixture();
+    let out = run(dir.path(), &["run", "pass", "--local", "--json"]);
+    let record = receipt(&out);
+    assert_eq!(out.status.code(), Some(0), "{record}");
+    let state = dir.path().join(".ferry/local/v1");
+    let id = record["id"].as_str().unwrap();
+    let mut request: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join(format!("runs/{id}/request.json"))).unwrap())
+            .unwrap();
+    assert_eq!(
+        request["binary_sha256"], record["caller_binary_sha256"],
+        "{request}"
+    );
+    request["id"] = "1-another".into();
+    request["binary_sha256"] = "0".repeat(64).into();
+    let mut submit = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["place", "--state"])
+        .arg(&state)
+        .arg("submit")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        submit.stdin.as_mut().unwrap(),
+        format!("{request}\n").as_bytes(),
+    )
+    .unwrap();
+    let out = submit.wait_with_output().unwrap();
+    let reply = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(125), "{reply}");
+    assert!(reply.contains("changed since it was asked"), "{reply}");
+    assert!(!state.join("records/1-another.reserved.json").exists());
+    assert!(!state.join("runs/1-another").exists());
 }

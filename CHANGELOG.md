@@ -4,6 +4,14 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **One binary checks and runs a request.** If a place's Ferry is replaced
+  between the caller's `host-info` and its `submit` (an install or a
+  rollback during the push), the run is refused before anything is reserved
+  (125, "the place's ferry changed since it was asked; run again") instead of
+  running on a binary that was never checked. The place starts its
+  supervisor and the run's session from the very file it checked. New
+  capability `pinned`; the caller sends the digest only to a place that
+  advertises it.
 - **`needs` is checked on every route.** `--local` now refuses (125) a
   recipe whose `needs` this machine lacks, naming what is missing: a recipe
   that needs `linux-x86_64`, run `--local` on a Mac, is refused instead of

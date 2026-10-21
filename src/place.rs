@@ -91,7 +91,7 @@ impl HostResult {
             outcome: Outcome::Refused,
             exit_code: 125,
             state: None,
-            binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
+            binary_sha256: receipt::digest(&fs::read(receipt::own_exe()?)?),
             source_rev: Some(receipt::source_rev()),
             exe: receipt::exe_path(),
             once: request.once,
@@ -153,6 +153,22 @@ fn refuse(why: &str, next: &str) -> i32 {
     125
 }
 
+/// The binary the caller checked must be the one that runs the request
+/// (SPEC §6, `pinned`): a request naming another digest is refused before
+/// anything is reserved. `own_exe` is the image this process runs, the
+/// same file on every call, so the supervisor starts from the file checked.
+fn other_binary(request: &Request) -> Result<Option<i32>> {
+    match &request.binary_sha256 {
+        Some(asked) if *asked != receipt::digest(&fs::read(receipt::own_exe()?)?) => {
+            Ok(Some(refuse(
+                "the place's ferry changed since it was asked; run again",
+                "run again",
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Reads, validates and starts a request. Refusals exit 125 and nothing ran.
 pub fn submit(root: &Path) -> Result<i32> {
     let mut line = String::new();
@@ -180,6 +196,9 @@ pub fn submit(root: &Path) -> Result<i32> {
         reply(&serde_json::json!({"id": request.id, "pid": pid}));
         return Ok(0);
     }
+    if let Some(refused) = other_binary(&request)? {
+        return Ok(refused);
+    }
     if execution::fail_at("submit-spawn") {
         return Ok(refuse(
             "submit-spawn: injected by FERRY_FAIL_AT",
@@ -187,7 +206,7 @@ pub fn submit(root: &Path) -> Result<i32> {
         ));
     }
     // Paused on its stdin: nothing runs until the reservation names it.
-    let mut supervisor = Command::new(std::env::current_exe()?)
+    let mut supervisor = Command::new(receipt::own_exe()?)
         .arg("place")
         .arg("--state")
         .arg(root)

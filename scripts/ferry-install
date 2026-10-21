@@ -33,9 +33,9 @@
 # moves, so a failed build or check leaves the working generation active. A
 # failed check after the flip flips back. Running sessions keep the executable
 # they started with. A run whose host-info precedes a flip and whose submit
-# follows it runs on the new binary, and its record names that binary, but
-# its capability checks were made against the old one (RELEASE.md,
-# Activation; pinned launch, ferry-ljc.2, closes that gap).
+# follows it is refused before reserving: the place checks the digest the
+# caller was given against the file it runs (RELEASE.md, Activation; SPEC
+# §6, pinned).
 #
 # verify-caller only reads: the caller pin lives in the caller's Nix
 # configuration and changes through its normal workflow.

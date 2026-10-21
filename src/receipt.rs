@@ -19,6 +19,7 @@ pub const CAPABILITIES: &[&str] = &[
     "detach",
     "retire",
     "seat-lifetime",
+    "pinned",
     "run-history",
     "ship",
     "status",
@@ -55,9 +56,34 @@ pub fn source_rev() -> String {
 
 /// The path of the running executable, as the kernel resolved it.
 pub fn exe_path() -> Option<String> {
-    std::env::current_exe()
-        .ok()
-        .map(|path| path.display().to_string())
+    #[cfg(target_os = "linux")]
+    let path = fs::read_link("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let path = own_exe();
+    path.ok().map(|path| path.display().to_string())
+}
+
+/// The file this process runs (SPEC §6, pinned binary): the image the
+/// kernel loaded, never a path re-resolved later, so an install's flip of
+/// `~/.local/bin/ferry` cannot make a digest or a spawn name another file.
+/// On Linux, `/proc/self/exe` itself: it reads and executes the loaded
+/// image even after an install renamed another file over its path.
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)]
+pub fn own_exe() -> std::io::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from("/proc/self/exe"))
+}
+/// The file this process runs: macOS keeps the invoked path in
+/// `current_exe`, so the kernel's own record of the image is asked.
+#[cfg(target_os = "macos")]
+pub fn own_exe() -> std::io::Result<std::path::PathBuf> {
+    libproc::proc_pid::pidpath(i32::try_from(std::process::id()).unwrap_or(-1))
+        .map(std::path::PathBuf::from)
+        .map_err(std::io::Error::other)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn own_exe() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe()?.canonicalize()
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq)]

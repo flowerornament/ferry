@@ -269,7 +269,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         name.clone_into(&mut record.machine);
         record.machine_features = hosts.host[name].capabilities().into_iter().collect();
     }
-    let request = execution::Request {
+    let mut request = execution::Request {
         protocol: receipt::PROTOCOL,
         id: record.id.clone(),
         token: receipt::run_id()?,
@@ -296,6 +296,10 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
         wait_seconds: options.wait_seconds,
         waits_end_ms: None,
         once: options.once,
+        // A local place runs this very binary (SPEC §6, pinned binary); a
+        // remote one's digest is its describe's, set where it is checked.
+        binary_sha256: matches!(route, config::Route::Local)
+            .then(|| record.caller_binary_sha256.clone()),
     };
     record.token = Some(request.token.clone());
     execution::interrupted()?;
@@ -311,7 +315,7 @@ fn dispatch(root: &Path, options: &Run, record: &mut receipt::Receipt) -> Result
     transport::not_inside(&place, &record.machine)?;
     // Until the place is asked to run it, nothing ran: any failure here is
     // a refusal (125), and a killed caller leaves no receipt claiming a run.
-    transport::ship(root, &place, &request, &objects, record)?;
+    transport::ship(root, &place, &mut request, &objects, record)?;
     execution::interrupted()?;
     // Every caller fact, stored just before the place is asked to run the
     // request: lost until the final receipt replaces it.
@@ -492,7 +496,7 @@ fn new_record(recipe: &str, seat: &str) -> Result<receipt::Receipt> {
         outcome: receipt::Outcome::Refused,
         exit_code: 125,
         state: None,
-        caller_binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
+        caller_binary_sha256: receipt::digest(&fs::read(receipt::own_exe()?)?),
         started_ms: receipt::now_ms(),
         caller_source_rev: Some(receipt::source_rev()),
         caller_exe: receipt::exe_path(),

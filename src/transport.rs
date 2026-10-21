@@ -233,7 +233,7 @@ pub struct HostInfo {
 pub fn host_info() -> Result<HostInfo> {
     Ok(HostInfo {
         protocol: receipt::PROTOCOL,
-        binary_sha256: receipt::digest(&fs::read(std::env::current_exe()?)?),
+        binary_sha256: receipt::digest(&fs::read(receipt::own_exe()?)?),
         os_arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         cores: std::thread::available_parallelism()?.get(),
         source_rev: Some(receipt::source_rev()),
@@ -424,7 +424,7 @@ impl Place<'_> {
     fn verb(&self, args: &[&str]) -> Result<Command> {
         match self {
             Place::Local(state) => {
-                let mut command = Command::new(std::env::current_exe()?);
+                let mut command = Command::new(receipt::own_exe()?);
                 command.arg("place").arg("--state").arg(state).args(args);
                 Ok(command)
             }
@@ -480,7 +480,7 @@ impl Place<'_> {
 pub fn ship(
     root: &Path,
     place: &Place,
-    request: &Request,
+    request: &mut Request,
     objects: &[(PathBuf, String)],
     record: &mut Receipt,
 ) -> Result<()> {
@@ -536,6 +536,11 @@ pub fn ship(
             let place = format!("machine {}", record.machine);
             if let Err(why) = config::lacks(&request.recipe, &place, &facts, &info.capabilities) {
                 return refused(record, why);
+            }
+            // Whatever runs it must be the binary checked here (SPEC §6),
+            // asked only of a place that knows the field.
+            if info.capabilities.iter().any(|c| c == "pinned") {
+                request.binary_sha256 = Some(info.binary_sha256.clone());
             }
             init_store(ssh(&machine.ssh)?.arg(format!(
                 "mkdir -p {store} && git init -q --bare {store}",

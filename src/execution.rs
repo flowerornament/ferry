@@ -51,6 +51,11 @@ pub struct Request {
     /// The seat lives for this run only (SPEC §9 "one run").
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub once: bool,
+    /// The digest of the binary whose `describe` the caller checked, sent
+    /// only to a place advertising `pinned` (SPEC §6): the place refuses
+    /// to run it with any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
 }
 impl Request {
     /// The bound on all lock waits together.

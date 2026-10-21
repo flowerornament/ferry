@@ -529,7 +529,7 @@ fn spawn_session(
 ) -> Result<(std::io::Result<std::process::Child>, Result<()>)> {
     crate::lock::close_on_exec(lock, false)?;
     // One pipe for both streams keeps the order they were written in.
-    let spawned = Command::new(std::env::current_exe()?)
+    let spawned = Command::new(crate::receipt::own_exe()?)
         .arg("execute-session")
         .arg(spec)
         .arg(result_path)

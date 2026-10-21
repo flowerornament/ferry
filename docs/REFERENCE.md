@@ -164,6 +164,7 @@ needs = ["admission"]
 | `retire` | the place's `retire` verb for `ferry seats prune`; prune refuses a place without it (125, naming its `source_rev`) |
 | `seat-lifetime` | `run --once`, `seats prune --idle`, and a `retire` that checks the seat's latest use, never deletes during an exclusive run, and renames to a tombstone first; a `--once` run or an idle retire refuses a place without it |
 | `run-history` | `delete_run_history_after_days` in `host.toml`, and a not-found answer that names it |
+| `pinned` | the request carries the digest `host-info` reported, and the place refuses (125, before reserving) to run it on any other binary; the caller sends it only to a place advertising `pinned` |
 | `ship` | `[[also_send]]` requests (`[[ship]]` in version 1) and the one store; a caller refuses a place without it before pushing anything (125, naming its `source_rev`) |
 | `status` | the place's `status` verb; `ferry status` refuses a place without it (125, naming its `source_rev`) |
 
