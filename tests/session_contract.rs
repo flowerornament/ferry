@@ -3064,19 +3064,45 @@ fn a_platform_binary_the_recipe_left_makes_the_pass_unknown() {
     let left = Owned(pidfile);
     let out = bounded_output(ferry(dir.path()).args(["run", "probe", "--local", "--json"]));
     let record = receipt(&out);
-    assert_eq!(record["outcome"], "ran-pass", "{record}");
+    let pid = left.pid().unwrap();
+    assert_eq!(record["outcome"], "ran-pass", "pid {pid}: {record}");
     assert!(
-        kill(Pid::from_raw(left.pid().unwrap()), None).is_ok(),
-        "the platform binary ended early: {record}"
+        kill(Pid::from_raw(pid), None).is_ok(),
+        "the platform binary (pid {pid}) ended early: {record}"
     );
-    assert_eq!(record["custody"]["survivors"], "unknown", "{record}");
     let error = record["custody"]["error"].as_str().unwrap_or_default();
+    // A host that reads a platform binary's environment (GitHub's macOS
+    // runner, not a §12 cell) lists it as marked: the withheld case is not
+    // produced there, and the pass must still name it.
+    let read = error
+        .split("marked [")
+        .skip(1)
+        .filter_map(|rest| rest.split(']').next())
+        .any(|pids| pids.split(", ").any(|p| p == pid.to_string()));
+    if read {
+        eprintln!(
+            "16a: this host reads a platform binary environment; the withheld case was not produced"
+        );
+        let survivors = &record["custody"]["survivors"];
+        let listed = survivors
+            .as_array()
+            .is_some_and(|list| list.iter().any(|s| s["pid"] == pid));
+        assert!(
+            *survivors == "unknown" || listed,
+            "pid {pid}, read: {record}"
+        );
+        return;
+    }
+    assert_eq!(
+        record["custody"]["survivors"], "unknown",
+        "pid {pid}: {record}"
+    );
     let withheld = error
         .split("its environment is withheld: ")
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|count| count.parse::<u32>().ok());
-    assert!(withheld >= Some(1), "{record}");
+    assert!(withheld >= Some(1), "pid {pid}: {record}");
 }
 
 /// A stop ends the recipe, and collect still runs after it under the same
