@@ -306,6 +306,11 @@ fn a_stalled_place_before_submit_is_refused_within_its_bound() {
         "{record}"
     );
     assert!(took < Duration::from_secs(30), "{took:?}");
+    // The bound was hit at host-info, not before the fake ssh reached it.
+    assert!(
+        pidfile.exists(),
+        "refused before host-info's ssh started: {record}"
+    );
     // The caller stopped its own ssh at the bound.
     let pid: i32 = fs::read_to_string(&pidfile)
         .unwrap()
@@ -695,6 +700,7 @@ fn a_store_setup_that_never_answers_is_refused_within_the_reply_bound() {
     }
     let dir = fixture("true", "");
     let pidfile = dir.path().join("hung-init.pid");
+    let bound = common::slack();
     let started = Instant::now();
     let out = remote_command(
         dir.path(),
@@ -703,8 +709,8 @@ fn a_store_setup_that_never_answers_is_refused_within_the_reply_bound() {
     )
     .env("FERRY_TEST_HANG_INIT", &pidfile)
     // Room for the short replies before it (host-info) on a loaded machine:
-    // only the store setup is meant to reach the bound.
-    .env("FERRY_SSH_REPLY_MS", "5000")
+    // only the store setup is meant to reach the bound (ferry-xtx.39).
+    .env("FERRY_SSH_REPLY_MS", bound.as_millis().to_string())
     .output()
     .unwrap();
     let took = started.elapsed();
@@ -718,8 +724,13 @@ fn a_store_setup_that_never_answers_is_refused_within_the_reply_bound() {
         "{record}"
     );
     assert!(
-        took < Duration::from_secs(5) + common::slack() + Duration::from_secs(10),
+        took < bound + common::slack() + Duration::from_secs(10),
         "{took:?}"
+    );
+    // The bound was hit at the store setup, not at a reply before it.
+    assert!(
+        pidfile.exists(),
+        "refused before the store setup's ssh started: {record}"
     );
     let pid: i32 = fs::read_to_string(&pidfile)
         .unwrap()
