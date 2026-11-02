@@ -376,6 +376,19 @@ fn seats_prune_idle_retires_only_what_is_idle_on_both_clocks() {
     let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&used).unwrap()).unwrap();
     value["ms"] = serde_json::json!(now_ms() - 2 * DAY_MS);
     fs::write(&used, value.to_string()).unwrap();
+    // And idle on the other caller's own clock: only the book's caller
+    // scope keeps this prune from it.
+    let foreign_book = dir.path().join("foreign-state/ferry/seats.jsonl");
+    let aged: Vec<String> = fs::read_to_string(&foreign_book)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut line: serde_json::Value = serde_json::from_str(line).unwrap();
+            line["last_used_ms"] = serde_json::json!(now_ms() - 2 * DAY_MS);
+            line.to_string()
+        })
+        .collect();
+    fs::write(&foreign_book, aged.join("\n") + "\n").unwrap();
     age(dir.path(), &keys["idle"], 2 * DAY_MS, false);
     age(dir.path(), &keys["reused"], 2 * DAY_MS, true);
     age(dir.path(), &keys["busy"], 2 * DAY_MS, false);
