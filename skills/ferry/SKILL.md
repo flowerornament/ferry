@@ -2,7 +2,7 @@
 name: ferry
 description: "Run a repository's recipe at an exact commit on a build machine (or locally in a clean checkout) and read what happened, with Ferry. Use this skill whenever you need to run a project's gate, tests or measurements on another machine (`ferry run … --on <machine>`), when a repository has a ferry.toml or a `just remote …` recipe that wraps ferry, when you must interpret a Ferry receipt, exit code (124, 125, 128+n, 255) or refusal, when a seat is busy or refuses, when an exclusive/timing run waits for the host lease, or when you must decide whether a red result is your code or the infrastructure."
 metadata:
-  { "version": "0.1.6", "openclaw": { "emoji": "⛴️", "os": ["darwin", "linux"], "requires": { "bins": ["ferry", "git", "ssh"] } } }
+  { "version": "0.1.8", "openclaw": { "emoji": "⛴️", "os": ["darwin", "linux"], "requires": { "bins": ["ferry", "git", "ssh"] } } }
 ---
 
 # ferry
@@ -138,9 +138,10 @@ anything after the verdict is noted in `reason` ("after the verdict: …").
 - **Stale seats:** `ferry seats prune` retires your seats whose workspace is
   gone; it skips busy ones and only names seats you recorded. "kept …
   unknown" means it could not prove the workspace gone (a denied lookup, a
-  missing parent directory, another device); it never deletes then. A
-  workspace deleted together with its parent stays "unknown": tell the
-  operator. A cap or retire note about a symbolic link or another device
+  missing parent directory, an unmounted volume); it never deletes then.
+  Such a seat still ends by itself: each remote run prunes seats you have
+  not used for 7 days (`delete_unused_checkouts_after_days`), so you need
+  not act. A cap or retire note about a symbolic link or another device
   means the place's `seats/` is not a plain directory on its
   state disk: tell the operator.
 

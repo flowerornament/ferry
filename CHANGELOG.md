@@ -4,6 +4,8 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+## v0.1.8 - 2026-11-01
+
 - **A reboot no longer strands a Mac caller's seats.** macOS renumbers an
   APFS volume's device at mount, so after a reboot `ferry seats prune` kept
   every seat recorded before it as `unknown` ("not on the device recorded
