@@ -288,7 +288,9 @@ fn a_stalled_place_before_submit_is_refused_within_its_bound() {
         &["run", "pass", "--on", "test-host", "--json"],
     )
     .env("FERRY_TEST_HANG_INFO", &pidfile)
-    .env("FERRY_SSH_REPLY_MS", "2000")
+    // Long enough for a loaded machine's fake ssh to reach host-info and
+    // write its pid before the caller stops it (ferry-xtx.35).
+    .env("FERRY_SSH_REPLY_MS", "5000")
     .output()
     .unwrap();
     let took = started.elapsed();
