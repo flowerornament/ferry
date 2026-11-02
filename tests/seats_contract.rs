@@ -781,12 +781,44 @@ fn a_run_prunes_its_places_idle_seats_by_itself() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("ferry: pruned test-host: retired 1"));
 }
 
-/// SPEC §12 item 23, the rest: without the key nothing is retired; with an
+/// SPEC §12 item 23: without the key the default of 7 days applies: a seat
+/// unused for eight days is retired, one unused for two is kept.
+#[test]
+fn an_automatic_prune_without_its_key_retires_what_is_unused_for_seven_days() {
+    let dir = fixture("true", "");
+    let seats = dir.path().join("host/.local/state/ferry/v1/seats");
+    let mut keys = vec![];
+    for (name, days) in [("stale", 8), ("recent", 2)] {
+        let repo = workspace(dir.path(), name);
+        assert_eq!(remote_pass(dir.path(), &repo).status.code(), Some(0));
+        let key = key_of(dir.path(), &repo);
+        age(dir.path(), &key, days * DAY_MS, false);
+        keys.push(key);
+    }
+    let _ = fs::remove_file(dir.path().join("state/ferry/pruned.json"));
+    let out = remote_pass(dir.path(), dir.path());
+    assert_eq!(out.status.code(), Some(0));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("ferry: pruned test-host: retired 1 unused for 7d"),
+        "{said}"
+    );
+    assert!(
+        !seats.join(&keys[0]).exists(),
+        "kept an eight-day seat: {said}"
+    );
+    assert!(
+        seats.join(&keys[1]).exists(),
+        "retired a two-day seat: {said}"
+    );
+}
+
+/// SPEC §12 item 23, the rest: with an
 /// exclusive run holding the place, the automatic prune retires nothing;
 /// with the place unreachable at the run's end, the run keeps its own code
 /// and `--json`, and nothing is retired.
 #[test]
-fn an_automatic_prune_retires_nothing_without_its_key_beside_an_exclusive_run_or_unreached() {
+fn an_automatic_prune_retires_nothing_beside_an_exclusive_run_or_unreached() {
     let scratch = tempfile::tempdir().unwrap();
     let (started, release) = (
         scratch.path().join("started"),
@@ -813,12 +845,6 @@ fn an_automatic_prune_retires_nothing_without_its_key_beside_an_exclusive_run_or
         let _ = fs::remove_file(dir.path().join("state/ferry/pruned.json"));
         age(dir.path(), &old_key, 2 * DAY_MS, false);
     };
-    // Without the key: an old seat stays.
-    unclaimed();
-    let out = remote_pass(dir.path(), dir.path());
-    assert_eq!(out.status.code(), Some(0));
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("pruned"));
-    assert!(seat.exists(), "retired without the key");
     fs::write(
         dir.path().join("machines-top.toml"),
         "delete_unused_checkouts_after_days = 1

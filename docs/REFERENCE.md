@@ -260,7 +260,8 @@ receipts or records.
     older than `<dur>`. A line without `last_used_ms` has an unknown age and
     is kept. With `delete_unused_checkouts_after_days = <n>` at the top of
     `machines.toml` (a whole number, at least 1; a "checkout" is a seat: the
-    place's copy of the repository, with its build cache), every `ferry run`
+    place's copy of the repository, with its build cache; unset, it is 7, so
+    a seat nobody can prove gone still ends), every `ferry run`
     on a remote place also prunes that place with `--idle <n>d`, after its
     receipt and output are complete: at most once an hour per place (claimed
     under an flock on `~/.local/state/ferry/pruned.lock`, the time kept in

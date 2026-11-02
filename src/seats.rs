@@ -357,9 +357,9 @@ fn refusal(reply: &serde_json::Value, line: &Line) -> (Kept, String) {
 /// retire after `AUTO_PRUNE_BUDGET`. Prints one line on stderr when it
 /// pruned or failed; never changes the run's exit code or output.
 pub fn prune_by_itself(place: &str, hosts: &config::Machines) {
-    let Some(days) = hosts.delete_unused_checkouts_after_days else {
-        return;
-    };
+    let days = hosts
+        .delete_unused_checkouts_after_days
+        .unwrap_or(crate::limits::UNUSED_CHECKOUT_DAYS);
     let started = Instant::now();
     let said = match claim_hour(place) {
         Ok(false) => return,

@@ -25,6 +25,10 @@ pub const DRAIN: Duration = Duration::from_secs(2);
 /// the survivors are `unknown` and the pass is abandoned.
 pub const MARKER_BOUND: Duration = Duration::from_secs(10);
 
+/// How many days unused a seat lives when `machines.toml` sets no
+/// `delete_unused_checkouts_after_days` (SPEC §9).
+pub const UNUSED_CHECKOUT_DAYS: u64 = 7;
+
 /// How often a caller's runs prune a place's idle seats by themselves, at
 /// most (SPEC §9).
 pub const AUTO_PRUNE_EVERY: Duration = Duration::from_hours(1);

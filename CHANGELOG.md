@@ -12,7 +12,13 @@ All notable changes to `ferry` are documented in this file.
   directory (same inode) is gone whatever its device number. An unmounted
   volume's empty mount point is another directory on another device and is
   still kept. Lines written before this release have no inode and keep the
-  device rule: prune those with `--idle`, or retire one by key on the place.
+  device rule: they end by the 7-day default below, or with `--idle`.
+- **Unused seats end by default after 7 days.** Without
+  `delete_unused_checkouts_after_days` in `machines.toml`, a run used to
+  prune nothing by itself, so a seat nobody could prove gone lived forever.
+  Unset, the key is now 7: each remote run prunes its place's seats this
+  caller has not used for seven days, at most once an hour. Set it to keep
+  seats longer.
 
 ## v0.1.7 - 2026-10-21
 
