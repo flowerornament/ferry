@@ -391,7 +391,9 @@ Nothing else is written; Ferry writes nowhere outside these.
     seat is kept and reported, never treated as idle;
   - **idle, without remembering:** with `delete_unused_checkouts_after_days
     = <n>` at the top level of the caller's `machines.toml` (a whole number
-    of days, at least 1; anything else is a bad `machines.toml`), each
+    of days, at least 1; anything else is a bad `machines.toml`; unset, it
+    is 7, so a seat nobody can prove gone, such as one recorded before a
+    reboot renumbered its volume, still ends without anyone acting), each
     `ferry run`, once its run is final (or submitted, with `--detach`),
     also runs `prune --idle <n>d` against that run's place, at most once an
     hour per place. The hour is claimed before pruning, under an flock on
@@ -728,8 +730,9 @@ receipt is seeing this rule, not a bug.
     place.
 14. **Seat count:** without `--idle`, `ferry seats prune` retires a seat
     only when its workspace is provably gone (`NotFound`, a listable
-    parent on the recorded device). An unreadable or unmounted workspace
-    is kept and reported. It never touches another caller's seat, and
+    parent that is the same directory it was when used, or on the recorded
+    device). A volume renumbered by a reboot still proves it; an unreadable
+    or unmounted workspace is kept and reported. It never touches another caller's seat, and
     skips a busy one.
 15. **Seat size:** over `max_cache_per_checkout`, a run starts cold with `pruned`
     recorded. Nothing outside `seats/<key>/` is ever
@@ -817,7 +820,8 @@ receipt is seeing this rule, not a bug.
     exit code and `--json` are its own and no new retire starts after ten
     seconds. With an exclusive run holding the place's gate or `host`,
     retire, by hand or by itself, is refused `exclusive` and deletes
-    nothing. Without the key, nothing is retired.
+    nothing. Without the key, the default of 7 days applies: a seat unused
+    for eight days is retired and one unused for two days is kept.
 24. **Plain config names:** each of the three files at version 2 is read
     with the §10 keys, sizes and durations. A version 1 file is read the
     same for one release; a version 2 file holding a version 1 key is
