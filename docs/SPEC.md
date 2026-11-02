@@ -743,7 +743,8 @@ receipt is seeing this rule, not a bug.
 16a. **An incomplete pass:** an injected failure to list processes, and a
     live eligible process whose environment cannot be read (Linux: a
     non-dumpable child; macOS: a platform binary started by the recipe),
-    each give `survivors: "unknown"` with `custody.error` naming it, never
+    each give `survivors: "unknown"` with `custody.error` naming the
+    reason, how many processes it covers and the first of their pids, never
     `[]`, and the run's outcome is unchanged. So does an unreadable process
     whose parent cannot be read or changes during the read (injected): it is
     never skipped as "not the user's".
