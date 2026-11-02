@@ -4,6 +4,16 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **A reboot no longer strands a Mac caller's seats.** macOS renumbers an
+  APFS volume's device at mount, so after a reboot `ferry seats prune` kept
+  every seat recorded before it as `unknown` ("not on the device recorded
+  with the workspace"). The seat book now records the workspace parent's
+  inode with its device, and a workspace absent from the same parent
+  directory (same inode) is gone whatever its device number. An unmounted
+  volume's empty mount point is another directory on another device and is
+  still kept. Lines written before this release have no inode and keep the
+  device rule: prune those with `--idle`, or retire one by key on the place.
+
 ## v0.1.7 - 2026-10-21
 
 - **One binary checks and runs a request.** If a place's Ferry is replaced

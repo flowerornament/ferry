@@ -33,6 +33,10 @@ pub struct Line {
     /// unmounted volume leaves an empty mount point on another device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_device: Option<u64>,
+    /// The parent directory's inode when it was used: a reboot may renumber
+    /// the device (macOS APFS), and the same inode is the same directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_inode: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_ms: Option<u128>,
 }
@@ -72,22 +76,26 @@ pub fn record(key: &str, place: &str, repo_path: &Path, seat: &str) -> Result<()
     let parent = repo_path
         .parent()
         .ok_or("the workspace has no parent directory")?;
+    let parent = fs::metadata(parent)?;
     append(&Line {
         key: key.to_owned(),
         place: place.to_owned(),
         repo_path: repo_path.display().to_string(),
         seat: seat.to_owned(),
         last_used_ms: Some(crate::receipt::now_ms()),
-        parent_device: Some(fs::metadata(parent)?.dev()),
+        parent_device: Some(parent.dev()),
+        parent_inode: Some(parent.ino()),
         retired_ms: None,
     })
 }
 
 /// Whether the workspace is provably gone: its name is absent from a parent
-/// directory that can be listed and is on the device recorded with it.
-/// Anything else (a denied or failed lookup, a missing parent, another
-/// device) cannot prove it, and the seat is kept: retiring a live
-/// workspace's seat would destroy its warm state.
+/// directory that can be listed and is the directory recorded with it (the
+/// same inode: a reboot may renumber the device) or on the device recorded
+/// with it. Anything else (a denied or failed lookup, a missing parent,
+/// another directory on another device, as an unmount's empty mount point)
+/// cannot prove it, and the seat is kept: retiring a live workspace's seat
+/// would destroy its warm state.
 fn gone(line: &Line) -> std::result::Result<bool, String> {
     let path = Path::new(&line.repo_path);
     match fs::symlink_metadata(path) {
@@ -97,12 +105,11 @@ fn gone(line: &Line) -> std::result::Result<bool, String> {
     }
     let parent = path.parent().ok_or("no parent directory")?;
     let listed = fs::read_dir(parent).and_then(|_| fs::metadata(parent));
-    let device = listed
-        .map_err(|e| format!("parent {}: {e}", parent.display()))?
-        .dev();
-    if line.parent_device != Some(device) {
+    let listed = listed.map_err(|e| format!("parent {}: {e}", parent.display()))?;
+    let same_directory = line.parent_inode.is_some_and(|inode| inode == listed.ino());
+    if !same_directory && line.parent_device != Some(listed.dev()) {
         return Err(format!(
-            "parent {} is not on the device recorded with the workspace (unmounted?)",
+            "parent {} is neither the directory nor on the device recorded with the workspace (unmounted?)",
             parent.display()
         ));
     }

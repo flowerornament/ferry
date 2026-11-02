@@ -249,8 +249,9 @@ receipts or records.
   never another caller's. A seat ends in one of three ways:
   - **Workspace gone.** `ferry seats prune [--on <machine>]` retires each
     recorded seat whose workspace is provably gone: its name is absent from
-    a parent directory that can be listed and is on the device recorded with
-    it. Anything else (a denied lookup, a missing parent, an unmounted
+    a parent directory that can be listed and is the directory recorded with
+    it (the same inode, so a reboot that renumbers the device does not
+    matter) or on the device recorded with it. Anything else (a denied lookup, a missing parent, an unmounted
     volume) is reported as `kept … unknown` and never retired by this rule.
     So a workspace removed together with its parent directory (say
     `~/tmp/x/` deleted whole) is pruned only by `--idle`.

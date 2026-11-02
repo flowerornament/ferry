@@ -1674,31 +1674,73 @@ fn a_run_with_its_wait_budget_spent_is_not_measured() {
     );
 }
 
-/// A workspace whose parent is now on another device than the one recorded
-/// (an unmounted volume's empty mount point) is unknown and kept.
-#[test]
-fn seats_prune_keeps_a_workspace_whose_parent_changed_device() {
+/// Appends the book's last line again, changed by `edit`: the same seat as
+/// recorded from another parent directory or device.
+fn rerecord(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut line = seats_book(dir).pop().unwrap();
+    edit(&mut line);
+    let book = dir.join("state/ferry/seats.jsonl");
+    let mut text = fs::read_to_string(&book).unwrap();
+    writeln!(text, "{line}").unwrap();
+    fs::write(&book, text).unwrap();
+}
+
+/// Prunes after `edit` rewrote a gone workspace's line; returns what it
+/// said and whether the seat's checkout survived.
+fn prune_rerecorded(edit: impl FnOnce(&mut serde_json::Value)) -> (String, bool) {
     let dir = fixture("true", "");
     let gone = workspace(dir.path(), "gone");
     assert_eq!(remote_pass(dir.path(), &gone).status.code(), Some(0));
     let key = key_of(dir.path(), &gone);
     fs::remove_dir_all(&gone).unwrap();
-    // The same seat as recorded from another device.
-    let mut line = seats_book(dir.path()).pop().unwrap();
-    line["parent_device"] = (line["parent_device"].as_u64().unwrap() + 1).into();
-    let book = dir.path().join("state/ferry/seats.jsonl");
-    let mut text = fs::read_to_string(&book).unwrap();
-    writeln!(text, "{line}").unwrap();
-    fs::write(&book, text).unwrap();
+    rerecord(dir.path(), edit);
     let (code, said) = prune(dir.path(), ".local/bin/ferry");
     assert_eq!(code, Some(0), "{said}");
-    assert!(said.contains("kept") && said.contains("device"), "{said}");
     let slot = dir
         .path()
         .join("host/.local/state/ferry/v1/seats")
         .join(&key)
         .join("checkout");
-    assert!(slot.exists(), "{said}");
+    (said, slot.exists())
+}
+
+fn bump(line: &mut serde_json::Value, field: &str) {
+    line[field] = (line[field].as_u64().unwrap() + 1).into();
+}
+
+/// A workspace whose parent is another directory on another device than
+/// the ones recorded (an unmounted volume's empty mount point) is unknown
+/// and kept.
+#[test]
+fn seats_prune_keeps_a_workspace_whose_parent_changed_device() {
+    let (said, kept) = prune_rerecorded(|line| {
+        bump(line, "parent_device");
+        bump(line, "parent_inode");
+    });
+    assert!(said.contains("kept") && said.contains("device"), "{said}");
+    assert!(kept, "{said}");
+}
+
+/// A reboot renumbers the parent's device (macOS APFS: 16777234 became
+/// 16777235), but the parent is the same directory, by its inode: the
+/// workspace is provably gone and its seat is retired (ferry-xtx.33).
+#[test]
+fn seats_prune_retires_a_workspace_whose_parent_device_was_renumbered() {
+    let (said, kept) = prune_rerecorded(|line| bump(line, "parent_device"));
+    assert!(said.contains("retired"), "{said}");
+    assert!(!kept, "{said}");
+}
+
+/// A line recorded before the inode keeps the device rule: on another
+/// device it is unknown and kept.
+#[test]
+fn seats_prune_keeps_an_inodeless_line_whose_parent_changed_device() {
+    let (said, kept) = prune_rerecorded(|line| {
+        bump(line, "parent_device");
+        line.as_object_mut().unwrap().remove("parent_inode");
+    });
+    assert!(said.contains("kept") && said.contains("device"), "{said}");
+    assert!(kept, "{said}");
 }
 
 /// Retire deletes only what is proven inside the place's root: through a
