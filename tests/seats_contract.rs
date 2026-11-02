@@ -922,6 +922,12 @@ fn two_runs_ending_together_prune_once() {
         )
         .current_dir(repo)
         .env("FERRY_FAIL_AT", "prune-claim")
+        // The budget's clock starts before the claim, so it runs through
+        // the pause below: a loaded machine must not spend it there.
+        .env(
+            "FERRY_AUTO_PRUNE_BUDGET_MS",
+            (2 * common::slack().as_millis()).to_string(),
+        )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -943,19 +949,31 @@ fn two_runs_ending_together_prune_once() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     fs::write(claim.with_extension("go"), "").unwrap();
-    let mut pruned = 0;
+    let mut said = vec![];
     for run in [&mut first, &mut second] {
         let mut stderr = String::new();
         std::io::Read::read_to_string(run.stderr.as_mut().unwrap(), &mut stderr).unwrap();
         assert_eq!(run.wait().unwrap().code(), Some(0), "{stderr}");
-        pruned += stderr
-            .lines()
-            .filter(|line| line.starts_with("ferry: pruned test-host"))
-            .count();
+        said.extend(
+            stderr
+                .lines()
+                .filter(|line| line.starts_with("ferry: prun"))
+                .map(str::to_owned),
+        );
     }
-    assert_eq!(pruned, 1, "two runs pruned the same place in one hour");
+    let pruned = said
+        .iter()
+        .filter(|line| line.starts_with("ferry: pruned test-host"))
+        .count();
+    assert_eq!(
+        pruned, 1,
+        "two runs pruned the same place in one hour: {said:?}"
+    );
     let place = dir.path().join("host/.local/state/ferry/v1");
-    assert!(!place.join("seats").join(&old).exists());
+    assert!(
+        !place.join("seats").join(&old).exists(),
+        "the old seat survived the prune: {said:?}"
+    );
 }
 
 /// A place without `seat-lifetime` (an older Ferry) is refused an idle
