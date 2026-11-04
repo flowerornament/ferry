@@ -51,7 +51,14 @@
             packages = [ (rustFor pkgs) pkgs.just pkgs.git pkgs.jujutsu pkgs.python3 pkgs.inetutils pkgs.openssh ]
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.procps pkgs.util-linux ];
             # git never discovers a repository at or above $HOME (a stray ~/.git).
-            shellHook = ''export GIT_CEILING_DIRECTORIES="$HOME"'';
+            # Compiles go through the machine's own sccache when it has one
+            # (content-addressed, safe across concurrent seats and desks). Never
+            # a pinned one here: every sccache on a machine shares one server,
+            # and a client of another version cannot read its replies.
+            shellHook = ''
+              export GIT_CEILING_DIRECTORIES="$HOME"
+              if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+            '';
           };
         });
     };
