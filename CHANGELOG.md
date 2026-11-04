@@ -4,6 +4,15 @@ All notable changes to `ferry` are documented in this file.
 
 ## Unreleased
 
+- **A receipt never brings back a removed workspace.** A run whose
+  workspace was removed while it ran (a retired desk) used to recreate the
+  folder to hold its receipt. It now keeps its outcome and exit code, warns
+  that no receipt is kept there, and names `ferry record <id> --on <place>`,
+  which reads the place's record.
+- **A place's unreadable `host-info` reply is named.** An empty or malformed
+  reply used to surface as a bare JSON parse error; it now says how many
+  bytes `host-info` replied.
+
 ## v0.1.8 - 2026-11-01
 
 - **A reboot no longer strands a Mac caller's seats.** macOS renumbers an

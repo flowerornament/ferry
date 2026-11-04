@@ -231,8 +231,25 @@ fn path(root: &Path, id: &str) -> std::path::PathBuf {
     root.join(".ferry/receipts").join(format!("{id}.json"))
 }
 
+/// The receipts directory, made if missing, but only inside a workspace
+/// that still exists: a receipt written after its workspace was removed
+/// must not bring the workspace back. The place keeps the run's record.
+fn receipts(root: &Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    if !root.is_dir() {
+        return Err(format!(
+            "the workspace {} is gone, so its receipt is not kept; `ferry record <id> --on <place>` reads the run",
+            root.display()
+        )
+        .into());
+    }
+    let dir = root.join(".ferry/receipts");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Stores a run's first receipt, complete or not at all, never over another.
 pub fn submit(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Error>> {
+    receipts(root)?;
     crate::record::write_new(
         &path(root, &receipt.id),
         &serde_json::to_vec_pretty(receipt)?,
@@ -257,13 +274,25 @@ pub fn load(root: &Path, id: &str) -> Result<Receipt, Box<dyn std::error::Error>
 /// never undo a final one (verdict once). A final one replaces it; each
 /// writer has its own temporary file, so concurrent `ferry record`s all
 /// complete, and final over final is the same place record.
+///
+/// A workspace removed while its run went on (a retired desk) keeps no
+/// receipt: the run's outcome and exit code stand, and the place's record
+/// is the truth, so this warns and stores nothing.
 pub fn save(root: &Path, receipt: &Receipt) -> Result<(), Box<dyn std::error::Error>> {
+    if !root.is_dir() {
+        crate::execution::warn(&format!(
+            "ferry: the workspace {} is gone, so run {} keeps no receipt there; `ferry record {} --on <place>` reads it",
+            root.display(),
+            receipt.id,
+            receipt.id
+        ));
+        return Ok(());
+    }
     let path = path(root, &receipt.id);
     if receipt.state.as_deref() == Some("submitted") {
         return submit(root, receipt).or_else(|e| if path.exists() { Ok(()) } else { Err(e) });
     }
-    let dir = root.join(".ferry/receipts");
-    fs::create_dir_all(&dir)?;
+    let dir = receipts(root)?;
     let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
     std::io::Write::write_all(&mut tmp, &serde_json::to_vec_pretty(receipt)?)?;
     tmp.as_file().sync_all()?;
@@ -294,6 +323,30 @@ pub fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_receipt_never_recreates_a_removed_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("desk");
+        let receipt: Receipt = serde_json::from_value(serde_json::json!({
+            "protocol": PROTOCOL, "id": run_id().unwrap(), "commit": null,
+            "recipe": "r", "seat": "s", "machine": "m", "outcome": "ran-pass",
+            "exit_code": 0, "reason": null, "caller_binary_sha256": "c",
+            "host_binary_sha256": null, "started_ms": 0, "elapsed_ms": 0,
+            "requirements": [], "machine_features": [],
+            "adapter_sha256": null, "contract_sha256": null, "state": "final"
+        }))
+        .unwrap();
+        // A final save stands (the run's code is kept) and stores nothing.
+        save(&gone, &receipt).unwrap();
+        assert!(!gone.exists(), "the receipt brought the workspace back");
+        // A submit, before the place runs anything, is refused.
+        let error = submit(&gone, &receipt).unwrap_err().to_string();
+        assert!(error.contains("is gone"), "{error}");
+        assert!(!gone.exists(), "the submit brought the workspace back");
+        fs::create_dir(&gone).unwrap();
+        save(&gone, &receipt).unwrap();
+        assert_eq!(load(&gone, &receipt.id).unwrap().outcome, Outcome::RanPass);
+    }
     #[test]
     fn recipe_125_is_still_a_recipe_failure() {
         assert_ne!(Outcome::RanFail, Outcome::Refused);

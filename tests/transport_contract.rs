@@ -1001,12 +1001,10 @@ fn a_host_without_a_required_capability_is_refused_before_acceptance() {
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
     // A host that can detach and ship, without the required capability.
-    fs::write(
-        bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\",\"ship\"]/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    old_place(
+        &bin,
+        "'s/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\",\"ship\"]/'",
+    );
     let out = remote_run(
         dir.path(),
         ".local/bin/old-ferry",
@@ -1034,12 +1032,10 @@ fn a_new_caller_refuses_a_place_without_detach_naming_its_revision() {
     let dir = fixture("true", "");
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(
-        bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    old_place(
+        &bin,
+        "-e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/'",
+    );
     let out = remote_run(
         dir.path(),
         ".local/bin/old-ferry",
@@ -1297,12 +1293,10 @@ fn an_old_place_receives_no_objects_before_its_refusal() {
     git(dir.path(), &["commit", "-m", "ship a dependency"]);
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(
-        bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[]/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    old_place(
+        &bin,
+        "-e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[]/'",
+    );
     let out = remote_run(
         dir.path(),
         ".local/bin/old-ferry",
@@ -1323,12 +1317,10 @@ fn a_place_without_ship_is_refused_before_any_push() {
     let dir = fixture("true", "");
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(
-        bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\",\"retire\"]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    old_place(
+        &bin,
+        "-e 's/\"capabilities\":\\[[^]]*\\]/\"capabilities\":[\"detach\",\"retire\"]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/'",
+    );
     let out = remote_run(
         dir.path(),
         ".local/bin/old-ferry",

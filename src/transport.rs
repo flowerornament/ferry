@@ -451,9 +451,16 @@ impl Place<'_> {
     fn info(&self) -> Result<HostInfo> {
         match self {
             Place::Local(_) => host_info(),
-            Place::Remote(machine) => Ok(serde_json::from_slice(&replied(
-                ssh(&machine.ssh)?.arg(format!("{} host-info", machine.binary)),
-            )?)?),
+            Place::Remote(machine) => {
+                let out = replied(ssh(&machine.ssh)?.arg(format!("{} host-info", machine.binary)))?;
+                serde_json::from_slice(&out).map_err(|e| {
+                    format!(
+                        "host-info replied {} bytes that are not its facts ({e})",
+                        out.len()
+                    )
+                    .into()
+                })
+            }
         }
     }
 

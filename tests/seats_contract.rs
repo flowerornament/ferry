@@ -229,12 +229,10 @@ fn seats_prune_refuses_a_place_without_retire_naming_its_revision() {
     let key = key_of(dir.path(), &gone);
     fs::remove_dir_all(&gone).unwrap();
     let bin = dir.path().join("host/.local/bin");
-    fs::write(
-        bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"retire\"//' -e 's/,,/,/' -e 's/,\\]/]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    old_place(
+        &bin,
+        "-e 's/\"retire\"//' -e 's/,,/,/' -e 's/,\\]/]/' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/'",
+    );
     let (code, said) = prune(dir.path(), ".local/bin/old-ferry");
     assert_eq!(code, Some(125), "{said}");
     assert!(
@@ -1011,12 +1009,10 @@ fn a_place_without_seat_lifetime_is_refused_idle_and_once() {
     let dir = fixture("true", "");
     let bin = dir.path().join("host/.local/bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(
-        bin.join("old-ferry"),
-        "#!/bin/sh\ncase \"$1\" in host-info) \"$HOME/.local/bin/ferry\" host-info | sed -e 's/\"seat-lifetime\",//' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/';; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+    old_place(
+        &bin,
+        "-e 's/\"seat-lifetime\",//' -e 's/\"source_rev\":\"[^\"]*\"/\"source_rev\":\"0ld-place-rev\"/'",
+    );
     let repo = workspace(dir.path(), "idle");
     let out = remote_command(
         dir.path(),

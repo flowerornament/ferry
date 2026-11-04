@@ -1490,3 +1490,18 @@ pub fn nesting(target: Option<&Path>) -> TempDir {
     git(dir.path(), &["commit", "-qam", "nest"]);
     dir
 }
+
+/// Writes `bin/old-ferry`: the place's ferry, its `host-info` facts edited
+/// by `sed` (an older place). host-info's own failure is passed on, its
+/// exit code and stderr, never hidden behind sed's success as an empty
+/// reply (ferry-xtx.40).
+pub fn old_place(bin: &Path, sed: &str) {
+    fs::write(
+        bin.join("old-ferry"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in host-info) out=$(\"$HOME/.local/bin/ferry\" host-info) || exit $?; printf '%s\\n' \"$out\" | sed {sed};; *) exec \"$HOME/.local/bin/ferry\" \"$@\";; esac\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("old-ferry"), fs::Permissions::from_mode(0o755)).unwrap();
+}
